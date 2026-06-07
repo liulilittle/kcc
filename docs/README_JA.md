@@ -344,7 +344,7 @@ PROBE_RTT モード：cwnd = min(cwnd, cwnd_min_target) // 最小インフライ
 | `kcc_extra_acked_gain_num` / `kcc_extra_acked_gain_den` | 1 / 1 | 0/1 | 100k/100k | ACK 集約ボーナス乗数 |
 | `kcc_high_gain_num` / `kcc_high_gain_den` | 2885 / 1000 | 0/1 | 100k | STARTUP ゲイン（≈2.885x） |
 | `kcc_drain_gain_num` / `kcc_drain_gain_den` | 347 / 1000 | 0/1 | 100k | DRAIN ゲイン（≈0.347x） |
-| `kcc_inflight_low_gain_num` / `kcc_inflight_low_gain_den` | 125 / 100 | 0/1 | 100k | インフライト下限（1.25x BDP） |
+| `kcc_inflight_low_gain_num` / `kcc_inflight_low_gain_den` | 100 / 100 | 0/1 | 100k | インフライト下限（1.0x BDP） |
 | `kcc_inflight_high_gain_num` / `kcc_inflight_high_gain_den` | 200 / 100 | 0/1 | 100k | インフライト上限（2.0x BDP） |
 | `kcc_gain_num[i]` / `kcc_gain_den[i]` | BBRv1 パターン（256 スロット） | 0/1 | — | スロットごとのペーシングゲイン |
 | `kcc_cycle_decay_mask[8]` | 0（すべてゼロ） | 0 | 0x7FFFFFFF | 256 ビット減衰ビットマップ |

@@ -339,7 +339,7 @@ Parameters are exposed under `/proc/sys/net/kcc/`. Writes trigger `kcc_init_modu
 | `kcc_extra_acked_gain_num` / `kcc_extra_acked_gain_den` | 1 / 1 | 0/1 | 100k/100k | ACK aggregation bonus multiplier |
 | `kcc_high_gain_num` / `kcc_high_gain_den` | 2885 / 1000 | 0/1 | 100k | STARTUP gain (≈2.885x) |
 | `kcc_drain_gain_num` / `kcc_drain_gain_den` | 347 / 1000 | 0/1 | 100k | DRAIN gain (≈0.347x) |
-| `kcc_inflight_low_gain_num` / `kcc_inflight_low_gain_den` | 125 / 100 | 0/1 | 100k | Inflight lower bound (1.25x BDP) |
+| `kcc_inflight_low_gain_num` / `kcc_inflight_low_gain_den` | 100 / 100 | 0/1 | 100k | Inflight lower bound (1.0x BDP) |
 | `kcc_inflight_high_gain_num` / `kcc_inflight_high_gain_den` | 200 / 100 | 0/1 | 100k | Inflight upper bound (2.0x BDP) |
 | `kcc_gain_num[i]` / `kcc_gain_den[i]` | BBRv1 pattern (256 slots) | 0/1 | — | Per-slot pacing gain |
 | `kcc_cycle_decay_mask[8]` | 0 (all zero) | 0 | 0x7FFFFFFF | 256-bit decay bitmap |

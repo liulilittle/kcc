@@ -342,7 +342,7 @@ cwnd = max(cwnd, cwnd_min_target)                 // أرضية مطلقة 4
 | `kcc_extra_acked_gain_num` / `kcc_extra_acked_gain_den` | 1 / 1 | 0/1 | 100k/100k | مضاعف مكافأة تجميع ACK |
 | `kcc_high_gain_num` / `kcc_high_gain_den` | 2885 / 1000 | 0/1 | 100k | كسوب STARTUP (≈2.885x) |
 | `kcc_drain_gain_num` / `kcc_drain_gain_den` | 347 / 1000 | 0/1 | 100k | كسوب DRAIN (≈0.347x) |
-| `kcc_inflight_low_gain_num` / `kcc_inflight_low_gain_den` | 125 / 100 | 0/1 | 100k | الحد الأدنى للحزم قيد الطيران (1.25x BDP) |
+| `kcc_inflight_low_gain_num` / `kcc_inflight_low_gain_den` | 100 / 100 | 0/1 | 100k | الحد الأدنى للحزم قيد الطيران (1.0x BDP) |
 | `kcc_inflight_high_gain_num` / `kcc_inflight_high_gain_den` | 200 / 100 | 0/1 | 100k | الحد الأعلى للحزم قيد الطيران (2.0x BDP) |
 | `kcc_gain_num[i]` / `kcc_gain_den[i]` | نمط BBRv1 (256 خانة) | 0/1 | — | كسوب السرعة لكل خانة |
 | `kcc_cycle_decay_mask[8]` | 0 (الكل صفر) | 0 | 0x7FFFFFFF | خريطة بت التوهين 256 بت |

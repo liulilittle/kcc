@@ -341,7 +341,7 @@ PROBE_RTT mode: cwnd = min(cwnd, cwnd_min_target) // 최소 in-flight
 | `kcc_extra_acked_gain_num` / `kcc_extra_acked_gain_den` | 1 / 1 | 0/1 | 100k/100k | ACK 집계 보너스 승수 |
 | `kcc_high_gain_num` / `kcc_high_gain_den` | 2885 / 1000 | 0/1 | 100k | STARTUP 게인(≈2.885x) |
 | `kcc_drain_gain_num` / `kcc_drain_gain_den` | 347 / 1000 | 0/1 | 100k | DRAIN 게인(≈0.347x) |
-| `kcc_inflight_low_gain_num` / `kcc_inflight_low_gain_den` | 125 / 100 | 0/1 | 100k | in-flight 하한(1.25x BDP) |
+| `kcc_inflight_low_gain_num` / `kcc_inflight_low_gain_den` | 100 / 100 | 0/1 | 100k | in-flight 하한(1.0x BDP) |
 | `kcc_inflight_high_gain_num` / `kcc_inflight_high_gain_den` | 200 / 100 | 0/1 | 100k | in-flight 상한(2.0x BDP) |
 | `kcc_gain_num[i]` / `kcc_gain_den[i]` | BBRv1 패턴(256 슬롯) | 0/1 | — | 슬롯별 페이싱 게인 |
 | `kcc_cycle_decay_mask[8]` | 0(모두 0) | 0 | 0x7FFFFFFF | 256비트 감쇠 비트맵 |

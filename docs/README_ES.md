@@ -342,7 +342,7 @@ Los parámetros se exponen bajo `/proc/sys/net/kcc/`. Las escrituras activan `kc
 | `kcc_extra_acked_gain_num` / `kcc_extra_acked_gain_den` | 1 / 1 | 0/1 | 100k/100k | Multiplicador de bonificación de agregación ACK |
 | `kcc_high_gain_num` / `kcc_high_gain_den` | 2885 / 1000 | 0/1 | 100k | Ganancia STARTUP (≈2.885x) |
 | `kcc_drain_gain_num` / `kcc_drain_gain_den` | 347 / 1000 | 0/1 | 100k | Ganancia DRAIN (≈0.347x) |
-| `kcc_inflight_low_gain_num` / `kcc_inflight_low_gain_den` | 125 / 100 | 0/1 | 100k | Límite inferior de tráfico en vuelo (1.25x BDP) |
+| `kcc_inflight_low_gain_num` / `kcc_inflight_low_gain_den` | 100 / 100 | 0/1 | 100k | Límite inferior de tráfico en vuelo (1.0x BDP) |
 | `kcc_inflight_high_gain_num` / `kcc_inflight_high_gain_den` | 200 / 100 | 0/1 | 100k | Límite superior de tráfico en vuelo (2.0x BDP) |
 | `kcc_gain_num[i]` / `kcc_gain_den[i]` | Patrón BBRv1 (256 ranuras) | 0/1 | — | Ganancia de pacing por ranura |
 | `kcc_cycle_decay_mask[8]` | 0 (todos cero) | 0 | 0x7FFFFFFF | Mapa de bits de decaimiento de 256 bits |
