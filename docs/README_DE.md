@@ -189,23 +189,25 @@ ECN-Markierungsverhältnis EWMA: wird an Rundengrenzen durch `kcc_ecn_ewma_retai
 
 ### Einzelfluss-Erkennung
 
-Wenn KCC erkennt, dass der Fluss wahrscheinlich allein am Engpass ist (niedrige Warteschlangenverzögerung, niedriger Jitter, keine ECN-Markierungen, keine ACK-Aggregation, keine LT-Bandbreite), wechselt es automatisch in einen reinen BBR-Modus:
+Wenn KCC erkennt, dass der Fluss wahrscheinlich allein am Engpass ist (niedrige Warteschlangenverzögerung, niedriger Jitter, keine ECN-Markierungen, keine ACK-Aggregation), wechselt es automatisch in einen reinen BBR-Modus:
 
 - `kcc_get_model_rtt()` gibt direkt `min_rtt_us` zurück (vermeidet die geglättete Kalman-Schätzung, die aufgrund des einseitigen Messrauschens eine kleine positive Verzerrung aufweist).
 - `kcc_ecn_backoff()` ist über `kcc_alone_bypass_ecn` (Standard 1) konfigurierbar — auf einem Einzelfluss-Pfad sind ECN-Markierungen Fehlalarme des AQM, da kein anderer Sender konkurriert. Das Überspringen entspricht dem Null-ECN-Verhalten von BBR. Auf 0 setzen, um ECN-Backoff auch im Alleinmodus beizubehalten (konservativ).
-- Die LT BW Bedingung (Policer) ist über `kcc_alone_bypass_lt_bw` (Standard 1) konfigurierbar — ein Einzelfluss-Pfad hat keinen Policer, sodass LT BW nicht legitim auslösen kann. Das Überspringen verhindert ein unerwünschtes Verlassen des Alleinmodus durch Fehlauslösungen. Auf 0 setzen für das ursprüngliche strenge Verhalten.
 
-Dies beseitigt die Leistungslücke bei Einzelflüssen zwischen KCC und BBR, während die vollständige Schutzschleife von KCC (Kalman, ECN-Rücknahme, Verstärkungsabfall, LT-Bandbreite) für Multi-Fluss-Szenarien erhalten bleibt.
+Dies beseitigt die Leistungslücke bei Einzelflüssen zwischen KCC und BBR, während die vollständige Schutzschleife von KCC (Kalman, ECN-Rücknahme, Verstärkungsabfall) für Multi-Fluss-Szenarien erhalten bleibt.
 
-**Hysterese**: Der Eintritt erfordert `kcc_alone_confirm_rounds` (Standard 3) aufeinanderfolgende qualifizierte Runden — vermeidet Oszillationen während kurzer Ruhephasen im Multi-Fluss-Wettbewerb ("konservativ beim Beschleunigen"). Der Austritt erfolgt sofort — jeder Qualifikationsfehler löscht das Flag und setzt den Bestätigungszähler zurück ("aggressiv beim Abbremsen").
+**Hysterese**: Der Eintritt erfordert `kcc_alone_confirm_rounds` (Standard 3) aufeinanderfolgende qualifizierte Runden — vermeidet Oszillationen während kurzer Ruhephasen im Multi-Fluss-Wettbewerb ("konservativ beim Beschleunigen"). Austritt: Während der Cruise-Phasen-Bewertung löscht jeder einzelne Qualifikationsfehler das Flag ("aggressiv beim Abbremsen").
 
-Qualifikationsbedingungen (alle sechs müssen an einer Rundengrenze erfüllt sein):
+**Design-Entscheidung**: Paketverlust wird NICHT als Einzelfluss-Disqualifikator verwendet — einige Verbindungen (flache Puffer, drahtlos, Virtualisierungs-Burst-Drops) haben inhärente Verluste, die nichts mit Wettbewerb zu tun haben. Verluste mit Multi-Fluss-Wettbewerb gleichzusetzen, verursacht Oszillationen auf Einzelfluss-Pfaden. Das LT BW-Signal (BBRs verlustausgelöste Policer-Erkennung) nimmt nicht an der Einzelfluss-Beurteilung teil.
+
+**Gain-Gating**: Die Einzelfluss-Bewertung läuft nur während der Cruise-Phase (`pacing_gain == BBR_UNIT`). Probe-Up (1,25x) drückt absichtlich gegen den Engpass — sein Warteschlangendruck ist selbstinduziert und kein Wettbewerbssignal. Drain (0,75x) unterdrückt die Warteschlange künstlich. Indem die Bewertung auf Cruise (das stationäre Gleichgewicht) beschränkt wird, verursacht der selbstinduzierte Probe-Up-Druck keine falschen Alone-Mode-Austritte mehr.
+
+Qualifikationsbedingungen (alle fünf müssen an einer Rundengrenze erfüllt sein):
 0. Kalman konvergiert (`sample_cnt >= kcc_kalman_min_samples`) — qdelay/jitter als Warteschlangensignale vertrauen
 1. `qdelay_avg < kcc_alone_qdelay_thresh_us` (Standard 1000 us) — Warteschlange fast leer
 2. `jitter_ewma < kcc_alone_jitter_thresh_us` (Standard 2000 us) — nur ACK-Takt-Mikrojitter
 3. `ecn_ewma == 0` — keine Überlastungsmarkierungen von AQM
-4. `lt_use_bw == 0` — nicht im vom Policer erkannten ratenbegrenzten Modus
-5. `agg_state <= max` gemäß `kcc_alone_agg_state_level` (Standard 1) — drei konfigurierbare ACK-Aggregationsstufen: 0 = nur IDLE (strengste, keine Aggregation), 1 = ≤ SUSPECTED (Standard, erlaubt vorübergehende Aggregation), 2 = ≤ CONFIRMED (permessivste, blockiert nur persistente Aggregation)
+4. `agg_state <= max` gemäß `kcc_alone_agg_state_level` (Standard 1) — drei konfigurierbare ACK-Aggregationsstufen: 0 = nur IDLE (strengste, keine Aggregation), 1 = ≤ SUSPECTED (Standard, erlaubt vorübergehende Aggregation), 2 = ≤ CONFIRMED (permessivste, blockiert nur persistente Aggregation)
 
 ### Dynamisches PROBE_RTT-Intervall
 
@@ -499,7 +501,6 @@ Parameter werden unter `/proc/sys/net/kcc/` bereitgestellt. Schreibvorgänge lö
 | kcc_alone_jitter_thresh_us | 2000 | 0-100k | µs | Max. Jitter für Einzelflusserkennung |
 | kcc_alone_agg_state_level | 1 | 0-2 | — | Aggregationsstrenge (0=nur IDLE, 1=≤SUSPECTED Standard, 2=≤CONFIRMED zu aggressiv) |
 | `kcc_alone_bypass_ecn` | 1 | 0-1 | — | ECN-Backoff im Alleinmodus überspringen (1=überspringen, 0=aktiv) |
-| `kcc_alone_bypass_lt_bw` | 1 | 0-1 | — | LT BW Bedingung im Alleinmodus überspringen (1=überspringen, 0=aktiv) |
 
 ## Datenpfad
 

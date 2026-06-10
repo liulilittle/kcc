@@ -1792,19 +1792,6 @@ module_param_cb(kcc_alone_agg_state_level, &kcc_param_ops, &kcc_alone_agg_state_
 static int kcc_alone_bypass_ecn = 1;                   /* when alone_on_path is active, skip ECN backoff (default: 1 = bypass); on single-flow paths, ECN marks are likely false positives from over-sensitive AQM; KCC extension; range [0, 1], BBR default: N/A */
 module_param_cb(kcc_alone_bypass_ecn, &kcc_param_ops, &kcc_alone_bypass_ecn, 0644); /* sysctl: kcc_alone_bypass_ecn */
 
-/*
- * kcc_alone_bypass_lt_bw — When alone_on_path is active, ignore LT BW
- *     (policer-detected rate-limited mode) in the qualification check
- *     (default 1).  A single-flow path has no policer, so LT BW cannot
- *     legitimately activate.  Bypassing avoids spurious alone-mode exit
- *     if a false LT BW trigger occurs from measurement noise.
- *     When set to 0, LT BW activation always forces exit from alone mode,
- *     matching the original hardcoded behavior.
- *     Range [0, 1].
- */
-static int kcc_alone_bypass_lt_bw = 1;                 /* when alone_on_path is active, ignore LT BW status in the alone qualification check (default: 1 = bypass); a single-flow path has no policer, so LT BW cannot legitimately activate; KCC extension; range [0, 1], BBR default: N/A */
-module_param_cb(kcc_alone_bypass_lt_bw, &kcc_param_ops, &kcc_alone_bypass_lt_bw, 0644); /* sysctl: kcc_alone_bypass_lt_bw */
-
 /* ---- ECN (Explicit Congestion Notification) --------------------------- */
 /*
  * kcc_ecn_enable — Master switch for ECN-aware backoff.
@@ -2201,7 +2188,6 @@ static int kcc_alone_qdelay_thresh_us_val;              /* clamped alone qdelay 
 static int kcc_alone_jitter_thresh_us_val;              /* clamped alone jitter threshold (computed at module init) */
 static int kcc_alone_agg_state_level_val;               /* clamped alone agg state level (computed at module init) */
 static int kcc_alone_bypass_ecn_val;                    /* clamped alone bypass ECN flag (computed at module init) */
-static int kcc_alone_bypass_lt_bw_val;                  /* clamped alone bypass LT BW flag (computed at module init) */
 
 static int kcc_ecn_enable_val;                           /* clamped ECN enable flag (computed at module init) */
 static u32 kcc_ecn_backoff_val;                          /* derived ECN backoff ratio in BBR_UNIT (computed at module init) */
@@ -2389,7 +2375,6 @@ static void kcc_init_module_params(void)                          /* clamp all p
     kcc_alone_jitter_thresh_us = clamp(kcc_alone_jitter_thresh_us, 0, 100000); /* alone jitter [0, 100k] us */
     kcc_alone_agg_state_level = clamp(kcc_alone_agg_state_level, 0, 2);         /* alone agg level [0, 2] */
     kcc_alone_bypass_ecn = clamp(kcc_alone_bypass_ecn, 0, 1);                   /* alone bypass ECN [0, 1] */
-    kcc_alone_bypass_lt_bw = clamp(kcc_alone_bypass_lt_bw, 0, 1);               /* alone bypass LT BW [0, 1] */
 
     /* ECN params */
     kcc_ecn_enable = clamp(kcc_ecn_enable, 0, 1);                                /* ECN enable [0, 1] */
@@ -2704,7 +2689,6 @@ static void kcc_init_module_params(void)                          /* clamp all p
     kcc_alone_jitter_thresh_us_val = kcc_alone_jitter_thresh_us;    /* publish alone jitter threshold */
     kcc_alone_agg_state_level_val = kcc_alone_agg_state_level;      /* publish alone agg state level */
     kcc_alone_bypass_ecn_val = kcc_alone_bypass_ecn;                /* publish alone bypass ECN flag */
-    kcc_alone_bypass_lt_bw_val = kcc_alone_bypass_lt_bw;            /* publish alone bypass LT BW flag */
     kcc_ecn_enable_val = kcc_ecn_enable;                            /* publish ECN enable */
     kcc_ecn_backoff_val = (u32)((u64)BBR_UNIT * (u32)kcc_ecn_backoff_num / (u32)kcc_ecn_backoff_den); /* backoff = BBR_UNIT * num / den */
     kcc_ecn_qdelay_thresh_us_val = kcc_ecn_qdelay_thresh_us;       /* publish ECN qdelay threshold */
@@ -6756,15 +6740,21 @@ static void kcc_update_model(struct sock* sk, const struct rate_sample* rs,     
  * protective mechanisms (Kalman model_rtt positive bias, ECN backoff)
  * reduce single-flow throughput compared to BBR.
  *
+ * Evaluation is gated to cruise phase only (pacing_gain == BBR_UNIT).
+ * Probe-up (1.25x) intentionally pushes the link — its queue pressure
+ * is self-induced and not a competition signal.  Gating to cruise
+ * eliminates the oscillation where self-induced probe pressure
+ * falsely triggers alone-mode exit.
+ *
  * When alone_on_path is set:
  *   - kcc_get_model_rtt returns kcc->min_rtt_us (BBR-style exact min),
  *     bypassing the Kalman smoothed estimate which has a small positive
  *     bias from one-sided measurement noise.
  *   - kcc_ecn_backoff returns immediately (no ECN reaction needed).
  *
- * The flag is cleared immediately when any queue, loss, ECN, or
- * aggregation signal appears — restoring full KCC protection.
- */
+ * The flag is cleared when any queue, ECN, or aggregation signal
+ * appears during a cruise-phase evaluation — restoring full KCC
+ * protection.
 static void kcc_alone_on_path_eval(struct sock* sk,                            /* evaluate single-flow heuristic */
     struct kcc_ext* ext)                                                       /* extended state */
 {
@@ -6789,8 +6779,30 @@ static void kcc_alone_on_path_eval(struct sock* sk,                            /
         return;                                                                    /* no counter to reset */
     }
 
+    /* Gain gating: only evaluate single-flow signals during cruise
+     * phase (pacing_gain == BBR_UNIT = 1.0x).  Probe-up (1.25x)
+     * intentionally pushes the bottleneck buffer — self-induced
+     * queue pressure is expected behaviour, not a competition
+     * signal.  Drain (0.75x) artificially suppresses the queue —
+     * not a reliable reading.  STARTUP (2.89x) and DRAIN (0.35x)
+     * are transient acceleration/deceleration — evaluation during
+     * these phases is meaningless.
+     *
+     * Cruise is the steady-state equilibrium where BBR runs at the
+     * estimated link capacity.  Clean signals during cruise genuinely
+     * indicate no competing bulk traffic; dirty signals during cruise
+     * indicate persistent queue pressure from another flow.
+     *
+     * By gating on cruise only, self-induced probe-up pressure does
+     * not cause false exits — the oscillation "probe → queue pressure
+     * → exit alone → conservative → clean → re-enter alone → probe"
+     * is structurally damped. */
+    if (kcc->pacing_gain != BBR_UNIT) {
+        return;
+    }
+
     /*
-     * Single-flow indicators (six orthogonal signals):
+     * Single-flow indicators (five orthogonal signals):
      *
      * 0. sample_cnt >= kcc_kalman_min_samples_val:
      *    Kalman filter must have converged before we can trust
@@ -6815,13 +6827,7 @@ static void kcc_alone_on_path_eval(struct sock* sk,                            /
      *    marks packets when queue exceeds the marking threshold.
      *    Absence of marks implies an empty bottleneck buffer.
      *
-     * 4. lt_use_bw == 0:
-     *    Not in policer - detected rate - limited mode.  When LT BW
-     *    is active, the path rate is constrained by a policer —
-     *    we are effectively competing with a fixed - rate limiter
-     *    and should maintain KCC's protective LT probe behavior.
-     *
-     * 5. agg_state <= max per kcc_alone_agg_state_level_val:
+     * 4. agg_state <= max per kcc_alone_agg_state_level_val:
      *    Configurable ACK aggregation strictness for alone detection.
      *    TCP delayed-ACK produces natural SUSPECTED-state aggregation
      *    even on a quiet single-flow path — requiring IDLE blocks
@@ -6835,7 +6841,7 @@ static void kcc_alone_on_path_eval(struct sock* sk,                            /
      *
      * Entry: requires N consecutive qualifying rounds (hysteresis).
      * The confirmation counter increments once per round boundary
-     * when all six conditions hold.  This prevents oscillation
+     * when all five conditions hold.  This prevents oscillation
      * during brief quiet windows in multi-flow competition —
      * "conservative to accelerate".
      *
@@ -6857,9 +6863,8 @@ static void kcc_alone_on_path_eval(struct sock* sk,                            /
             ext->qdelay_avg < (u32)kcc_alone_qdelay_thresh_us_val &&                   /* queue below configurable threshold */
             ext->jitter_ewma < (u32)kcc_alone_jitter_thresh_us_val &&                  /* jitter below configurable threshold */
             ext->ecn_ewma == 0 &&                                                       /* no ECN marks from AQM */
-            (kcc_alone_bypass_lt_bw_val || kcc->lt_use_bw == 0) &&                      /* LT BW: configurable bypass (default skip) */
             ext->agg_state <= max_agg) {                                                /* configurable agg strictness */
-            /* All six conditions hold on this round boundary.
+            /* All five conditions hold on this round boundary.
              * Increment the consecutive confirmation counter.
              * Wrap at 255 (u8 max) to prevent overflow on connections
              * running millions of rounds in single-flow mode — the
@@ -7675,7 +7680,6 @@ static struct ctl_table kcc_ctl_table[] = {                                     
     {.procname = "kcc_alone_jitter_thresh_us",   .data = &kcc_alone_jitter_thresh_us,   .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100k us] alone mode max jitter; KCC-only; default 2000 */
     {.procname = "kcc_alone_agg_state_level",    .data = &kcc_alone_agg_state_level,    .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..2] alone mode agg strictness; KCC-only; default 1 */
     {.procname = "kcc_alone_bypass_ecn",         .data = &kcc_alone_bypass_ecn,         .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0/1] alone mode ECN bypass; KCC-only; default 1=bypass */
-    {.procname = "kcc_alone_bypass_lt_bw",       .data = &kcc_alone_bypass_lt_bw,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0/1] alone mode LT BW bypass; KCC-only; default 1=bypass */
     {.procname = "kcc_ecn_enable",              .data = &kcc_ecn_enable,              .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0/1] ECN master switch; KCC extension; default 1=enabled */
     {.procname = "kcc_ecn_backoff_num",         .data = &kcc_ecn_backoff_num,         .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100] ECN backoff percentage numerator; KCC extension; default 20 */
     {.procname = "kcc_ecn_backoff_den",         .data = &kcc_ecn_backoff_den,         .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] ECN backoff percentage denominator; KCC extension; default 100 */

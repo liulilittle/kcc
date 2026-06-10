@@ -189,23 +189,25 @@ Rapport de marque ECN EWMA : mis à jour aux limites de round par `kcc_ecn_ewma_
 
 ### Détection de Flux Unique
 
-Lorsqu'KCC détecte que le flux est probablement seul sur le goulot d'étranglement (faible délai de file d'attente, faible gigue, aucune marque ECN, aucune agrégation d'ACK, aucune bande passante LT), il passe automatiquement en mode BBR pur :
+Lorsqu'KCC détecte que le flux est probablement seul sur le goulot d'étranglement (faible délai de file d'attente, faible gigue, aucune marque ECN, aucune agrégation d'ACK), il passe automatiquement en mode BBR pur :
 
 - `kcc_get_model_rtt()` renvoie directement `min_rtt_us` (évitant l'estimation lissée de Kalman, qui a un léger biais positif dû au bruit de mesure unilatéral).
 - `kcc_ecn_backoff()` est configurable via `kcc_alone_bypass_ecn` (défaut 1) — sur un chemin à flux unique, les marques ECN sont des faux positifs de l'AQM car il n'y a pas d'autre émetteur en compétition. Le sauter correspond au comportement ECN zéro de BBR. Mettez à 0 pour conserver le backoff ECN même en mode solo (conservateur).
-- La condition LT BW (policer) est configurable via `kcc_alone_bypass_lt_bw` (défaut 1) — un chemin à flux unique n'a pas de policer, donc LT BW ne peut pas s'activer légitimement. Le sauter évite les sorties intempestives du mode solo dues à de faux déclenchements. Mettez à 0 pour le comportement strict d'origine.
 
-Cela élimine l'écart de performance en flux unique entre KCC et BBR, tout en préservant la boucle de protection complète d'KCC (Kalman, backoff ECN, décroissance de gain, bande passante LT) pour les scénarios multi-flux.
+Cela élimine l'écart de performance en flux unique entre KCC et BBR, tout en préservant la boucle de protection complète d'KCC (Kalman, backoff ECN, décroissance de gain) pour les scénarios multi-flux.
 
-**Hystérésis** : L'entrée nécessite `kcc_alone_confirm_rounds` (défaut 3) rounds consécutifs qualifiés — évitant les oscillations lors de brèves périodes d'accalmie dans la compétition multi-flux ("conservateur pour accélérer"). La sortie est immédiate — tout échec de qualification efface le drapeau et réinitialise le compteur de confirmation ("agressif pour freiner").
+**Hystérésis** : L'entrée nécessite `kcc_alone_confirm_rounds` (défaut 3) rounds consécutifs qualifiés — évitant les oscillations lors de brèves périodes d'accalmie dans la compétition multi-flux ("conservateur pour accélérer"). Sortie : lors de l'évaluation en phase de croisière, tout échec de qualification unique efface le drapeau ("agressif pour freiner").
 
-Conditions de qualification (les six doivent être satisfaites à une limite de tour) :
+**Compromis de conception** : La perte de paquets n'est PAS utilisée comme disqualifiant de flux unique — certaines liaisons (tampons peu profonds, sans fil, pertes en rafale de virtualisation) ont des pertes inhérentes sans rapport avec la concurrence. Assimiler la perte à une concurrence multi-flux provoque des oscillations sur les chemins à flux unique. Le signal LT BW (détection de policer déclenchée par les pertes de BBR) ne participe pas au jugement de flux unique.
+
+**Gain gating** : l'évaluation de flux unique s'exécute uniquement pendant la phase de croisière (`pacing_gain == BBR_UNIT`). La sonde montante (1,25x) pousse intentionnellement contre le goulot d'étranglement — sa pression de file d'attente est auto-induite et non un signal de concurrence. Le drain (0,75x) supprime artificiellement la file d'attente. En limitant l'évaluation à la croisière (l'équilibre stationnaire), la pression de sonde montante auto-induite ne provoque plus de fausses sorties du mode seul.
+
+Conditions de qualification (les cinq doivent être satisfaites à une limite de tour) :
 0. Kalman convergé (`sample_cnt >= kcc_kalman_min_samples`) — faire confiance à qdelay/jitter comme signaux de file
 1. `qdelay_avg < kcc_alone_qdelay_thresh_us` (par défaut 1000 us) — file presque vide
 2. `jitter_ewma < kcc_alone_jitter_thresh_us` (par défaut 2000 us) — micro-gigue d'horloge ACK uniquement
 3. `ecn_ewma == 0` — aucune marque de congestion d'AQM
-4. `lt_use_bw == 0` — pas en mode de débit limité détecté par le policer
-5. `agg_state <= max` selon `kcc_alone_agg_state_level` (par défaut 1) — trois niveaux de rigueur d'agrégation ACK : 0 = IDLE seulement (le plus strict, zéro agrégation), 1 = ≤ SUSPECTED (par défaut, permet l'agrégation transitoire), 2 = ≤ CONFIRMED (le plus permissif, bloque uniquement l'agrégation persistante)
+4. `agg_state <= max` selon `kcc_alone_agg_state_level` (par défaut 1) — trois niveaux de rigueur d'agrégation ACK : 0 = IDLE seulement (le plus strict, zéro agrégation), 1 = ≤ SUSPECTED (par défaut, permet l'agrégation transitoire), 2 = ≤ CONFIRMED (le plus permissif, bloque uniquement l'agrégation persistante)
 
 ### Intervalle PROBE_RTT Dynamique
 
@@ -499,7 +501,6 @@ Les paramètres sont exposés sous `/proc/sys/net/kcc/`. Les écritures déclenc
 | kcc_alone_jitter_thresh_us | 2000 | 0-100k | µs | Gigue max pour détection de flux unique |
 | kcc_alone_agg_state_level | 1 | 0-2 | — | Rigueur d'agrégation (0=IDLE seulement, 1=≤SUSPECTED défaut, 2=≤CONFIRMED trop agressif) |
 | `kcc_alone_bypass_ecn` | 1 | 0-1 | — | Ignorer le backoff ECN en mode solo (1=ignorer, 0=actif) |
-| `kcc_alone_bypass_lt_bw` | 1 | 0-1 | — | Ignorer la condition LT BW en mode solo (1=ignorer, 0=actif) |
 
 ## Chemin de Données
 
