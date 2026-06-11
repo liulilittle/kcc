@@ -1229,7 +1229,10 @@ module_param_cb(kcc_kf_discount_den, &kcc_param_ops, &kcc_kf_discount_den, 0644)
  * variable cold-start injection.  When 1, init_bw uses the long-term
  * peak (kcc_kf_x_steady, monotonic max ever observed) directly:
  *
- *   fair = max(kf_x, kf_x_steady)
+ *   fair = kf_x;
+ *   if (kf_x_steady > fair) {
+ *       fair = kf_x_steady;
+ *   }
  *
  * The peak provides a stable upper baseline for cold-start injection
  * that is not polluted by transient dips in the live KF estimate.
@@ -7052,7 +7055,9 @@ static u64 kcc_kf_get_init_bw(struct sock* sk)                   /* compute boot
     struct tcp_sock* tp = tcp_sk(sk);                                    /* get TCP socket state */
     u64 fair, init_bw;                                                   /* fair-share estimate; discounted init BW */
 
-    /* Guards: return 0 if KF disabled or not yet ready */
+    /* Guards: return 0 if KF disabled or not yet seeded.
+     * kf_active is a one-way flag — once set, never cleared.
+     * When 0, no bandwidth estimate exists yet (fresh boot). */
     if (!kcc_kf_enable_val || !atomic_read(&kcc_kf_active)) {              /* KF disabled or never seeded */
         return 0;                                                        /* no estimate available */
     }
@@ -7072,8 +7077,9 @@ static u64 kcc_kf_get_init_bw(struct sock* sk)                   /* compute boot
      * kf_x_steady is zeroed in kcc_init_module_params on mode disable. */
     if (kcc_kf_steady_mode_val) {
         u64 peak = (u64)atomic64_read(&kcc_kf_x_steady);
-        if (peak > fair)
+        if (peak > fair) {
             fair = peak;
+        }
     }
 
     /* Discount and gain-compensate:
