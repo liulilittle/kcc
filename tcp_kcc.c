@@ -287,18 +287,17 @@
 #define KCC_CTL_TABLE struct ctl_table
 #endif
     /*
-     * tcp_snd_cwnd_set() / tcp_snd_cwnd() were introduced in kernel 5.14.
-     * Provide inline fallbacks for older kernels so KCC compiles against
-     * pre-5.14 kernels without modification.
+     * Kernel helpers tcp_snd_cwnd_set() / tcp_snd_cwnd() were introduced
+     * in mainline 5.19 and backported to some stable kernels.  Out-of-tree
+     * modules cannot reliably infer those backports from LINUX_VERSION_CODE
+     * alone, especially on distribution kernels such as Ubuntu 5.15.0-*.
      *
      * Kernel BBR does not need these fallbacks because it is part of the
      * kernel tree and is always compiled against its own version.  KCC
      * as an out-of-tree module must bridge the gap.
      */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
-static inline void tcp_snd_cwnd_set(struct tcp_sock* tp, u32 val) { WRITE_ONCE(tp->snd_cwnd, val); }
-static inline u32 tcp_snd_cwnd(const struct tcp_sock* tp) { return READ_ONCE(tp->snd_cwnd); }
-#endif
+static inline void kcc_tcp_snd_cwnd_set(struct tcp_sock* tp, u32 val) { WRITE_ONCE(tp->snd_cwnd, val); }
+static inline u32 kcc_tcp_snd_cwnd(const struct tcp_sock* tp) { return READ_ONCE(tp->snd_cwnd); }
 /* ---- Fixed-Point Scales --------------------------------------------- */
 /*
  * KCC uses the exact fixed-point scales as kernel BBR (tcp_bbr.c) for
@@ -3005,7 +3004,7 @@ static void kcc_init_pacing_rate_from_rtt(struct sock* sk)                    /*
     }
 
     /* bw = cwnd * BW_UNIT / rtt_us  (bandwidth proxy from BDP) */
-    bw = (u64)tcp_snd_cwnd(tp) * BW_UNIT;                                         /* cwnd in BW_UNIT scale */
+    bw = (u64)kcc_tcp_snd_cwnd(tp) * BW_UNIT;                                         /* cwnd in BW_UNIT scale */
     bw = div_u64(bw, rtt_us);                                   /* 64-bit / 32-bit division: bw in BW_UNIT */
 
     WRITE_ONCE(sk->sk_pacing_rate, kcc_bw_to_pacing_rate(sk, bw, kcc_high_gain_val));
@@ -3215,10 +3214,10 @@ static void kcc_save_cwnd(struct sock* sk)                                    /*
     struct kcc* kcc = (struct kcc*)inet_csk_ca(sk);                          /* get KCC CA state */
 
     if (kcc->prev_ca_state < TCP_CA_Recovery && kcc->mode != KCC_PROBE_RTT) { /* not already in recovery/ProbeRTT */
-        kcc->prior_cwnd = tcp_snd_cwnd(tp);                                       /* first entry to recovery/ProbeRTT: save cwnd */
+        kcc->prior_cwnd = kcc_tcp_snd_cwnd(tp);                                       /* first entry to recovery/ProbeRTT: save cwnd */
     }
     else {                                                                 /* already in recovery/ProbeRTT */
-        kcc->prior_cwnd = max_t(u32, kcc->prior_cwnd, tcp_snd_cwnd(tp));          /* keep max of saved and current */
+        kcc->prior_cwnd = max_t(u32, kcc->prior_cwnd, kcc_tcp_snd_cwnd(tp));          /* keep max of saved and current */
     }
 }
 /*
@@ -4031,7 +4030,7 @@ static bool kcc_set_cwnd_to_recover_or_restore(                                 
     struct tcp_sock* tp = tcp_sk(sk);                                             /* get TCP socket state */
     struct kcc* kcc = (struct kcc*)inet_csk_ca(sk);                               /* get KCC CA state */
     u8 prev_state = kcc->prev_ca_state, state = inet_csk(sk)->icsk_ca_state;      /* previous and current CA states */
-    u32 cwnd = tcp_snd_cwnd(tp);                                                       /* start with current cwnd */
+    u32 cwnd = kcc_tcp_snd_cwnd(tp);                                                       /* start with current cwnd */
 
     /* Loss: reduce cwnd by the number of lost segments (floor at 1) */
     if (rs->losses > 0) {                                                           /* losses present */
@@ -4183,7 +4182,7 @@ static void kcc_set_cwnd(struct sock* sk, const struct rate_sample* rs,         
 {
     struct tcp_sock* tp = tcp_sk(sk);                                                /* get TCP socket state */
     struct kcc* kcc = (struct kcc*)inet_csk_ca(sk);                                  /* get KCC CA state */
-    u32 cwnd = tcp_snd_cwnd(tp), target;                                                   /* current cwnd and target */
+    u32 cwnd = kcc_tcp_snd_cwnd(tp), target;                                                   /* current cwnd and target */
 
     /* Step 1: no data ACKed → no cwnd progression */
     if (unlikely(!acked)) {                                                                        /* uncommon: pure SACK or dupack */
@@ -4229,12 +4228,12 @@ static void kcc_set_cwnd(struct sock* sk, const struct rate_sample* rs,         
     cwnd = max(cwnd, kcc_cwnd_min_target_val);                                         /* floor: never below min cwnd */
 
 done:
-    tcp_snd_cwnd_set(tp, min(cwnd, tp->snd_cwnd_clamp));                               /* global cap */
+    kcc_tcp_snd_cwnd_set(tp, min(cwnd, tp->snd_cwnd_clamp));                               /* global cap */
 
     /* Step 6: PROBE_RTT enforcement (reasoning (5)).
      * Second cwnd cap — PROBE_RTT must drain pipe to probe min_rtt. */
     if (unlikely(kcc->mode == KCC_PROBE_RTT)) {
-        tcp_snd_cwnd_set(tp, min(tcp_snd_cwnd(tp), kcc_cwnd_min_target_val));           /* force 4-segment minimum */
+        kcc_tcp_snd_cwnd_set(tp, min(kcc_tcp_snd_cwnd(tp), kcc_cwnd_min_target_val));           /* force 4-segment minimum */
     }
 }
 /* ---- Cycle Phase Check (Cardwell et al. 2016) ------------------------ */
@@ -6365,7 +6364,7 @@ static u32 kcc_measure_ack_aggregation(struct sock* sk, const struct rate_sample
     }
 
     /* Cap 1: not more than current cwnd */
-    extra = min_t(u32, extra, tcp_snd_cwnd(tp));
+    extra = min_t(u32, extra, kcc_tcp_snd_cwnd(tp));
 
     /* Cap 2: not more than bw * window_ms worth of data */
     {
@@ -7118,7 +7117,7 @@ static u64 kcc_kf_get_init_bw(struct sock* sk)                   /* compute boot
     /* Local BW check: if the connection's own cwnd/RTT already exceeds
      * the global estimate, the local path is faster — return 0 to let
      * the connection probe on its own without external guidance. */
-    if (init_bw < (u64)tcp_snd_cwnd(tp) * (u64)BBR_UNIT / max_t(u32, tp->srtt_us >> 3, 1U)) { /* local BW > global estimate */
+    if (init_bw < (u64)kcc_tcp_snd_cwnd(tp) * (u64)BBR_UNIT / max_t(u32, tp->srtt_us >> 3, 1U)) { /* local BW > global estimate */
         return 0;                                                        /* global estimate is too conservative */
     }
 
@@ -7454,7 +7453,7 @@ KCC_KFUNC u32 kcc_undo_cwnd(struct sock* sk)                                    
     kcc->full_bw = 0;                                                                                /* reset full_bw estimate */
     kcc->full_bw_cnt = 0;                                                                            /* reset full_bw counter */
     kcc_reset_lt_bw_sampling(sk);                                                                      /* clear LT BW state */
-    return tcp_snd_cwnd(tcp_sk(sk));                                                                        /* return current cwnd */
+    return kcc_tcp_snd_cwnd(tcp_sk(sk));                                                                        /* return current cwnd */
 }
 /*
  * kcc_ssthresh - Return the slow-start threshold after a loss event.
