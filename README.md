@@ -81,7 +81,7 @@ Triggered when `full_bw_reached` is set — after `kcc_full_bw_cnt` (default 3) 
 
 ### DRAIN → PROBE_BW
 
-Triggered when estimated inflight-at-EDT ≤ target inflight at 1.0x BDP gain. **Drain-skip optimization**: when the Kalman filter is converged AND `qdelay_avg` is below `kcc_drain_skip_qdelay_us` (default 1000 µs), the DRAIN phase is skipped — converts early to PROBE_BW.
+Triggered when estimated inflight-at-EDT ≤ target inflight at 1.0x BDP gain. **Drain-skip optimization**: when the Kalman filter is converged AND `qdelay_avg < the dynamic clean threshold` (10% of min_rtt_us with 500us floor), the DRAIN phase is skipped — converts early to PROBE_BW.
 
 On PROBE_BW entry, the cycle phase index is randomized: `cycle_idx = len − 1 − rand(kcc_probe_bw_cycle_rand)` (default `len − 1 − rand(8)`), which decorrelates concurrent flows sharing a bottleneck link.
 
@@ -138,11 +138,11 @@ Q        = min(Q, kcc_kalman_q_max)
 
 **Adaptive measurement noise R**:
 ```
-R = R_base + max(0, jitter_ewma − kcc_jitter_r_thresh_us) × R_base / kcc_jitter_r_scale
+R = R_base + max(0, jitter_ewma − clean_thresh) × R_base / kcc_jitter_r_scale
 R = min(R, R_base × kcc_kalman_r_max_boost)
 ```
 
-**Q-Boost path-change detection**: when `|innovation| > kcc_kalman_q_boost_thresh_val` (default ≈ 4 ms RTT shift) AND the filter has converged (`p_est ≤ kcc_kalman_converged_p_est_val`, default 500), `p_est` is reset to `kcc_kalman_p_est_init_val`, boosting Kalman gain toward 1.0 for rapid convergence.  A cooldown of `kcc_kalman_qboost_cdwn` (default 15) samples between successive qboost events prevents runaway triggering on lossy paths with high RTT jitter.
+**Q-Boost path-change detection**: when `|innovation| > kcc_kalman_q_boost_thresh_val` (default ≈ 4 ms RTT shift) AND the filter has converged (`p_est ≤ kcc_kalman_converged_p_est_val`, default 500), `p_est` is reset to `kcc_kalman_p_est_init_val`, boosting Kalman gain toward 1.0 for rapid convergence.  A cooldown of `kcc_kalman_qboost_cdwn` (default 8) samples between successive qboost events prevents runaway triggering on lossy paths with high RTT jitter.
 
 **Outlier gating**: dynamic threshold `dyn_thresh = max(outlier_ms × 1000 × scale, jitter_ewma × outlier_jitter_mult × scale)`. Applied only when `p_pred ≤ kcc_kalman_converged_p_est_val`. After `kcc_kalman_max_consec_reject` (default 25) consecutive rejections, the next sample is force-accepted to prevent self-reinforcing lock-in.
 
@@ -176,7 +176,7 @@ Activation conditions (all must hold):
 1. `kcc_ecn_enable_val != 0`
 2. Kalman converged (`p_est < converged`, `sample_cnt >= min_samples`)
 3. `ecn_ewma > 0` (CE marks observed)
-4. `qdelay_avg > kcc_ecn_qdelay_thresh_us_val` (default 2000 µs)
+4. `qdelay_avg > the dynamic congestion threshold` (25% of min_rtt_us with 500us floor)
 5. Mode is NOT PROBE_BW (cwnd_gain is fixed at 2x in PROBE_BW)
 
 During probing phases (`pacing_gain > BBR_UNIT`), ECN backoff is graduated by `BBR_UNIT² / pacing_gain` — ~80% of backoff at 1.25x probe, ~65% at 2.89x STARTUP gain.
@@ -188,7 +188,7 @@ ECN mark ratio EWMA: updated on round boundaries by `kcc_ecn_ewma_retained / kcc
 When KCC detects the flow is likely alone on the bottleneck (low queue delay, low jitter, no ECN marks, no ACK aggregation, no LT bandwidth), it automatically transitions to a BBR-pure mode:
 
 - `kcc_get_model_rtt()` returns `min_rtt_us` directly (bypassing the Kalman smoothed estimate, which has a small positive bias from one-sided measurement noise).
-- `kcc_ecn_backoff()` is skipped when `kcc_alone_bypass_ecn = 1` (default), matching BBR's zero-ECN behavior. On a single-flow path there is no competing sender to share ECN marks with — any marks are false positives. Set `kcc_alone_bypass_ecn = 0` to keep ECN backoff active even when alone (conservative).
+- `kcc_ecn_backoff()` is skipped when `kcc_alone_bypass_ecn = 1` (default 0, disabled by default). On a single-flow path there is no competing sender to share ECN marks with — any marks are false positives. Set `kcc_alone_bypass_ecn = 1` to bypass ECN backoff when alone (matches BBR's zero-ECN behavior).
 - LT BW (policer-detected rate limit) qualification is configurable via `kcc_alone_bypass_lt_bw` (default 1). A single-flow path has no policer, so LT BW cannot legitimately activate. Setting it to 1 prevents spurious alone-mode exit from false LT BW triggers. Set to 0 for original strict behavior.
 
 This eliminates the single-flow throughput gap between KCC and BBR while preserving KCC's full protection loop (Kalman, ECN backoff, gain decay, LT bandwidth) for multi-flow scenarios.
@@ -197,8 +197,8 @@ This eliminates the single-flow throughput gap between KCC and BBR while preserv
 
 Qualification conditions (all six must hold on a round boundary):
 0. Kalman converged (`sample_cnt >= kcc_kalman_min_samples`) — trust qdelay/jitter as queue signals
-1. `qdelay_avg < kcc_alone_qdelay_thresh_us` (default 1000 us) — near-empty queue
-2. `jitter_ewma < kcc_alone_jitter_thresh_us` (default 2000 us) — ACK-clock micro-jitter only
+1. `qdelay_avg < the dynamic clean threshold` — near-empty queue
+2. `jitter_ewma < the dynamic congestion threshold` — ACK-clock micro-jitter only
 3. `ecn_ewma == 0` — no congestion marks from AQM
 4. `lt_use_bw == 0` — not in policer-detected rate-limited mode
 5. `agg_state <= max` per `kcc_alone_agg_state_level` (default 1) — three-tier configurable:
@@ -229,7 +229,7 @@ In FILTER mode, the Kalman filter replaces the window entirely. It can separate 
 | Decoupled | 1 (default) | **Kalman healthy** (p_est ≤ `kcc_recal_p_est_thresh`): suppress PROBE_RTT entirely → zero throughput cliffs, zero sync collapses. **Kalman diverged** (p_est > threshold): auto-trigger traditional PROBE_RTT as a safety net → restores filter baseline, then decoupling resumes. |
 | Traditional | 0 | Blind periodic PROBE_RTT every ~10s (BBR-compatible). |
 
-**Smart recalibration heuristic** (`kcc_kalman_needs_recalibration()`): In steady-state operation on a stable path, the Kalman error covariance p_est converges to p_est_floor (~4–10), far below the threshold `kcc_recal_p_est_thresh` (250,000 = 25% of p_est_max). A rising p_est signals that the filter's internal model no longer explains observations — typically because the path has materially changed. When p_est exceeds the threshold, a single traditional PROBE_RTT drain restores the filter baseline; the Kalman re-converges and decoupling resumes automatically.
+**Smart recalibration heuristic** (`kcc_kalman_needs_recalibration()`): In steady-state operation on a stable path, the Kalman error covariance p_est converges to p_est_floor (~4–10), far below the threshold `kcc_recal_p_est_thresh` (25,000 = 2.5% of p_est_max). A rising p_est signals that the filter's internal model no longer explains observations — typically because the path has materially changed. When p_est exceeds the threshold, a single traditional PROBE_RTT drain restores the filter baseline; the Kalman re-converges and decoupling resumes automatically.
 
 This transforms PROBE_RTT from a **blind periodic self-mutilation** into an **intelligent confidence-driven recalibration** — the protocol only drains the pipe when it has empirical evidence that the filter has lost confidence.
 
@@ -238,11 +238,11 @@ Requires `kcc_rtt_mode == 1`. No-op in MIN mode (MIN mode depends on PROBE_RTT t
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
 | `kcc_probe_rtt_decouple` | 1 | 0–1 | Enable PROBE_RTT decoupling (FILTER mode only) |
-| `kcc_recal_p_est_thresh` | 250,000 | 1–100,000,000 | p_est threshold for triggered recalibration safety net |
+| `kcc_recal_p_est_thresh` | 25,000 | 1–100,000,000 | p_est threshold for triggered recalibration safety net |
 
 ### LT Bandwidth Estimation
 
-Loss-triggered lower-bound estimator. Sampling interval spans [4, 16] RTTs. Valid when loss ratio ≥ 5.9% (`kcc_lt_loss_thresh` default 15/256). Bandwidth `bw = delivered × BW_UNIT / interval_us`.
+Loss-triggered lower-bound estimator. Sampling interval spans [4, 16] RTTs. Valid when loss ratio ≥ 9.8% (`kcc_lt_loss_thresh` default 25/256). Bandwidth `bw = delivered × BW_UNIT / interval_us`.
 
 Unlike BBR's simple average (`(bw + lt_bw) >> 1`), KCC uses a configurable EMA (`kcc_lt_bw_ema_num / kcc_lt_bw_ema_den`, default 1/2 = 0.5):
 
@@ -252,7 +252,7 @@ lt_bw = (bw_new × en + lt_bw × (ed − en)) / ed
 
 Activation differs from BBR: KCC stores `lt_bw` on the first valid interval but does NOT set `lt_use_bw`; consistency with a previous interval is required — reduces false activation from measurement noise.
 
-**Dual-threshold congestion gate**: Before setting `lt_use_bw = 1`, both a persistent EWMA queue check (`qdelay_avg > kcc_ecn_qdelay_thresh_us_val`) AND an instantaneous SRTT-based queue check (`srtt_us − min_rtt_us > kcc_lt_bw_inst_qdelay_thresh_us`, default 5000 µs) are evaluated. When congestion is detected, LT BW sampling is aborted. The SRTT check works without `ext` allocation, providing a safety net against allocation failure.
+**Dual-threshold congestion gate**: Before setting `lt_use_bw = 1`, both a persistent EWMA queue check (`qdelay_avg > the dynamic congestion threshold`) AND an instantaneous SRTT-based queue check (`srtt_us − min_rtt_us > the instantaneous congestion threshold`, default 5000 µs) are evaluated. When congestion is detected, LT BW sampling is aborted. The SRTT check works without `ext` allocation, providing a safety net against allocation failure.
 
 LT BW probe boost (`kcc_lt_bw_probe_pct`, default 10%): amplifies pacing_gain by `1 + probe_pct/100` across all PROBE_BW phases. Ramp component: `+1% per 8 RTTs` increase, capped at `2 × probe_pct`.
 
@@ -265,7 +265,7 @@ Adds a confidence-gated second layer over the traditional dual-slot extra-acked 
 **Four orthogonal factors** (each contributes `kcc_agg_factor_weight` points, default 256):
 1. Kalman converged (`p_est < converged` + `sample_cnt >= min_samples`)
 2. Not in loss recovery (`icsk_ca_state < TCP_CA_Recovery`)
-3. RTT within `min_rtt_us + kcc_agg_factor3_qdelay_us` (default 2ms) of true propagation delay
+3. RTT within `min_rtt_us + the dynamic clean threshold` of true propagation delay
 4. `extra_acked` within `kcc_agg_factor4_ratio_num/den` (default 1.5x) of windowed maximum
 
 **Four states**: IDLE (< `kcc_agg_thresh_suspected`=256), SUSPECTED (≥256), CONFIRMED (≥512), TRUSTED (≥768).
@@ -273,7 +273,7 @@ Adds a confidence-gated second layer over the traditional dual-slot extra-acked 
 **Signal layer** (always active): confidence linearly interpolates R scaling factor `[r_min, r_max]`. R rises instantly (fast response), decays at `kcc_agg_r_hysteresis`% (default 75% retained, ~4 RTTs to baseline) per RTT.
 
 **Control layer** (`agg_state ≥ CONFIRMED`): five-layer safety-gated cwnd compensation:
-1. Blocks if queue delay > `kcc_agg_safety_qdelay_us` (default 4ms)
+1. Blocks if queue delay > `the dynamic congestion threshold`
 2. Blocks during loss recovery
 3. Blocks if cwnd > `BDP × kcc_agg_safety_bdp_mult` (default 3x)
 4. Blocks if inflight > safe cwnd + TSO segs goal
@@ -357,9 +357,9 @@ Parameters are exposed under `/proc/sys/net/kcc/`. Writes trigger `kcc_init_modu
 | `kcc_kalman_outlier_ms` | 5 | 0 | 10000 | ms | Outlier base threshold |
 | `kcc_kalman_q_boost_mult` | 4 | 1 | 10000 | Q-boost multiplier |
 | `kcc_kalman_q_boost_ms` | 1 | 0 | 5000 | ms | Q-boost time constant |
-| `kcc_kalman_qboost_cdwn` | 15 | 1 | 255 | samples | Q-boost cooldown |
+| `kcc_kalman_qboost_cdwn` | 8 | 1 | 255 | samples | Q-boost cooldown |
 | `kcc_kalman_q_max` | 2000 | 1 | 100k | Q ceiling |
-| `kcc_kalman_q_scale_cap` | 20 | 1 | 10000 | Q scale cap |
+| `kcc_kalman_q_scale_cap` | 50 | 1 | 10000 | Q scale cap |
 | `kcc_kalman_max_consec_reject` | 25 | 1 | 1000 | Max consecutive rejections before force-accept |
 | `kcc_rtt_sample_max_us` | 500000 | 1 | 10M | µs | Kalman RTT ceiling |
 | `kcc_kalman_r_max_boost` | 8 | 1 | 1000 | R max boost multiplier |
@@ -371,7 +371,7 @@ Parameters are exposed under `/proc/sys/net/kcc/`. Writes trigger `kcc_init_modu
 
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
-| `kcc_kalman_outlier_jitter_mult_num/den` | 4 / 1 | 0-1000 / 1-100k | Outlier jitter multiplier |
+| `kcc_kalman_outlier_jitter_mult_num/den` | 3 / 1 | 0-1000 / 1-100k | Outlier jitter multiplier |
 | `kcc_kalman_q_min_factor_num/den` | 10 / 1 | 0-1000 / 1-100k | Q min factor |
 | `kcc_kalman_p_est_init_rtt_div_num/den` | 10 / 1 | 1-100k / 1-100k | p_est init RTT divisor |
 
@@ -382,24 +382,31 @@ Parameters are exposed under `/proc/sys/net/kcc/`. Writes trigger `kcc_init_modu
 | `kcc_kalman_noise_alpha_num/den` | 1 / 10 | 0-100 / 1-100k | Q estimate learning rate |
 | `kcc_kalman_noise_beta_num/den` | 1 / 10 | 0-100 / 1-100k | R estimate learning rate |
 | `kcc_kalman_noise_mode` | 1 | 0-2 | Combine mode (0=off, 1=max, 2=weighted avg) |
-| `kcc_kalman_q_est_max` | 1,000,000,000 | 1-2B | Q estimate upper bound |
-| `kcc_kalman_r_est_max` | 1,000,000,000 | 1-2B | R estimate upper bound |
+| `kcc_kalman_q_est_max` | 50,000 | 1-2B | Q estimate upper bound |
+| `kcc_kalman_r_est_max` | 32,000 | 1-2B | R estimate upper bound |
 | `kcc_kalman_q_est_floor` / `r_est_floor` | 1 | 1-100k | Lower bound per estimate |
 
 ### Gain Decay (Probing)
 
 | Parameter | Default | Range | Unit | Description |
 |-----------|---------|-------|------|-------------|
-| `kcc_qdelay_probe_thresh_us` | 5000 | 0-100k | µs | qdelay decay threshold |
 | `kcc_qdelay_probe_scale_us` | 20000 | 1-100k | µs | qdelay decay scale |
-| `kcc_jitter_probe_thresh_us` | 4000 | 0-100k | µs | Jitter decay threshold |
 | `kcc_jitter_probe_scale_us` | 16000 | 1-100k | µs | Jitter decay scale |
+
+### Dynamic Queue-Delay Thresholds
+
+| Parameter | Default | Range | Unit | Description |
+|-----------|---------|-------|------|-------------|
+| `kcc_qdelay_clean_bp` | 1000 | 1-10000 | ‱ | Clean threshold (= 10 % of min_rtt_us) |
+| `kcc_qdelay_cong_bp` | 2500 | 1-10000 | ‱ | Congestion threshold (= 25 % of min_rtt_us) |
+| `kcc_qdelay_floor_us` | 500 | 1-100k | µs | Absolute floor below which RTT-percentage is overridden |
+
+These are basis-point (‱) values scaled to min_rtt_us. The floor prevents false trigger on low-RTT paths.
 
 ### Adaptive R (Jitter-Driven)
 
 | Parameter | Default | Range | Unit | Description |
 |-----------|---------|-------|------|-------------|
-| `kcc_jitter_r_thresh_us` | 2000 | 0-100k | µs | Jitter threshold for R increase |
 | `kcc_jitter_r_scale` | 8000 | 1-100k | — | R increase scale divisor |
 
 ### ECN
@@ -408,7 +415,6 @@ Parameters are exposed under `/proc/sys/net/kcc/`. Writes trigger `kcc_init_modu
 |-----------|---------|-------|-------------|
 | `kcc_ecn_enable` | 1 | 0-1 | ECN master switch |
 | `kcc_ecn_backoff_num` / `kcc_ecn_backoff_den` | 20 / 100 | 0-100 / 1-100k | ECN backoff fraction |
-| `kcc_ecn_qdelay_thresh_us` | 2000 | 0-100k | µs | ECN qdelay threshold |
 | `kcc_ecn_ewma_retained` / `kcc_ecn_ewma_total` | 3 / 4 | 0-100 / 1-100k | ECN EWMA weights |
 | `kcc_ecn_idle_decay_num` / `kcc_ecn_idle_decay_den` | 31 / 32 | 1-100k | Idle ECN decay |
 
@@ -427,7 +433,7 @@ Parameters are exposed under `/proc/sys/net/kcc/`. Writes trigger `kcc_init_modu
 |-----------|---------|-------|-------------|
 | `kcc_lt_intvl_min_rtts` | 4 | 1-127 | RTTs | Min interval length |
 | `kcc_lt_intvl_max_mult` | 4 | 1-32 | Interval timeout multiplier |
-| `kcc_lt_loss_thresh` | 15 | 1-65535 | BBR_UNIT | Min loss ratio |
+| `kcc_lt_loss_thresh` | 25 | 1-65535 | BBR_UNIT | Min loss ratio |
 | `kcc_lt_bw_ratio_num` / `kcc_lt_bw_ratio_den` | 1 / 8 | 0-100k / 1-100k | Relative tolerance |
 | `kcc_lt_bw_diff` | 500 | 0-100k | bytes/s | Absolute tolerance |
 | `kcc_lt_bw_max_rtts` | 48 | 1-4094 | RTTs | LT BW max active RTTs |
@@ -446,13 +452,11 @@ Parameters are exposed under `/proc/sys/net/kcc/`. Writes trigger `kcc_init_modu
 |-----------|---------|-------|-------------|
 | `kcc_agg_enable` | 1 | 0-1 | Master switch |
 | `kcc_agg_confidence_thresh` | 512 | 0-10000 | cwnd compensation confidence threshold |
-| `kcc_agg_max_comp_ratio` | 75 | 0-100 | % of BDP | cwnd comp cap |
+| `kcc_agg_max_comp_ratio` | 50 | 0-100 | % of BDP | cwnd comp cap |
 | `kcc_agg_max_comp_duration` | 8 | 1-128 | RTTs | Watchdog timeout |
 | `kcc_agg_r_hysteresis` | 75 | 0-100 | % | R hysteresis decay |
 | `kcc_agg_r_multiplier_min` / `kcc_agg_r_multiplier_max` | 256 / 2048 | 1-10000 | R scaling range (256=1x) |
-| `kcc_agg_factor3_qdelay_us` | 2000 | 0-100k | µs | Factor 3 qdelay margin |
 | `kcc_agg_factor4_ratio_num` / `kcc_agg_factor4_ratio_den` | 3 / 2 | 1-100k | Factor 4 ratio |
-| `kcc_agg_safety_qdelay_us` | 4000 | 0-100k | µs | Safety guard 1 qdelay |
 | `kcc_agg_safety_bdp_mult` | 3 | 1-100 | Safety guard BDP multiplier |
 | `kcc_agg_max_window_ms` | 100 | 1-10000 | ms | extra_acked cap window |
 | `kcc_agg_max_decay_pct` | 75 | 0-100 | % | Watchdog decay rate |
@@ -491,12 +495,9 @@ Parameters are exposed under `/proc/sys/net/kcc/`. Writes trigger `kcc_init_modu
 | `kcc_extra_acked_max_ms_num` / `kcc_extra_acked_max_ms_den` | 150 / 1 | 0-100k / 1-100k | Max ACK agg window |
 | `kcc_probe_rtt_long_rtt_us` | 20000 | 0-10M | µs | Long-RTT threshold |
 | `kcc_probe_rtt_long_interval_div` | 1 | 1-1000 | Long-RTT interval divisor |
-| `kcc_drain_skip_qdelay_us` | 1000 | 0-100k | µs | Drain-skip qdelay threshold |
 | `kcc_alone_confirm_rounds` | 3 | 1-32 | rounds | Rounds before activating single-flow mode |
-| `kcc_alone_qdelay_thresh_us` | 1000 | 0-100k | µs | Max qdelay for single-flow detection |
-| `kcc_alone_jitter_thresh_us` | 2000 | 0-100k | µs | Max jitter for single-flow detection |
 | `kcc_alone_agg_state_level` | 1 | 0-2 | — | Aggregation strictness (0=IDLE, 1=≤SUSPECTED, 2=≤CONFIRMED) |
-| `kcc_alone_bypass_ecn` | 1 | 0-1 | — | Bypass ECN backoff when alone (1=skip, 0=keep active) |
+| `kcc_alone_bypass_ecn` | 0 | 0-1 | — | Bypass ECN backoff when alone (1=skip, 0=keep active) |
 | `kcc_alone_bypass_lt_bw` | 1 | 0-1 | — | Bypass LT BW qualification when alone (1=skip, 0=keep active) |
 
 ## Data Path

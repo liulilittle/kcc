@@ -81,7 +81,7 @@ Se activa cuando `full_bw_reached` se establece — después de `kcc_full_bw_cnt
 
 ### DRAIN → PROBE_BW
 
-Se activa cuando el tráfico en vuelo estimado a EDT ≤ tráfico en vuelo objetivo con ganancia BDP de 1.0x. **Optimización de salto de DRAIN**: cuando el filtro de Kalman está convergido Y `qdelay_avg` está por debajo de `kcc_drain_skip_qdelay_us` (por defecto 1000 µs), la fase DRAIN se omite — se convierte temprano a PROBE_BW.
+Se activa cuando el tráfico en vuelo estimado a EDT ≤ tráfico en vuelo objetivo con ganancia BDP de 1.0x. **Optimización de salto de DRAIN**: cuando el filtro de Kalman está convergido Y `qdelay_avg < el umbral dinámico limpio` (10% de min_rtt_us con piso de 500us), la fase DRAIN se omite — se convierte temprano a PROBE_BW.
 
 Al ingresar a PROBE_BW, el índice de fase del ciclo se aleatoriza: `cycle_idx = len − 1 − rand(kcc_probe_bw_cycle_rand)` (por defecto `len − 1 − rand(8)`), lo que descorrelaciona flujos concurrentes que comparten un enlace congestionado.
 
@@ -142,7 +142,7 @@ Q        = min(Q, kcc_kalman_q_max)
 
 **Ruido de medición adaptativo R**:
 ```
-R = R_base + max(0, jitter_ewma − kcc_jitter_r_thresh_us) × R_base / kcc_jitter_r_scale
+R = R_base + max(0, jitter_ewma − clean_thresh) × R_base / kcc_jitter_r_scale
 R = min(R, R_base × kcc_kalman_r_max_boost)
 ```
 
@@ -180,7 +180,7 @@ Condiciones de activación (todas deben cumplirse):
 1. `kcc_ecn_enable_val != 0`
 2. Kalman convergido (`p_est < converged`, `sample_cnt >= min_samples`)
 3. `ecn_ewma > 0` (marcas CE observadas)
-4. `qdelay_avg > kcc_ecn_qdelay_thresh_us_val` (por defecto 2000 µs)
+4. `qdelay_avg > el umbral dinámico de congestión` (25% de min_rtt_us con piso de 500us)
 5. El modo NO es PROBE_BW (cwnd_gain es fijo en 2x en PROBE_BW)
 
 Durante las fases de sondeo (`pacing_gain > BBR_UNIT`), el retroceso ECN es graduado por `BBR_UNIT² / pacing_gain` — ~80% de retroceso en sonda 1.25x, ~65% en ganancia STARTUP 2.89x.
@@ -204,8 +204,8 @@ Esto elimina la brecha de rendimiento en flujo único entre KCC y BBR, preservan
 
 Condiciones de calificación (las cinco deben cumplirse en un límite de ronda):
 0. Kalman convergido (`sample_cnt >= kcc_kalman_min_samples`) — confiar en qdelay/jitter como señales de cola
-1. `qdelay_avg < kcc_alone_qdelay_thresh_us` (predeterminado 1000 us) — cola casi vacía
-2. `jitter_ewma < kcc_alone_jitter_thresh_us` (predeterminado 2000 us) — solo micro-fluctuación de reloj ACK
+1. `qdelay_avg < el umbral dinámico limpio` — cola casi vacía
+2. `jitter_ewma < el umbral dinámico de congestión` — solo micro-fluctuación de reloj ACK
 3. `ecn_ewma == 0` — sin marcas de congestión de AQM
 4. `agg_state <= max` según `kcc_alone_agg_state_level` (predeterminado 1) — tres niveles de rigor de agregación ACK: 0 = solo IDLE (más estricto, cero agregación), 1 = ≤ SUSPECTED (predeterminado, permite agregación transitoria), 2 = ≤ CONFIRMED (más permisivo, solo bloquea agregación persistente)
 
@@ -243,7 +243,7 @@ Requiere `kcc_rtt_mode == 1`. Sin efecto en modo MIN (el modo MIN depende de PRO
 | Parámetro | Predeterminado | Rango | Descripción |
 |-----------|----------------|-------|-------------|
 | `kcc_probe_rtt_decouple` | 1 | 0–1 | Activar desacoplamiento PROBE_RTT (solo modo FILTER) |
-| `kcc_recal_p_est_thresh` | 250,000 | 1–100,000,000 | Umbral p_est para red de seguridad de recalibración |
+| `kcc_recal_p_est_thresh` | 25000 | 1–100,000,000 | Umbral p_est para red de seguridad de recalibración |
 
 ### Estimación de Ancho de Banda LT
 
@@ -257,7 +257,7 @@ lt_bw = (bw_new × en + lt_bw × (ed − en)) / ed
 
 La activación difiere de BBR: KCC almacena `lt_bw` en el primer intervalo válido pero NO establece `lt_use_bw`; se requiere consistencia con un intervalo anterior — reduce la activación falsa por ruido de medición.
 
-**Compuerta de congestión de doble umbral**: Antes de establecer `lt_use_bw = 1`, se evalúan tanto una verificación de cola EWMA persistente (`qdelay_avg > kcc_ecn_qdelay_thresh_us_val`) como una verificación de cola instantánea basada en SRTT (`srtt_us − min_rtt_us > kcc_lt_bw_inst_qdelay_thresh_us`, predeterminado 5000 µs). Cuando se detecta congestión, el muestreo LT BW se aborta. La verificación SRTT funciona sin asignación `ext`, proporcionando una red de seguridad contra fallas de asignación.
+**Compuerta de congestión de doble umbral**: Antes de establecer `lt_use_bw = 1`, se evalúan tanto una verificación de cola EWMA persistente (`qdelay_avg > el umbral dinámico de congestión`) como una verificación de cola instantánea basada en SRTT (`srtt_us − min_rtt_us > el umbral instantáneo de congestión`, predeterminado 5000 µs). Cuando se detecta congestión, el muestreo LT BW se aborta. La verificación SRTT funciona sin asignación `ext`, proporcionando una red de seguridad contra fallas de asignación.
 
 
 
@@ -269,7 +269,7 @@ Agrega una segunda capa con compuerta de confianza sobre el estimador tradiciona
 **Cuatro factores ortogonales** (cada uno contribuye `kcc_agg_factor_weight` puntos, por defecto 256):
 1. Kalman convergido (`p_est < converged` + `sample_cnt >= min_samples`)
 2. No en recuperación de pérdida (`icsk_ca_state < TCP_CA_Recovery`)
-3. RTT dentro de `min_rtt_us + kcc_agg_factor3_qdelay_us` (por defecto 2ms) del retardo de propagación real
+3. RTT dentro de `min_rtt_us + el umbral dinámico limpio` del retardo de propagación real
 4. `extra_acked` dentro de `kcc_agg_factor4_ratio_num/den` (por defecto 1.5x) del máximo ventaneado
 
 **Cuatro estados**: IDLE (< `kcc_agg_thresh_suspected`=256), SOSPECHOSO (≥256), CONFIRMADO (≥512), CONFIABLE (≥768).
@@ -277,7 +277,7 @@ Agrega una segunda capa con compuerta de confianza sobre el estimador tradiciona
 **Capa de señal** (siempre activa): la confianza interpola linealmente el factor de escalado R `[r_min, r_max]`. R sube instantáneamente (respuesta rápida), decae a `kcc_agg_r_hysteresis`% (por defecto 75% retenido, ~4 RTTs a la línea base) por RTT.
 
 **Capa de control** (`agg_state ≥ CONFIRMED`): compensación de cwnd con compuerta de seguridad de cinco capas:
-1. Bloquea si el retardo de cola > `kcc_agg_safety_qdelay_us` (por defecto 4ms)
+1. Bloquea si el retardo de cola > `el umbral dinámico de congestión`
 2. Bloquea durante la recuperación de pérdida
 3. Bloquea si cwnd > `BDP × kcc_agg_safety_bdp_mult` (por defecto 3x)
 4. Bloquea si en vuelo > cwnd seguro + objetivo de segmentos TSO
@@ -361,9 +361,9 @@ Los parámetros se exponen bajo `/proc/sys/net/kcc/`. Las escrituras activan `kc
 | `kcc_kalman_outlier_ms` | 5 | 0 | 10000 | ms | Umbral base de valores atípicos |
 | `kcc_kalman_q_boost_mult` | 4 | 1 | 10000 | Multiplicador Q-boost |
 | `kcc_kalman_q_boost_ms` | 1 | 0 | 5000 | ms | Constante de tiempo Q-boost |
-| `kcc_kalman_qboost_cdwn` | 15 | 1 | 255 | samples | Enfriamiento Q-boost |
+| `kcc_kalman_qboost_cdwn` | 8 | 1 | 255 | samples | Enfriamiento Q-boost |
 | `kcc_kalman_q_max` | 2000 | 1 | 100k | Techo Q |
-| `kcc_kalman_q_scale_cap` | 20 | 1 | 10000 | Límite de escala Q |
+| `kcc_kalman_q_scale_cap` | 50 | 1 | 10000 | Límite de escala Q |
 | `kcc_kalman_max_consec_reject` | 25 | 1 | 1000 | Máximo de rechazos consecutivos antes de forzar aceptación |
 | `kcc_rtt_sample_max_us` | 500000 | 1 | 10M | µs | Techo de RTT de Kalman |
 | `kcc_kalman_r_max_boost` | 8 | 1 | 1000 | Multiplicador de impulso máximo R |
@@ -375,7 +375,7 @@ Los parámetros se exponen bajo `/proc/sys/net/kcc/`. Las escrituras activan `kc
 
 | Parámetro | Por defecto | Rango | Descripción |
 |-----------|-------------|-------|-------------|
-| `kcc_kalman_outlier_jitter_mult_num/den` | 4 / 1 | 0-1000 / 1-100k | Multiplicador de fluctuación para valores atípicos |
+| `kcc_kalman_outlier_jitter_mult_num/den` | 3 / 1 | 0-1000 / 1-100k | Multiplicador de fluctuación para valores atípicos |
 | `kcc_kalman_q_min_factor_num/den` | 10 / 1 | 0-1000 / 1-100k | Factor mínimo Q |
 | `kcc_kalman_p_est_init_rtt_div_num/den` | 10 / 1 | 1-100k / 1-100k | Divisor RTT de inicialización p_est |
 
@@ -386,24 +386,29 @@ Los parámetros se exponen bajo `/proc/sys/net/kcc/`. Las escrituras activan `kc
 | `kcc_kalman_noise_alpha_num/den` | 1 / 10 | 0-100 / 1-100k | Tasa de aprendizaje de estimación Q |
 | `kcc_kalman_noise_beta_num/den` | 1 / 10 | 0-100 / 1-100k | Tasa de aprendizaje de estimación R |
 | `kcc_kalman_noise_mode` | 1 | 0-2 | Modo de combinación (0=off, 1=max, 2=promedio ponderado) |
-| `kcc_kalman_q_est_max` | 1,000,000,000 | 1-2B | Límite superior de estimación Q |
-| `kcc_kalman_r_est_max` | 1,000,000,000 | 1-2B | Límite superior de estimación R |
+| `kcc_kalman_q_est_max` | 50000 | 1-2B | Límite superior de estimación Q |
+| `kcc_kalman_r_est_max` | 32000 | 1-2B | Límite superior de estimación R |
 | `kcc_kalman_q_est_floor` / `r_est_floor` | 1 | 1-100k | Límite inferior por estimación |
 
 ### Decaimiento de Ganancia (Sondeo)
 
 | Parámetro | Por defecto | Rango | Unidad | Descripción |
 |-----------|-------------|-------|--------|-------------|
-| `kcc_qdelay_probe_thresh_us` | 5000 | 0-100k | µs | Umbral de decaimiento qdelay |
 | `kcc_qdelay_probe_scale_us` | 20000 | 1-100k | µs | Escala de decaimiento qdelay |
-| `kcc_jitter_probe_thresh_us` | 4000 | 0-100k | µs | Umbral de decaimiento de fluctuación |
 | `kcc_jitter_probe_scale_us` | 16000 | 1-100k | µs | Escala de decaimiento de fluctuación |
+
+### Umbrales Dinámicos de Retardo de Cola
+
+| Parámetro | Por defecto | Rango | Unidad | Descripción |
+|-----------|-------------|-------|--------|-------------|
+| `kcc_qdelay_clean_bp` | 1000 | 1-10000 | ‱ | Umbral limpio (10 % de min_rtt_us) |
+| `kcc_qdelay_cong_bp` | 2500 | 1-10000 | ‱ | Umbral de congestión (25 % de min_rtt_us) |
+| `kcc_qdelay_floor_us` | 500 | 1-100k | µs | Piso absoluto para anulación de porcentaje RTT |
 
 ### R Adaptativo (Impulsado por Fluctuación)
 
 | Parámetro | Por defecto | Rango | Unidad | Descripción |
 |-----------|-------------|-------|--------|-------------|
-| `kcc_jitter_r_thresh_us` | 2000 | 0-100k | µs | Umbral de fluctuación para aumento de R |
 | `kcc_jitter_r_scale` | 8000 | 1-100k | — | Divisor de escala de aumento R |
 
 ### ECN
@@ -412,7 +417,6 @@ Los parámetros se exponen bajo `/proc/sys/net/kcc/`. Las escrituras activan `kc
 |-----------|-------------|-------|-------------|
 | `kcc_ecn_enable` | 1 | 0-1 | Interruptor maestro ECN |
 | `kcc_ecn_backoff_num` / `kcc_ecn_backoff_den` | 20 / 100 | 0-100 / 1-100k | Fracción de retroceso ECN |
-| `kcc_ecn_qdelay_thresh_us` | 2000 | 0-100k | µs | Umbral qdelay ECN |
 | `kcc_ecn_ewma_retained` / `kcc_ecn_ewma_total` | 3 / 4 | 0-100 / 1-100k | Pesos EWMA ECN |
 | `kcc_ecn_idle_decay_num` / `kcc_ecn_idle_decay_den` | 31 / 32 | 1-100k | Decaimiento ECN inactivo |
 
@@ -431,7 +435,7 @@ Los parámetros se exponen bajo `/proc/sys/net/kcc/`. Las escrituras activan `kc
 |-----------|-------------|-------|-------------|
 | `kcc_lt_intvl_min_rtts` | 4 | 1-127 | RTTs | Longitud mínima de intervalo |
 | `kcc_lt_intvl_max_mult` | 4 | 1-32 | Multiplicador de tiempo de espera de intervalo |
-| `kcc_lt_loss_thresh` | 15 | 1-65535 | BBR_UNIT | Relación de pérdida mínima |
+| `kcc_lt_loss_thresh` | 25 | 1-65535 | BBR_UNIT | Relación de pérdida mínima |
 | `kcc_lt_bw_ratio_num` / `kcc_lt_bw_ratio_den` | 1 / 8 | 0-100k / 1-100k | Tolerancia relativa |
 | `kcc_lt_bw_diff` | 500 | 0-100k | bytes/s | Tolerancia absoluta |
 | `kcc_lt_bw_max_rtts` | 48 | 1-4094 | RTTs | RTTs activos máximos de LT BW |
@@ -444,13 +448,11 @@ Los parámetros se exponen bajo `/proc/sys/net/kcc/`. Las escrituras activan `kc
 |-----------|-------------|-------|-------------|
 | `kcc_agg_enable` | 1 | 0-1 | Interruptor maestro |
 | `kcc_agg_confidence_thresh` | 512 | 0-10000 | Umbral de confianza de compensación cwnd |
-| `kcc_agg_max_comp_ratio` | 75 | 0-100 | % de BDP | Límite de compensación cwnd |
+| `kcc_agg_max_comp_ratio` | 50 | 0-100 | % de BDP | Límite de compensación cwnd |
 | `kcc_agg_max_comp_duration` | 8 | 1-128 | RTTs | Tiempo de espera del vigilante |
 | `kcc_agg_r_hysteresis` | 75 | 0-100 | % | Decaimiento de histéresis R |
 | `kcc_agg_r_multiplier_min` / `kcc_agg_r_multiplier_max` | 256 / 2048 | 1-10000 | Rango de escalado R (256=1x) |
-| `kcc_agg_factor3_qdelay_us` | 2000 | 0-100k | µs | Margen qdelay del factor 3 |
 | `kcc_agg_factor4_ratio_num` / `kcc_agg_factor4_ratio_den` | 3 / 2 | 1-100k | Relación del factor 4 |
-| `kcc_agg_safety_qdelay_us` | 4000 | 0-100k | µs | Guarda de seguridad 1 qdelay |
 | `kcc_agg_safety_bdp_mult` | 3 | 1-100 | Multiplicador BDP de guarda de seguridad |
 | `kcc_agg_max_window_ms` | 100 | 1-10000 | ms | Ventana de límite extra_acked |
 | `kcc_agg_max_decay_pct` | 75 | 0-100 | % | Tasa de decaimiento del vigilante |
@@ -489,15 +491,12 @@ Los parámetros se exponen bajo `/proc/sys/net/kcc/`. Las escrituras activan `kc
 | `kcc_extra_acked_max_ms_num` / `kcc_extra_acked_max_ms_den` | 150 / 1 | 0-100k / 1-100k | Ventana máxima de agregación ACK |
 | `kcc_probe_rtt_decouple` | 1 | 0-1 | Activar desacoplamiento PROBE_RTT (solo modo FILTER) |
 | `kcc_rtt_mode` | 1 | 0-1 | Estrategia de RTT del Modelo: 1=FILTER (Kalman directo), 0=MIN (limitado) |
-| `kcc_recal_p_est_thresh` | 250,000 | 1-100M | Umbral p_est para red de seguridad de recalibración |
+| `kcc_recal_p_est_thresh` | 25000 | 1-100M | Umbral p_est para red de seguridad de recalibración |
 | `kcc_probe_rtt_long_rtt_us` | 20000 | 0-10M | µs | Umbral de RTT largo |
 | `kcc_probe_rtt_long_interval_div` | 1 | 1-1000 | Divisor de intervalo de RTT largo |
-| `kcc_drain_skip_qdelay_us` | 1000 | 0-100k | µs | Umbral qdelay de salto de DRAIN |
 | `kcc_alone_confirm_rounds` | 3 | 1-32 | rondas | Rondas antes de activar el modo de flujo único |
-| kcc_alone_qdelay_thresh_us | 1000 | 0-100k | µs | Retardo máximo de cola para detección de flujo único |
-| kcc_alone_jitter_thresh_us | 2000 | 0-100k | µs | Fluctuación máxima para detección de flujo único |
 | kcc_alone_agg_state_level | 1 | 0-2 | — | Rigor de agregación (0=solo IDLE, 1=≤SUSPECTED predet., 2=≤CONFIRMED demasiado agresivo) |
-| `kcc_alone_bypass_ecn` | 1 | 0-1 | — | Omitir backoff ECN en modo individual (1=omitir, 0=activo) |
+| `kcc_alone_bypass_ecn` | 0 | 0-1 | — | Omitir backoff ECN en modo individual (1=omitir, 0=activo) |
 
 ## Ruta de Datos
 

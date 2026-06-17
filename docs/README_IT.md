@@ -81,7 +81,7 @@ Attivato quando `full_bw_reached` è impostato — dopo `kcc_full_bw_cnt` (defau
 
 ### DRAIN → PROBE_BW
 
-Attivato quando il traffico in volo stimato a EDT ≤ traffico in volo target con guadagno BDP 1,0x. **Ottimizzazione salto DRAIN**: quando il filtro di Kalman è converguto E `qdelay_avg` è inferiore a `kcc_drain_skip_qdelay_us` (default 1000 µs), la fase DRAIN viene saltata — conversione anticipata a PROBE_BW.
+Attivato quando il traffico in volo stimato a EDT ≤ traffico in volo target con guadagno BDP 1,0x. **Ottimizzazione salto DRAIN**: quando il filtro di Kalman è converguto E `qdelay_avg < la soglia pulita dinamica` (10% di min_rtt_us con pavimento 500us), la fase DRAIN viene saltata — conversione anticipata a PROBE_BW.
 
 All'ingresso di PROBE_BW, l'indice di fase del ciclo viene randomizzato: `cycle_idx = len − 1 − rand(kcc_probe_bw_cycle_rand)` (default `len − 1 − rand(8)`), che decorrela i flussi concorrenti che condividono un collegamento congestionato.
 
@@ -142,7 +142,7 @@ Q        = min(Q, kcc_kalman_q_max)
 
 **Rumore di misurazione adattativo R**:
 ```
-R = R_base + max(0, jitter_ewma − kcc_jitter_r_thresh_us) × R_base / kcc_jitter_r_scale
+R = R_base + max(0, jitter_ewma − clean_thresh) × R_base / kcc_jitter_r_scale
 R = min(R, R_base × kcc_kalman_r_max_boost)
 ```
 
@@ -180,7 +180,7 @@ Condizioni di attivazione (tutte devono essere soddisfatte):
 1. `kcc_ecn_enable_val != 0`
 2. Kalman converguto (`p_est < converged`, `sample_cnt >= min_samples`)
 3. `ecn_ewma > 0` (marchi CE osservati)
-4. `qdelay_avg > kcc_ecn_qdelay_thresh_us_val` (default 2000 µs)
+4. `qdelay_avg > la soglia di congestione dinamica` (25% di min_rtt_us con pavimento 500us)
 5. La modalità NON è PROBE_BW (cwnd_gain è fisso a 2x in PROBE_BW)
 
 Durante le fasi di esplorazione (`pacing_gain > BBR_UNIT`), l'arretramento ECN viene graduato da `BBR_UNIT² / pacing_gain` — ~80% di arretramento a sonda 1,25x, ~65% a guadagno STARTUP 2,89x.
@@ -204,8 +204,8 @@ Ciò elimina il divario di prestazioni in flusso singolo tra KCC e BBR, preserva
 
 Condizioni di qualifica (tutte e cinque devono essere soddisfatte al confine di un turno):
 0. Kalman convergente (`sample_cnt >= kcc_kalman_min_samples`) — fidarsi di qdelay/jitter come segnali di coda
-1. `qdelay_avg < kcc_alone_qdelay_thresh_us` (predefinito 1000 us) — coda quasi vuota
-2. `jitter_ewma < kcc_alone_jitter_thresh_us` (predefinito 2000 us) — solo micro-jitter di clock ACK
+1. `qdelay_avg < la soglia pulita dinamica` — coda quasi vuota
+2. `jitter_ewma < la soglia di congestione dinamica` — solo micro-jitter di clock ACK
 3. `ecn_ewma == 0` — nessun contrassegno di congestione da AQM
 4. `agg_state <= max` secondo `kcc_alone_agg_state_level` (predefinito 1) — tre livelli di rigore di aggregazione ACK: 0 = solo IDLE (più rigido, zero aggregazione), 1 = ≤ SUSPECTED (predefinito, consente aggregazione transitoria), 2 = ≤ CONFIRMED (più permissivo, blocca solo aggregazione persistente)
 
@@ -243,7 +243,7 @@ Richiede `kcc_rtt_mode == 1`. Inefficace in modalità MIN (la modalità MIN dipe
 | Parametro | Predefinito | Intervallo | Descrizione |
 |-----------|-------------|------------|-------------|
 | `kcc_probe_rtt_decouple` | 1 | 0–1 | Abilitare disaccoppiamento PROBE_RTT (solo modalità FILTER) |
-| `kcc_recal_p_est_thresh` | 250.000 | 1–100.000.000 | Soglia p_est per rete di sicurezza di ricalibrazione |
+| `kcc_recal_p_est_thresh` | 25000 | 1–100.000.000 | Soglia p_est per rete di sicurezza di ricalibrazione |
 
 ### Stima della Larghezza di Banda LT
 
@@ -257,7 +257,7 @@ lt_bw = (bw_new × en + lt_bw × (ed − en)) / ed
 
 L'attivazione differisce da BBR: KCC memorizza `lt_bw` al primo intervallo valido ma NON imposta `lt_use_bw`; è richiesta coerenza con un intervallo precedente — riduce la falsa attivazione da rumore di misurazione.
 
-**Cancello di congestione a doppia soglia**: Prima di impostare `lt_use_bw = 1`, vengono valutati sia un controllo EWMA persistente della coda (`qdelay_avg > kcc_ecn_qdelay_thresh_us_val`) che un controllo istantaneo della coda basato su SRTT (`srtt_us − min_rtt_us > kcc_lt_bw_inst_qdelay_thresh_us`, default 5000 µs). Quando viene rilevata congestione, il campionamento LT BW viene interrotto. Il controllo SRTT funziona senza allocazione `ext`, fornendo una rete di sicurezza contro il fallimento dell'allocazione.
+**Cancello di congestione a doppia soglia**: Prima di impostare `lt_use_bw = 1`, vengono valutati sia un controllo EWMA persistente della coda (`qdelay_avg > la soglia di congestione dinamica`) che un controllo istantaneo della coda basato su SRTT (`srtt_us − min_rtt_us > la soglia di congestione istantanea`, default 5000 µs). Quando viene rilevata congestione, il campionamento LT BW viene interrotto. Il controllo SRTT funziona senza allocazione `ext`, fornendo una rete di sicurezza contro il fallimento dell'allocazione.
 
 
 
@@ -269,7 +269,7 @@ Aggiunge un secondo strato con cancello di confidenza sopra lo stimatore tradizi
 **Quattro fattori ortogonali** (ciascuno contribuisce `kcc_agg_factor_weight` punti, default 256):
 1. Kalman converguto (`p_est < converged` + `sample_cnt >= min_samples`)
 2. Non in recupero perdita (`icsk_ca_state < TCP_CA_Recovery`)
-3. RTT entro `min_rtt_us + kcc_agg_factor3_qdelay_us` (default 2ms) dal ritardo di propagazione reale
+3. RTT entro `min_rtt_us + la soglia pulita dinamica` dal ritardo di propagazione reale
 4. `extra_acked` entro `kcc_agg_factor4_ratio_num/den` (default 1,5x) del massimo finestrato
 
 **Quattro stati**: INATTIVO (< `kcc_agg_thresh_suspected`=256), SOSPETTO (≥256), CONFERMATO (≥512), FIDATO (≥768).
@@ -277,7 +277,7 @@ Aggiunge un secondo strato con cancello di confidenza sopra lo stimatore tradizi
 **Strato di segnale** (sempre attivo): la confidenza interpola linearmente il fattore di scala R `[r_min, r_max]`. R sale istantaneamente (risposta rapida), decade al `kcc_agg_r_hysteresis`% (default 75% trattenuto, ~4 RTT per tornare alla baseline) per RTT.
 
 **Strato di controllo** (`agg_state ≥ CONFIRMED`): compensazione cwnd con cancello di sicurezza a cinque livelli:
-1. Blocca se il ritardo di coda > `kcc_agg_safety_qdelay_us` (default 4ms)
+1. Blocca se il ritardo di coda > `la soglia di congestione dinamica`
 2. Blocca durante il recupero perdita
 3. Blocca se cwnd > `BDP × kcc_agg_safety_bdp_mult` (default 3x)
 4. Blocca se in volo > cwnd sicuro + obiettivo segmenti TSO
@@ -361,9 +361,9 @@ I parametri sono esposti sotto `/proc/sys/net/kcc/`. Le scritture attivano `kcc_
 | `kcc_kalman_outlier_ms` | 5 | 0 | 10000 | ms | Soglia base outlier |
 | `kcc_kalman_q_boost_mult` | 4 | 1 | 10000 | Moltiplicatore Q-boost |
 | `kcc_kalman_q_boost_ms` | 1 | 0 | 5000 | ms | Costante di tempo Q-boost |
-| `kcc_kalman_qboost_cdwn` | 15 | 1 | 255 | samples | Raffreddamento Q-boost |
+| `kcc_kalman_qboost_cdwn` | 8 | 1 | 255 | samples | Raffreddamento Q-boost |
 | `kcc_kalman_q_max` | 2000 | 1 | 100k | Soffitto Q |
-| `kcc_kalman_q_scale_cap` | 20 | 1 | 10000 | Limite scala Q |
+| `kcc_kalman_q_scale_cap` | 50 | 1 | 10000 | Limite scala Q |
 | `kcc_kalman_max_consec_reject` | 25 | 1 | 1000 | Max rifiuti consecutivi prima di forzare accettazione |
 | `kcc_rtt_sample_max_us` | 500000 | 1 | 10M | µs | Soffitto RTT Kalman |
 | `kcc_kalman_r_max_boost` | 8 | 1 | 1000 | Moltiplicatore boost max R |
@@ -375,7 +375,7 @@ I parametri sono esposti sotto `/proc/sys/net/kcc/`. Le scritture attivano `kcc_
 
 | Parametro | Default | Intervallo | Descrizione |
 |-----------|---------|------------|-------------|
-| `kcc_kalman_outlier_jitter_mult_num/den` | 4 / 1 | 0-1000 / 1-100k | Moltiplicatore jitter per outlier |
+| `kcc_kalman_outlier_jitter_mult_num/den` | 3 / 1 | 0-1000 / 1-100k | Moltiplicatore jitter per outlier |
 | `kcc_kalman_q_min_factor_num/den` | 10 / 1 | 0-1000 / 1-100k | Fattore minimo Q |
 | `kcc_kalman_p_est_init_rtt_div_num/den` | 10 / 1 | 1-100k / 1-100k | Divisore RTT inizializzazione p_est |
 
@@ -386,24 +386,29 @@ I parametri sono esposti sotto `/proc/sys/net/kcc/`. Le scritture attivano `kcc_
 | `kcc_kalman_noise_alpha_num/den` | 1 / 10 | 0-100 / 1-100k | Tasso di apprendimento stima Q |
 | `kcc_kalman_noise_beta_num/den` | 1 / 10 | 0-100 / 1-100k | Tasso di apprendimento stima R |
 | `kcc_kalman_noise_mode` | 1 | 0-2 | Modalità combinazione (0=spento, 1=max, 2=media pesata) |
-| `kcc_kalman_q_est_max` | 1.000.000.000 | 1-2 Mld | Limite superiore stima Q |
-| `kcc_kalman_r_est_max` | 1.000.000.000 | 1-2 Mld | Limite superiore stima R |
+| `kcc_kalman_q_est_max` | 50000 | 1-2 Mld | Limite superiore stima Q |
+| `kcc_kalman_r_est_max` | 32000 | 1-2 Mld | Limite superiore stima R |
 | `kcc_kalman_q_est_floor` / `r_est_floor` | 1 | 1-100k | Limite inferiore per stima |
 
 ### Decadimento del Guadagno (Esplorazione)
 
 | Parametro | Default | Intervallo | Unità | Descrizione |
 |-----------|---------|------------|-------|-------------|
-| `kcc_qdelay_probe_thresh_us` | 5000 | 0-100k | µs | Soglia decadimento qdelay |
 | `kcc_qdelay_probe_scale_us` | 20000 | 1-100k | µs | Scala decadimento qdelay |
-| `kcc_jitter_probe_thresh_us` | 4000 | 0-100k | µs | Soglia decadimento jitter |
 | `kcc_jitter_probe_scale_us` | 16000 | 1-100k | µs | Scala decadimento jitter |
+
+### Soglie Dinamiche di Ritardo di Coda
+
+| Parametro | Default | Intervallo | Unità | Descrizione |
+|-----------|---------|------------|-------|-------------|
+| `kcc_qdelay_clean_bp` | 1000 | 1-10000 | ‱ | Soglia pulita (10 % di min_rtt_us) |
+| `kcc_qdelay_cong_bp` | 2500 | 1-10000 | ‱ | Soglia di congestione (25 % di min_rtt_us) |
+| `kcc_qdelay_floor_us` | 500 | 1-100k | µs | Pavimento assoluto per sovrascrittura percentuale RTT |
 
 ### R Adattativo (Guidato dal Jitter)
 
 | Parametro | Default | Intervallo | Unità | Descrizione |
 |-----------|---------|------------|-------|-------------|
-| `kcc_jitter_r_thresh_us` | 2000 | 0-100k | µs | Soglia jitter per aumento R |
 | `kcc_jitter_r_scale` | 8000 | 1-100k | — | Divisore scala aumento R |
 
 ### ECN
@@ -412,7 +417,6 @@ I parametri sono esposti sotto `/proc/sys/net/kcc/`. Le scritture attivano `kcc_
 |-----------|---------|------------|-------------|
 | `kcc_ecn_enable` | 1 | 0-1 | Interruttore principale ECN |
 | `kcc_ecn_backoff_num` / `kcc_ecn_backoff_den` | 20 / 100 | 0-100 / 1-100k | Frazione arretramento ECN |
-| `kcc_ecn_qdelay_thresh_us` | 2000 | 0-100k | µs | Soglia qdelay ECN |
 | `kcc_ecn_ewma_retained` / `kcc_ecn_ewma_total` | 3 / 4 | 0-100 / 1-100k | Pesi EWMA ECN |
 | `kcc_ecn_idle_decay_num` / `kcc_ecn_idle_decay_den` | 31 / 32 | 1-100k | Decadimento ECN inattivo |
 
@@ -431,7 +435,7 @@ I parametri sono esposti sotto `/proc/sys/net/kcc/`. Le scritture attivano `kcc_
 |-----------|---------|------------|-------------|
 | `kcc_lt_intvl_min_rtts` | 4 | 1-127 | RTT | Lunghezza intervallo minima |
 | `kcc_lt_intvl_max_mult` | 4 | 1-32 | Moltiplicatore timeout intervallo |
-| `kcc_lt_loss_thresh` | 15 | 1-65535 | BBR_UNIT | Rapporto perdita minimo |
+| `kcc_lt_loss_thresh` | 25 | 1-65535 | BBR_UNIT | Rapporto perdita minimo |
 | `kcc_lt_bw_ratio_num` / `kcc_lt_bw_ratio_den` | 1 / 8 | 0-100k / 1-100k | Tolleranza relativa |
 | `kcc_lt_bw_diff` | 500 | 0-100k | bytes/s | Tolleranza assoluta |
 | `kcc_lt_bw_max_rtts` | 48 | 1-4094 | RTT | RTT attivi max LT BW |
@@ -444,13 +448,11 @@ I parametri sono esposti sotto `/proc/sys/net/kcc/`. Le scritture attivano `kcc_
 |-----------|---------|------------|-------------|
 | `kcc_agg_enable` | 1 | 0-1 | Interruttore principale |
 | `kcc_agg_confidence_thresh` | 512 | 0-10000 | Soglia confidenza compensazione cwnd |
-| `kcc_agg_max_comp_ratio` | 75 | 0-100 | % del BDP | Limite compensazione cwnd |
+| `kcc_agg_max_comp_ratio` | 50 | 0-100 | % del BDP | Limite compensazione cwnd |
 | `kcc_agg_max_comp_duration` | 8 | 1-128 | RTT | Timeout watchdog |
 | `kcc_agg_r_hysteresis` | 75 | 0-100 | % | Decadimento isteresi R |
 | `kcc_agg_r_multiplier_min` / `kcc_agg_r_multiplier_max` | 256 / 2048 | 1-10000 | Intervallo scala R (256=1x) |
-| `kcc_agg_factor3_qdelay_us` | 2000 | 0-100k | µs | Margine qdelay fattore 3 |
 | `kcc_agg_factor4_ratio_num` / `kcc_agg_factor4_ratio_den` | 3 / 2 | 1-100k | Rapporto fattore 4 |
-| `kcc_agg_safety_qdelay_us` | 4000 | 0-100k | µs | Guardia sicurezza 1 qdelay |
 | `kcc_agg_safety_bdp_mult` | 3 | 1-100 | Moltiplicatore BDP guardia sicurezza |
 | `kcc_agg_max_window_ms` | 100 | 1-10000 | ms | Finestra limite extra_acked |
 | `kcc_agg_max_decay_pct` | 75 | 0-100 | % | Tasso decadimento watchdog |
@@ -489,15 +491,12 @@ I parametri sono esposti sotto `/proc/sys/net/kcc/`. Le scritture attivano `kcc_
 | `kcc_extra_acked_max_ms_num` / `kcc_extra_acked_max_ms_den` | 150 / 1 | 0-100k / 1-100k | Finestra max aggregazione ACK |
 | `kcc_probe_rtt_decouple` | 1 | 0-1 | Abilitare disaccoppiamento PROBE_RTT (solo modalità FILTER) |
 | `kcc_rtt_mode` | 1 | 0-1 | Strategia RTT del Modello: 1=FILTER (Kalman diretto), 0=MIN (limitato) |
-| `kcc_recal_p_est_thresh` | 250.000 | 1-100M | Soglia p_est per rete di sicurezza di ricalibrazione |
+| `kcc_recal_p_est_thresh` | 25000 | 1-100M | Soglia p_est per rete di sicurezza di ricalibrazione |
 | `kcc_probe_rtt_long_rtt_us` | 20000 | 0-10M | µs | Soglia RTT lungo |
 | `kcc_probe_rtt_long_interval_div` | 1 | 1-1000 | Divisore intervallo RTT lungo |
-| `kcc_drain_skip_qdelay_us` | 1000 | 0-100k | µs | Soglia qdelay salto DRAIN |
 | `kcc_alone_confirm_rounds` | 3 | 1-32 | round | Round prima di attivare la modalità flusso singolo |
-| kcc_alone_qdelay_thresh_us | 1000 | 0-100k | µs | Ritardo di coda max per rilevamento flusso singolo |
-| kcc_alone_jitter_thresh_us | 2000 | 0-100k | µs | Jitter max per rilevamento flusso singolo |
 | kcc_alone_agg_state_level | 1 | 0-2 | — | Rigore di aggregazione (0=solo IDLE, 1=≤SUSPECTED predef., 2=≤CONFIRMED troppo aggressivo) |
-| `kcc_alone_bypass_ecn` | 1 | 0-1 | — | Salta backoff ECN in modalità singola (1=salta, 0=attivo) |
+| `kcc_alone_bypass_ecn` | 0 | 0-1 | — | Salta backoff ECN in modalità singola (1=salta, 0=attivo) |
 
 ## Percorso Dati
 

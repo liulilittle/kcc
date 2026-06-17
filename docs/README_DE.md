@@ -81,7 +81,7 @@ Ausgelöst, wenn `full_bw_reached` gesetzt ist — nach `kcc_full_bw_cnt` (Stand
 
 ### DRAIN → PROBE_BW
 
-Ausgelöst, wenn der geschätzte Inflight-Verkehr bei EDT ≤ Ziel-Inflight bei 1,0x BDP-Verstärkung. **Drain-Überspring-Optimierung**: wenn der Kalman-Filter konvergiert ist UND `qdelay_avg` unter `kcc_drain_skip_qdelay_us` (Standard 1000 µs) liegt, wird die DRAIN-Phase übersprungen — frühzeitige Umwandlung zu PROBE_BW.
+Ausgelöst, wenn der geschätzte Inflight-Verkehr bei EDT ≤ Ziel-Inflight bei 1,0x BDP-Verstärkung. **Drain-Überspring-Optimierung**: wenn der Kalman-Filter konvergiert ist UND `qdelay_avg < der dynamische Sauber-Schwellwert` (10% von min_rtt_us mit 500us Untergrenze), wird die DRAIN-Phase übersprungen — frühzeitige Umwandlung zu PROBE_BW.
 
 Beim Eintritt in PROBE_BW wird der Zyklenphasenindex randomisiert: `cycle_idx = len − 1 − rand(kcc_probe_bw_cycle_rand)` (Standard `len − 1 − rand(8)`), was parallele Ströme, die sich einen Engpasslink teilen, dekorreliert.
 
@@ -142,7 +142,7 @@ Q        = min(Q, kcc_kalman_q_max)
 
 **Adaptives Messrauschen R**:
 ```
-R = R_base + max(0, jitter_ewma − kcc_jitter_r_thresh_us) × R_base / kcc_jitter_r_scale
+R = R_base + max(0, jitter_ewma − clean_thresh) × R_base / kcc_jitter_r_scale
 R = min(R, R_base × kcc_kalman_r_max_boost)
 ```
 
@@ -180,7 +180,7 @@ Aktivierungsbedingungen (alle müssen erfüllt sein):
 1. `kcc_ecn_enable_val != 0`
 2. Kalman konvergiert (`p_est < converged`, `sample_cnt >= min_samples`)
 3. `ecn_ewma > 0` (CE-Markierungen beobachtet)
-4. `qdelay_avg > kcc_ecn_qdelay_thresh_us_val` (Standard 2000 µs)
+4. `qdelay_avg > der dynamische Überlastungs-Schwellwert` (25% von min_rtt_us mit 500us Untergrenze)
 5. Modus ist NICHT PROBE_BW (cwnd_gain ist in PROBE_BW fest auf 2x)
 
 Während der Erkundungsphasen (`pacing_gain > BBR_UNIT`) wird die ECN-Rücknahme durch `BBR_UNIT² / pacing_gain` abgestuft — ~80% Rücknahme bei 1,25x-Sonde, ~65% bei 2,89x-STARTUP-Verstärkung.
@@ -204,8 +204,8 @@ Dies beseitigt die Leistungslücke bei Einzelflüssen zwischen KCC und BBR, wäh
 
 Qualifikationsbedingungen (alle fünf müssen an einer Rundengrenze erfüllt sein):
 0. Kalman konvergiert (`sample_cnt >= kcc_kalman_min_samples`) — qdelay/jitter als Warteschlangensignale vertrauen
-1. `qdelay_avg < kcc_alone_qdelay_thresh_us` (Standard 1000 us) — Warteschlange fast leer
-2. `jitter_ewma < kcc_alone_jitter_thresh_us` (Standard 2000 us) — nur ACK-Takt-Mikrojitter
+1. `qdelay_avg < der dynamische Sauber-Schwellwert` — Warteschlange fast leer
+2. `jitter_ewma < der dynamische Überlastungs-Schwellwert` — nur ACK-Takt-Mikrojitter
 3. `ecn_ewma == 0` — keine Überlastungsmarkierungen von AQM
 4. `agg_state <= max` gemäß `kcc_alone_agg_state_level` (Standard 1) — drei konfigurierbare ACK-Aggregationsstufen: 0 = nur IDLE (strengste, keine Aggregation), 1 = ≤ SUSPECTED (Standard, erlaubt vorübergehende Aggregation), 2 = ≤ CONFIRMED (permessivste, blockiert nur persistente Aggregation)
 
@@ -243,7 +243,7 @@ Erfordert `kcc_rtt_mode == 1`. Im MIN-Modus wirkungslos (der MIN-Modus ist auf P
 | Parameter | Standard | Bereich | Beschreibung |
 |-----------|----------|---------|-------------|
 | `kcc_probe_rtt_decouple` | 1 | 0–1 | PROBE_RTT-Entkopplung aktivieren (nur FILTER-Modus) |
-| `kcc_recal_p_est_thresh` | 250.000 | 1–100.000.000 | p_est-Schwellenwert für Sicherheitsnetz-Neukalibrierung |
+| `kcc_recal_p_est_thresh` | 25000 | 1–100.000.000 | p_est-Schwellenwert für Sicherheitsnetz-Neukalibrierung |
 
 ### LT-Bandbreitenschätzung
 
@@ -257,7 +257,7 @@ lt_bw = (bw_new × en + lt_bw × (ed − en)) / ed
 
 Die Aktivierung unterscheidet sich von BBR: KCC speichert `lt_bw` beim ersten gültigen Intervall, setzt aber NICHT `lt_use_bw`; Konsistenz mit einem vorherigen Intervall ist erforderlich — reduziert Fehlaktivierung durch Messrauschen.
 
-**Doppelschwellen-Überlastungstor**: Bevor `lt_use_bw = 1` gesetzt wird, werden sowohl eine persistente EWMA-Warteschlangenprüfung (`qdelay_avg > kcc_ecn_qdelay_thresh_us_val`) ALS AUCH eine sofortige SRTT-basierte Warteschlangenprüfung (`srtt_us − min_rtt_us > kcc_lt_bw_inst_qdelay_thresh_us`, Standard 5000 µs) ausgewertet. Wenn eine Überlastung erkannt wird, wird die LT-BW-Abtastung abgebrochen. Die SRTT-Prüfung funktioniert ohne `ext`-Zuweisung und bietet ein Sicherheitsnetz gegen Zuweisungsfehler.
+**Doppelschwellen-Überlastungstor**: Bevor `lt_use_bw = 1` gesetzt wird, werden sowohl eine persistente EWMA-Warteschlangenprüfung (`qdelay_avg > der dynamische Überlastungs-Schwellwert`) ALS AUCH eine sofortige SRTT-basierte Warteschlangenprüfung (`srtt_us − min_rtt_us > der sofortige Überlastungs-Schwellwert`, Standard 5000 µs) ausgewertet. Wenn eine Überlastung erkannt wird, wird die LT-BW-Abtastung abgebrochen. Die SRTT-Prüfung funktioniert ohne `ext`-Zuweisung und bietet ein Sicherheitsnetz gegen Zuweisungsfehler.
 
 
 
@@ -269,7 +269,7 @@ Fügt eine konfidenzgesteuerte zweite Schicht über dem traditionellen Dual-Slot
 **Vier orthogonale Faktoren** (jeder trägt `kcc_agg_factor_weight` Punkte bei, Standard 256):
 1. Kalman konvergiert (`p_est < converged` + `sample_cnt >= min_samples`)
 2. Nicht in Verlustwiederherstellung (`icsk_ca_state < TCP_CA_Recovery`)
-3. RTT innerhalb von `min_rtt_us + kcc_agg_factor3_qdelay_us` (Standard 2ms) der wahren Ausbreitungsverzögerung
+3. RTT innerhalb von `min_rtt_us + der dynamische Sauber-Schwellwert` der wahren Ausbreitungsverzögerung
 4. `extra_acked` innerhalb von `kcc_agg_factor4_ratio_num/den` (Standard 1,5x) des fensterbasierten Maximums
 
 **Vier Zustände**: IDLE (< `kcc_agg_thresh_suspected`=256), VERDÄCHTIG (≥256), BESTÄTIGT (≥512), VERTRAUENSWÜRDIG (≥768).
@@ -277,7 +277,7 @@ Fügt eine konfidenzgesteuerte zweite Schicht über dem traditionellen Dual-Slot
 **Signalschicht** (immer aktiv): Konfidenz interpoliert linear den R-Skalierungsfaktor `[r_min, r_max]`. R steigt sofort an (schnelle Reaktion), fällt mit `kcc_agg_r_hysteresis`% (Standard 75% beibehalten, ~4 RTTs zur Basislinie) pro RTT.
 
 **Kontrollschicht** (`agg_state ≥ CONFIRMED`): fünffach sicherheitsgesteuerte cwnd-Kompensation:
-1. Blockiert, wenn die Warteschlangenverzögerung > `kcc_agg_safety_qdelay_us` (Standard 4ms)
+1. Blockiert, wenn die Warteschlangenverzögerung > `der dynamische Überlastungs-Schwellwert`
 2. Blockiert während der Verlustwiederherstellung
 3. Blockiert, wenn cwnd > `BDP × kcc_agg_safety_bdp_mult` (Standard 3x)
 4. Blockiert, wenn Inflight > sicheres cwnd + TSO-Segmentziel
@@ -361,9 +361,9 @@ Parameter werden unter `/proc/sys/net/kcc/` bereitgestellt. Schreibvorgänge lö
 | `kcc_kalman_outlier_ms` | 5 | 0 | 10000 | ms | Basis-Ausreißerschwellwert |
 | `kcc_kalman_q_boost_mult` | 4 | 1 | 10000 | Q-Boost-Multiplikator |
 | `kcc_kalman_q_boost_ms` | 1 | 0 | 5000 | ms | Q-Boost-Zeitkonstante |
-| `kcc_kalman_qboost_cdwn` | 15 | 1 | 255 | samples | Q-Boost-Abklingzeit |
+| `kcc_kalman_qboost_cdwn` | 8 | 1 | 255 | samples | Q-Boost-Abklingzeit |
 | `kcc_kalman_q_max` | 2000 | 1 | 100k | Q-Obergrenze |
-| `kcc_kalman_q_scale_cap` | 20 | 1 | 10000 | Q-Skalierungsbegrenzung |
+| `kcc_kalman_q_scale_cap` | 50 | 1 | 10000 | Q-Skalierungsbegrenzung |
 | `kcc_kalman_max_consec_reject` | 25 | 1 | 1000 | Max. aufeinanderfolgende Ablehnungen vor Zwangsannahme |
 | `kcc_rtt_sample_max_us` | 500000 | 1 | 10M | µs | Kalman-RTT-Obergrenze |
 | `kcc_kalman_r_max_boost` | 8 | 1 | 1000 | R-Max-Boost-Multiplikator |
@@ -375,7 +375,7 @@ Parameter werden unter `/proc/sys/net/kcc/` bereitgestellt. Schreibvorgänge lö
 
 | Parameter | Standard | Bereich | Beschreibung |
 |-----------|----------|---------|-------------|
-| `kcc_kalman_outlier_jitter_mult_num/den` | 4 / 1 | 0-1000 / 1-100k | Ausreißer-Jitter-Multiplikator |
+| `kcc_kalman_outlier_jitter_mult_num/den` | 3 / 1 | 0-1000 / 1-100k | Ausreißer-Jitter-Multiplikator |
 | `kcc_kalman_q_min_factor_num/den` | 10 / 1 | 0-1000 / 1-100k | Q-Minimalfaktor |
 | `kcc_kalman_p_est_init_rtt_div_num/den` | 10 / 1 | 1-100k / 1-100k | p_est-Init-RTT-Divisor |
 
@@ -386,24 +386,29 @@ Parameter werden unter `/proc/sys/net/kcc/` bereitgestellt. Schreibvorgänge lö
 | `kcc_kalman_noise_alpha_num/den` | 1 / 10 | 0-100 / 1-100k | Q-Schätzungs-Lernrate |
 | `kcc_kalman_noise_beta_num/den` | 1 / 10 | 0-100 / 1-100k | R-Schätzungs-Lernrate |
 | `kcc_kalman_noise_mode` | 1 | 0-2 | Kombinationsmodus (0=aus, 1=max, 2=gewichteter Durchschnitt) |
-| `kcc_kalman_q_est_max` | 1.000.000.000 | 1-2 Mrd. | Q-Schätzungs-Obergrenze |
-| `kcc_kalman_r_est_max` | 1.000.000.000 | 1-2 Mrd. | R-Schätzungs-Obergrenze |
+| `kcc_kalman_q_est_max` | 50000 | 1-2 Mrd. | Q-Schätzungs-Obergrenze |
+| `kcc_kalman_r_est_max` | 32000 | 1-2 Mrd. | R-Schätzungs-Obergrenze |
 | `kcc_kalman_q_est_floor` / `r_est_floor` | 1 | 1-100k | Untergrenze pro Schätzung |
 
 ### Verstärkungsabfall (Erkundung)
 
 | Parameter | Standard | Bereich | Einheit | Beschreibung |
 |-----------|----------|---------|---------|-------------|
-| `kcc_qdelay_probe_thresh_us` | 5000 | 0-100k | µs | qdelay-Abfallschwellwert |
 | `kcc_qdelay_probe_scale_us` | 20000 | 1-100k | µs | qdelay-Abfallskalierung |
-| `kcc_jitter_probe_thresh_us` | 4000 | 0-100k | µs | Jitter-Abfallschwellwert |
 | `kcc_jitter_probe_scale_us` | 16000 | 1-100k | µs | Jitter-Abfallskalierung |
+
+### Dynamische Warteschlangenverzögerungs-Schwellenwerte
+
+| Parameter | Standard | Bereich | Einheit | Beschreibung |
+|-----------|----------|---------|---------|-------------|
+| `kcc_qdelay_clean_bp` | 1000 | 1-10000 | ‱ | Sauberer Schwellwert (10 % von min_rtt_us) |
+| `kcc_qdelay_cong_bp` | 2500 | 1-10000 | ‱ | Überlastungsschwellwert (25 % von min_rtt_us) |
+| `kcc_qdelay_floor_us` | 500 | 1-100k | µs | Absoluter Mindestwert für RTT-Prozentsatz-Überschreibung |
 
 ### Adaptives R (Jitter-gesteuert)
 
 | Parameter | Standard | Bereich | Einheit | Beschreibung |
 |-----------|----------|---------|---------|-------------|
-| `kcc_jitter_r_thresh_us` | 2000 | 0-100k | µs | Jitter-Schwellwert für R-Erhöhung |
 | `kcc_jitter_r_scale` | 8000 | 1-100k | — | R-Erhöhungs-Skalierungsdivisor |
 
 ### ECN
@@ -412,7 +417,6 @@ Parameter werden unter `/proc/sys/net/kcc/` bereitgestellt. Schreibvorgänge lö
 |-----------|----------|---------|-------------|
 | `kcc_ecn_enable` | 1 | 0-1 | ECN-Hauptschalter |
 | `kcc_ecn_backoff_num` / `kcc_ecn_backoff_den` | 20 / 100 | 0-100 / 1-100k | ECN-Rücknahme-Anteil |
-| `kcc_ecn_qdelay_thresh_us` | 2000 | 0-100k | µs | ECN-qdelay-Schwellwert |
 | `kcc_ecn_ewma_retained` / `kcc_ecn_ewma_total` | 3 / 4 | 0-100 / 1-100k | ECN-EWMA-Gewichte |
 | `kcc_ecn_idle_decay_num` / `kcc_ecn_idle_decay_den` | 31 / 32 | 1-100k | Leerlauf-ECN-Abfall |
 
@@ -431,7 +435,7 @@ Parameter werden unter `/proc/sys/net/kcc/` bereitgestellt. Schreibvorgänge lö
 |-----------|----------|---------|-------------|
 | `kcc_lt_intvl_min_rtts` | 4 | 1-127 | RTTs | Minimale Intervalllänge |
 | `kcc_lt_intvl_max_mult` | 4 | 1-32 | Intervall-TimeOut-Multiplikator |
-| `kcc_lt_loss_thresh` | 15 | 1-65535 | BBR_UNIT | Mindestverlustverhältnis |
+| `kcc_lt_loss_thresh` | 25 | 1-65535 | BBR_UNIT | Mindestverlustverhältnis |
 | `kcc_lt_bw_ratio_num` / `kcc_lt_bw_ratio_den` | 1 / 8 | 0-100k / 1-100k | Relative Toleranz |
 | `kcc_lt_bw_diff` | 500 | 0-100k | bytes/s | Absolute Toleranz |
 | `kcc_lt_bw_max_rtts` | 48 | 1-4094 | RTTs | LT BW max. aktive RTTs |
@@ -444,13 +448,11 @@ Parameter werden unter `/proc/sys/net/kcc/` bereitgestellt. Schreibvorgänge lö
 |-----------|----------|---------|-------------|
 | `kcc_agg_enable` | 1 | 0-1 | Hauptschalter |
 | `kcc_agg_confidence_thresh` | 512 | 0-10000 | cwnd-Kompensations-Konfidenzschwellwert |
-| `kcc_agg_max_comp_ratio` | 75 | 0-100 | % des BDP | cwnd-Kompensationsgrenze |
+| `kcc_agg_max_comp_ratio` | 50 | 0-100 | % des BDP | cwnd-Kompensationsgrenze |
 | `kcc_agg_max_comp_duration` | 8 | 1-128 | RTTs | Watchdog-Timeout |
 | `kcc_agg_r_hysteresis` | 75 | 0-100 | % | R-Hysterese-Abfall |
 | `kcc_agg_r_multiplier_min` / `kcc_agg_r_multiplier_max` | 256 / 2048 | 1-10000 | R-Skalierungsbereich (256=1x) |
-| `kcc_agg_factor3_qdelay_us` | 2000 | 0-100k | µs | Faktor-3-qdelay-Spielraum |
 | `kcc_agg_factor4_ratio_num` / `kcc_agg_factor4_ratio_den` | 3 / 2 | 1-100k | Faktor-4-Verhältnis |
-| `kcc_agg_safety_qdelay_us` | 4000 | 0-100k | µs | Sicherheitsschutz 1 qdelay |
 | `kcc_agg_safety_bdp_mult` | 3 | 1-100 | Sicherheitsschutz-BDP-Multiplikator |
 | `kcc_agg_max_window_ms` | 100 | 1-10000 | ms | extra_acked-Grenzfenster |
 | `kcc_agg_max_decay_pct` | 75 | 0-100 | % | Watchdog-Abfallrate |
@@ -489,15 +491,12 @@ Parameter werden unter `/proc/sys/net/kcc/` bereitgestellt. Schreibvorgänge lö
 | `kcc_extra_acked_max_ms_num` / `kcc_extra_acked_max_ms_den` | 150 / 1 | 0-100k / 1-100k | Max. ACK-Aggregationsfenster |
 | `kcc_probe_rtt_decouple` | 1 | 0-1 | PROBE_RTT-Entkopplung aktivieren (nur FILTER-Modus) |
 | `kcc_rtt_mode` | 1 | 0-1 | Modell-RTT-Strategie: 1=FILTER (direkt Kalman), 0=MIN (geklammert) |
-| `kcc_recal_p_est_thresh` | 250.000 | 1-100M | p_est-Schwellenwert für Sicherheitsnetz-Neukalibrierung |
+| `kcc_recal_p_est_thresh` | 25000 | 1-100M | p_est-Schwellenwert für Sicherheitsnetz-Neukalibrierung |
 | `kcc_probe_rtt_long_rtt_us` | 20000 | 0-10M | µs | Lang-RTT-Schwellwert |
 | `kcc_probe_rtt_long_interval_div` | 1 | 1-1000 | Lang-RTT-Intervall-Divisor |
-| `kcc_drain_skip_qdelay_us` | 1000 | 0-100k | µs | Drain-Überspring-qdelay-Schwellwert |
 | `kcc_alone_confirm_rounds` | 3 | 1-32 | Runden | Runden vor Aktivierung des Einzelfluss-Modus |
-| kcc_alone_qdelay_thresh_us | 1000 | 0-100k | µs | Max. Warteschlangenverzögerung für Einzelflusserkennung |
-| kcc_alone_jitter_thresh_us | 2000 | 0-100k | µs | Max. Jitter für Einzelflusserkennung |
 | kcc_alone_agg_state_level | 1 | 0-2 | — | Aggregationsstrenge (0=nur IDLE, 1=≤SUSPECTED Standard, 2=≤CONFIRMED zu aggressiv) |
-| `kcc_alone_bypass_ecn` | 1 | 0-1 | — | ECN-Backoff im Alleinmodus überspringen (1=überspringen, 0=aktiv) |
+| `kcc_alone_bypass_ecn` | 0 | 0-1 | — | ECN-Backoff im Alleinmodus überspringen (1=überspringen, 0=aktiv) |
 
 ## Datenpfad
 

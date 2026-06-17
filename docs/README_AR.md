@@ -81,7 +81,7 @@
 
 ### DRAIN → PROBE_BW
 
-يُفعل عندما تكون الحزم قيد الطيران المقدرة عند EDT ≤ الحزم المستهدفة عند كسوب BDP 1.0x. **تحسين تخطي التفريغ**: عندما يكون مرشح كالمان متقارباً و `qdelay_avg` أقل من `kcc_drain_skip_qdelay_us` (افتراضي 1000 ميكروثانية)، يتم تخطي مرحلة DRAIN — التحويل المبكر إلى PROBE_BW.
+يُفعل عندما تكون الحزم قيد الطيران المقدرة عند EDT ≤ الحزم المستهدفة عند كسوب BDP 1.0x. **تحسين تخطي التفريغ**: عندما يكون مرشح كالمان متقارباً و `qdelay_avg < عتبة النظافة الديناميكية` (10% من min_rtt_us مع حد أدنى 500us)، يتم تخطي مرحلة DRAIN — التحويل المبكر إلى PROBE_BW.
 
 عند الدخول إلى PROBE_BW، يتم عشوائية مؤشر مرحلة الدورة: `cycle_idx = len − 1 − rand(kcc_probe_bw_cycle_rand)` (افتراضي `len − 1 − rand(8)`)، مما يفك ارتباط التدفقات المتزامنة المشاركة لنفس رابط الاختناق.
 
@@ -142,7 +142,7 @@ Q        = min(Q, kcc_kalman_q_max)
 
 **ضوضاء القياس التكيفية R**:
 ```
-R = R_base + max(0, jitter_ewma − kcc_jitter_r_thresh_us) × R_base / kcc_jitter_r_scale
+R = R_base + max(0, jitter_ewma − clean_thresh) × R_base / kcc_jitter_r_scale
 R = min(R, R_base × kcc_kalman_r_max_boost)
 ```
 
@@ -180,7 +180,7 @@ effective     = max(probe_gain − qdelay_decay − jitter_decay, BBR_UNIT)
 1. `kcc_ecn_enable_val != 0`
 2. كالمان متقارب (`p_est < converged`، `sample_cnt >= min_samples`)
 3. `ecn_ewma > 0` (تم رصد علامات CE)
-4. `qdelay_avg > kcc_ecn_qdelay_thresh_us_val` (افتراضي 2000 ميكروثانية)
+4. `qdelay_avg > عتبة الازدحام الديناميكية` (25% من min_rtt_us مع حد أدنى 500us)
 5. الوضع ليس PROBE_BW (cwnd_gain ثابت عند 2x في PROBE_BW)
 
 خلال مراحل الاستكشاف (`pacing_gain > BBR_UNIT`)، يكون التراجع عن ECN متدرجاً بـ `BBR_UNIT² / pacing_gain` — ~80% من التراجع عند استكشاف 1.25x، ~65% عند كسوب STARTUP 2.89x.
@@ -204,8 +204,8 @@ EWMA نسبة علامات ECN: تُحدّث على حدود الدورة بوا
 
 شروط التأهيل (يجب استيفاء جميع الشروط الخمسة عند حدود الجولة):
 0. تقارب كالمان (`sample_cnt >= kcc_kalman_min_samples`) — الثقة في qdelay/jitter كإشارات طابور
-1. `qdelay_avg < kcc_alone_qdelay_thresh_us` (الافتراضي 1000 us) — الطابور شبه فارغ
-2. `jitter_ewma < kcc_alone_jitter_thresh_us` (الافتراضي 2000 us) — تقلب ميكروي لساعة ACK فقط
+1. `qdelay_avg < عتبة النظافة الديناميكية` — الطابور شبه فارغ
+2. `jitter_ewma < عتبة الازدحام الديناميكية` — تقلب ميكروي لساعة ACK فقط
 3. `ecn_ewma == 0` — لا توجد علامات ازدحام من AQM
 4. `agg_state <= max` وفقًا لـ `kcc_alone_agg_state_level` (الافتراضي 1) — ثلاثة مستويات من صرامة تجميع ACK: 0 = IDLE فقط (الأكثر صرامة، تجميع صفري)، 1 = ≤ SUSPECTED (افتراضي، يسمح بالتجميع العابر)، 2 = ≤ CONFIRMED (الأكثر تساهلاً، يحظر التجميع المستمر فقط)
 
@@ -243,7 +243,7 @@ converged < p_est < high:       استيفاء خطي
 | المعامل | الافتراضي | النطاق | الوصف |
 |----------|----------|--------|--------|
 | `kcc_probe_rtt_decouple` | 1 | 0–1 | تفعيل فصل PROBE_RTT (وضع FILTER فقط) |
-| `kcc_recal_p_est_thresh` | 250,000 | 1–100,000,000 | عتبة p_est لشبكة الأمان لإعادة المعايرة |
+| `kcc_recal_p_est_thresh` | 25000 | 1–100,000,000 | عتبة p_est لشبكة الأمان لإعادة المعايرة |
 
 ### تقدير عرض النطاق طويل الأمد (LT)
 
@@ -257,7 +257,7 @@ lt_bw = (bw_new × en + lt_bw × (ed − en)) / ed
 
 يختلف التفعيل عن BBR: يخزّن KCC `lt_bw` في أول فترة صالحة لكنه لا يعيّن `lt_use_bw`؛ الاتساق مع فترة سابقة مطلوب — يقلل من التفعيل الخاطئ الناتج عن ضوضاء القياس.
 
-**بوابة الازدحام ثنائية العتبة**: قبل تعيين `lt_use_bw = 1`، يتم تقييم كل من فحص طابور EWMA المستمر (`qdelay_avg > kcc_ecn_qdelay_thresh_us_val`) وفحص الطابور الفوري المعتمد على SRTT (`srtt_us − min_rtt_us > kcc_lt_bw_inst_qdelay_thresh_us`، افتراضي 5000 ميكروثانية). عند اكتشاف ازدحام، يتم إحباط أخذ عينات LT BW. يعمل فحص SRTT دون تخصيص `ext`، مما يوفر شبكة أمان ضد فشل التخصيص.
+**بوابة الازدحام ثنائية العتبة**: قبل تعيين `lt_use_bw = 1`، يتم تقييم كل من فحص طابور EWMA المستمر (`qdelay_avg > عتبة الازدحام الديناميكية`) وفحص الطابور الفوري المعتمد على SRTT (`srtt_us − min_rtt_us > عتبة الازدحام الفورية`، افتراضي 5000 ميكروثانية). عند اكتشاف ازدحام، يتم إحباط أخذ عينات LT BW. يعمل فحص SRTT دون تخصيص `ext`، مما يوفر شبكة أمان ضد فشل التخصيص.
 
 
 ### تعويض تجميع ACK المعتمد على الثقة (مستوحى من BBRplus)
@@ -267,7 +267,7 @@ lt_bw = (bw_new × en + lt_bw × (ed − en)) / ed
 **أربعة عوامل متعامدة** (يساهم كل منها بـ `kcc_agg_factor_weight` نقطة، افتراضي 256):
 1. كالمان متقارب (`p_est < converged` + `sample_cnt >= min_samples`)
 2. ليس في استرداد الخسارة (`icsk_ca_state < TCP_CA_Recovery`)
-3. RTT ضمن `min_rtt_us + kcc_agg_factor3_qdelay_us` (افتراضي 2 ملي ثانية) من زمن الانتشار الحقيقي
+3. RTT ضمن `min_rtt_us + عتبة النظافة الديناميكية` من زمن الانتشار الحقيقي
 4. `extra_acked` ضمن `kcc_agg_factor4_ratio_num/den` (افتراضي 1.5x) من الحد الأقصى للنافذة
 
 **أربع حالات**: IDLE (< `kcc_agg_thresh_suspected`=256)، SUSPECTED (≥256)، CONFIRMED (≥512)، TRUSTED (≥768).
@@ -275,7 +275,7 @@ lt_bw = (bw_new × en + lt_bw × (ed − en)) / ed
 **طبقة الإشارة** (نشطة دائماً): الثقة تحدد خطياً عامل القياس R `[r_min, r_max]`. R يرتفع فوراً (استجابة سريعة)، ويتوهن بنسبة `kcc_agg_r_hysteresis`% (افتراضي 75% محتفظ به، ~4 RTTs للعودة إلى خط الأساس) لكل RTT.
 
 **طبقة التحكم** (`agg_state ≥ CONFIRMED`): تعويض cwnd محمي بخمس طبقات أمان:
-1. يمنع إذا كان تأخير الطابور > `kcc_agg_safety_qdelay_us` (افتراضي 4 ملي ثانية)
+1. يمنع إذا كان تأخير الطابور > `عتبة الازدحام الديناميكية`
 2. يمنع أثناء استرداد الخسارة
 3. يمنع إذا كان cwnd > `BDP × kcc_agg_safety_bdp_mult` (افتراضي 3x)
 4. يمنع إذا كانت الحزم قيد الطيران > cwnd الآمن + هدف شرائح TSO
@@ -359,9 +359,9 @@ cwnd = max(cwnd, cwnd_min_target)                 // أرضية مطلقة 4
 | `kcc_kalman_outlier_ms` | 5 | 0 | 10000 | ملي ثانية | عتبة القيم الشاذة الأساسية |
 | `kcc_kalman_q_boost_mult` | 4 | 1 | 10000 | مضاعف تعزيز Q |
 | `kcc_kalman_q_boost_ms` | 1 | 0 | 5000 | ملي ثانية | ثابت زمني لتعزيز Q |
-| `kcc_kalman_qboost_cdwn` | 15 | 1 | 255 | samples | تبريد Q-boost |
+| `kcc_kalman_qboost_cdwn` | 8 | 1 | 255 | samples | تبريد Q-boost |
 | `kcc_kalman_q_max` | 2000 | 1 | 100k | سقف Q |
-| `kcc_kalman_q_scale_cap` | 20 | 1 | 10000 | حد مقياس Q |
+| `kcc_kalman_q_scale_cap` | 50 | 1 | 10000 | حد مقياس Q |
 | `kcc_kalman_max_consec_reject` | 25 | 1 | 1000 | أقصى رفض متتالٍ قبل القبول القسري |
 | `kcc_rtt_sample_max_us` | 500000 | 1 | 10M | ميكروثانية | سقف RTT لكالمان |
 | `kcc_kalman_r_max_boost` | 8 | 1 | 1000 | مضاعف تعزيز R الأقصى |
@@ -373,7 +373,7 @@ cwnd = max(cwnd, cwnd_min_target)                 // أرضية مطلقة 4
 
 | المعامل | الافتراضي | النطاق | الوصف |
 |-----------|---------|-------|-------------|
-| `kcc_kalman_outlier_jitter_mult_num/den` | 4 / 1 | 0-1000 / 1-100k | مضاعف تذبذب القيم الشاذة |
+| `kcc_kalman_outlier_jitter_mult_num/den` | 3 / 1 | 0-1000 / 1-100k | مضاعف تذبذب القيم الشاذة |
 | `kcc_kalman_q_min_factor_num/den` | 10 / 1 | 0-1000 / 1-100k | العامل الأدنى لـ Q |
 | `kcc_kalman_p_est_init_rtt_div_num/den` | 10 / 1 | 1-100k / 1-100k | مقسم RTT لتهيئة p_est |
 
@@ -384,24 +384,29 @@ cwnd = max(cwnd, cwnd_min_target)                 // أرضية مطلقة 4
 | `kcc_kalman_noise_alpha_num/den` | 1 / 10 | 0-100 / 1-100k | معدل تعلم تقدير Q |
 | `kcc_kalman_noise_beta_num/den` | 1 / 10 | 0-100 / 1-100k | معدل تعلم تقدير R |
 | `kcc_kalman_noise_mode` | 1 | 0-2 | وضع الدمج (0=إيقاف، 1=أقصى، 2=متوسط مرجح) |
-| `kcc_kalman_q_est_max` | 1,000,000,000 | 1-2B | الحد الأعلى لتقدير Q |
-| `kcc_kalman_r_est_max` | 1,000,000,000 | 1-2B | الحد الأعلى لتقدير R |
+| `kcc_kalman_q_est_max` | 50000 | 1-2B | الحد الأعلى لتقدير Q |
+| `kcc_kalman_r_est_max` | 32000 | 1-2B | الحد الأعلى لتقدير R |
 | `kcc_kalman_q_est_floor` / `r_est_floor` | 1 | 1-100k | الحد الأدنى لكل تقدير |
 
 ### توهين الكسوب (الاستكشاف)
 
 | المعامل | الافتراضي | النطاق | الوحدة | الوصف |
 |-----------|---------|-------|------|-------------|
-| `kcc_qdelay_probe_thresh_us` | 5000 | 0-100k | ميكروثانية | عتبة توهين تأخير الطابور |
 | `kcc_qdelay_probe_scale_us` | 20000 | 1-100k | ميكروثانية | مقياس توهين تأخير الطابور |
-| `kcc_jitter_probe_thresh_us` | 4000 | 0-100k | ميكروثانية | عتبة توهين التذبذب |
 | `kcc_jitter_probe_scale_us` | 16000 | 1-100k | ميكروثانية | مقياس توهين التذبذب |
+
+### عتبات ديناميكية لتأخير الطابور
+
+| المعامل | الافتراضي | النطاق | الوحدة | الوصف |
+|-----------|---------|-------|------|-------------|
+| `kcc_qdelay_clean_bp` | 1000 | 1-10000 | ‱ | عتبة النظافة (10 % من min_rtt_us) |
+| `kcc_qdelay_cong_bp` | 2500 | 1-10000 | ‱ | عتبة الازدحام (25 % من min_rtt_us) |
+| `kcc_qdelay_floor_us` | 500 | 1-100k | µs | حد أدنى مطلق لتجاوز النسبة المئوية لـ RTT |
 
 ### R التكيفية (مدفوعة بالتذبذب)
 
 | المعامل | الافتراضي | النطاق | الوحدة | الوصف |
 |-----------|---------|-------|------|-------------|
-| `kcc_jitter_r_thresh_us` | 2000 | 0-100k | ميكروثانية | عتبة التذبذب لزيادة R |
 | `kcc_jitter_r_scale` | 8000 | 1-100k | — | مقسم مقياس زيادة R |
 
 ### ECN
@@ -410,7 +415,6 @@ cwnd = max(cwnd, cwnd_min_target)                 // أرضية مطلقة 4
 |-----------|---------|-------|-------------|
 | `kcc_ecn_enable` | 1 | 0-1 | المفتاح الرئيسي لـ ECN |
 | `kcc_ecn_backoff_num` / `kcc_ecn_backoff_den` | 20 / 100 | 0-100 / 1-100k | كسر التراجع عن ECN |
-| `kcc_ecn_qdelay_thresh_us` | 2000 | 0-100k | ميكروثانية | عتبة تأخير الطابور لـ ECN |
 | `kcc_ecn_ewma_retained` / `kcc_ecn_ewma_total` | 3 / 4 | 0-100 / 1-100k | أوزان EWMA لـ ECN |
 | `kcc_ecn_idle_decay_num` / `kcc_ecn_idle_decay_den` | 31 / 32 | 1-100k | توهين ECN في الخمول |
 
@@ -429,7 +433,7 @@ cwnd = max(cwnd, cwnd_min_target)                 // أرضية مطلقة 4
 |-----------|---------|-------|-------------|
 | `kcc_lt_intvl_min_rtts` | 4 | 1-127 | RTT | الحد الأدنى لطول الفترة |
 | `kcc_lt_intvl_max_mult` | 4 | 1-32 | مضاعف مهلة الفترة |
-| `kcc_lt_loss_thresh` | 15 | 1-65535 | BBR_UNIT | الحد الأدنى لنسبة الخسارة |
+| `kcc_lt_loss_thresh` | 25 | 1-65535 | BBR_UNIT | الحد الأدنى لنسبة الخسارة |
 | `kcc_lt_bw_ratio_num` / `kcc_lt_bw_ratio_den` | 1 / 8 | 0-100k / 1-100k | التسامح النسبي |
 | `kcc_lt_bw_diff` | 500 | 0-100k | بايت/ثانية | التسامح المطلق |
 | `kcc_lt_bw_max_rtts` | 48 | 1-4094 | RTT | أقصى RTT نشطة لـ LT BW |
@@ -442,13 +446,11 @@ cwnd = max(cwnd, cwnd_min_target)                 // أرضية مطلقة 4
 |-----------|---------|-------|-------------|
 | `kcc_agg_enable` | 1 | 0-1 | المفتاح الرئيسي |
 | `kcc_agg_confidence_thresh` | 512 | 0-10000 | عتبة ثقة تعويض cwnd |
-| `kcc_agg_max_comp_ratio` | 75 | 0-100 | % من BDP | سقف تعويض cwnd |
+| `kcc_agg_max_comp_ratio` | 50 | 0-100 | % من BDP | سقف تعويض cwnd |
 | `kcc_agg_max_comp_duration` | 8 | 1-128 | RTT | مهلة المراقب |
 | `kcc_agg_r_hysteresis` | 75 | 0-100 | % | توهين التباطؤ لـ R |
 | `kcc_agg_r_multiplier_min` / `kcc_agg_r_multiplier_max` | 256 / 2048 | 1-10000 | نطاق قياس R (256=1x) |
-| `kcc_agg_factor3_qdelay_us` | 2000 | 0-100k | ميكروثانية | هامش تأخير الطابور للعامل 3 |
 | `kcc_agg_factor4_ratio_num` / `kcc_agg_factor4_ratio_den` | 3 / 2 | 1-100k | نسبة العامل 4 |
-| `kcc_agg_safety_qdelay_us` | 4000 | 0-100k | ميكروثانية | تأخير الطابور لحماية الأمان 1 |
 | `kcc_agg_safety_bdp_mult` | 3 | 1-100 | مضاعف BDP لحماية الأمان |
 | `kcc_agg_max_window_ms` | 100 | 1-10000 | ملي ثانية | نافذة سقف extra_acked |
 | `kcc_agg_max_decay_pct` | 75 | 0-100 | % | معدل توهين المراقب |
@@ -489,15 +491,12 @@ cwnd = max(cwnd, cwnd_min_target)                 // أرضية مطلقة 4
 | `kcc_extra_acked_max_ms_num` / `kcc_extra_acked_max_ms_den` | 150 / 1 | 0-100k / 1-100k | أقصى نافذة تجميع ACK |
 | `kcc_probe_rtt_long_rtt_us` | 20000 | 0-10M | ميكروثانية | عتبة RTT الطويلة |
 | `kcc_probe_rtt_long_interval_div` | 1 | 1-1000 | مقسم فترة RTT الطويلة |
-| `kcc_drain_skip_qdelay_us` | 1000 | 0-100k | ميكروثانية | عتبة تأخير الطابور لتخطي التفريغ |
 | `kcc_alone_confirm_rounds` | 3 | 1-32 | جولات | الجولات قبل تفعيل وضع التدفق الفردي |
-| kcc_alone_qdelay_thresh_us | 1000 | 0-100k | µs | أقصى تأخير طابور لاكتشاف التدفق الفردي |
-| kcc_alone_jitter_thresh_us | 2000 | 0-100k | µs | أقصى تقلب لاكتشاف التدفق الفردي |
 | kcc_alone_agg_state_level | 1 | 0-2 | — | صرامة التجميع (0=IDLE فقط، 1=≤SUSPECTED افتراضي، 2=≤CONFIRMED شديد العدوانية) |
-| `kcc_alone_bypass_ecn` | 1 | 0-1 | — | تخطي تراجع ECN في الوضع الفردي (1=تخطي، 0=نشط) |
+| `kcc_alone_bypass_ecn` | 0 | 0-1 | — | تخطي تراجع ECN في الوضع الفردي (1=تخطي، 0=نشط) |
 | `kcc_rtt_mode` | 1 | 0-1 | — | استراتيجية RTT للنموذج: 1=FILTER (كالمان مباشرة)، 0=MIN (تقييد) |
 | `kcc_probe_rtt_decouple` | 1 | 0-1 | — | فصل PROBE_RTT (FILTER فقط): قمع التفريغ إلى 4 حزم |
-| `kcc_recal_p_est_thresh` | 250,000 | 1-100M | — | عتبة p_est لكالمان لشبكة أمان إعادة المعايرة |
+| `kcc_recal_p_est_thresh` | 25000 | 1-100M | — | عتبة p_est لكالمان لشبكة أمان إعادة المعايرة |
 
 ## مسار البيانات
 
