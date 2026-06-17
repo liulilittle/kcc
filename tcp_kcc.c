@@ -87,7 +87,7 @@
  *
  *   - Confidence-gated qboost: large innovations only trigger gain reset
  *     when the filter is converged (p_est <= converged_p_est), with a
- *     configurable cooldown (kcc_kalman_qboost_cdwn, default 15 samples)
+ *     configurable cooldown (kcc_kalman_qboost_cdwn, default 8 samples)
  *     between events to prevent runaway on lossy paths.
  *     Kernel BBR: no equivalent mechanism.
  *     WHY: When path delay drops significantly (route change), the filter
@@ -384,6 +384,7 @@ static inline u32 kcc_tcp_snd_cwnd(const struct tcp_sock* tp) { return READ_ONCE
            */
 #define KCC_MIN_RTT_UNINIT        ~0U /* sentinel: min_rtt_us not yet measured; all guards check != before arithmetic to avoid u32 underflow */
 #define KCC_PCT_BASE              100 /* percentage base (100 = 100%) for ratio/fraction arithmetic in gain-decay and ECN backoff calculations */
+#define KCC_QDELAY_BP_BASE        10000 /* per-10 000 (‱) base — 100× finer than percent; used by kcc_clean_thresh / kcc_cong_thresh to scale min_rtt_us into µs queue-delay thresholds */
 #define KCC_MSTAMP_HI_SHIFT       32  /* shift for u64-timestamp hi/lo split/recombine; KCC splits tcp_mstamp into lo/hi for 32-bit cycle_mstamp fields to save bitfield space in struct kcc; kernel BBR uses the full 64-bit tcp_mstamp directly */
 #define KCC_DECAY_MASK_LSB        1   /* LSB extraction for testing individual bits in gain-decay mask via (mask_word & KCC_DECAY_MASK_LSB) */
            /*
@@ -676,7 +677,7 @@ struct kcc_ext {                                     /* extended per-connection 
      * ECN (Explicit Congestion Notification) state.
      * When enabled (kcc_ecn_enable != 0), CE-marked segments are tracked
      * via an EWMA of the ECN-mark ratio.  If ecn_ewma > 0 and Kalman
-     * qdelay_avg exceeds kcc_ecn_qdelay_thresh_us, cwnd_gain and
+     * qdelay_avg exceeds the congestion threshold, cwnd_gain and
      * pacing_gain are reduced proportionally by kcc_ecn_backoff.
      * Scaled to BBR_UNIT (256 = 100%).
      * Kernel BBR: ECN handling is limited to reducing cwnd on each
@@ -1117,17 +1118,6 @@ static int kcc_kalman_converged_p_est = 500;          /* p_est convergence thres
 module_param_cb(kcc_kalman_converged_p_est, &kcc_param_ops, &kcc_kalman_converged_p_est, 0644); /* sysctl: kcc_kalman_converged_p_est */
 
 /*
- * kcc_drain_skip_qdelay_us — When the Kalman filter is converged AND
- *     qdelay_avg is below this threshold (us), skip the drain phase
- *     of the PROBE_BW cycle entirely.  This leverages Kalman's trusted
- *     zero-queue detection to avoid wasting 1/8 of each cycle on
- *     unnecessary draining, converting the drain phase into an
- *     additional cruise phase.  Default 1000 us (1 ms).
- */
-static int kcc_drain_skip_qdelay_us = 1000;          /* qdelay (us) below which the DRAIN phase is skipped entirely; KCC extension: when Kalman is converged and qdelay is near zero, skipping DRAIN converts it into an extra cruise phase, avoiding unnecessary throughput dips; kernel BBR never skips DRAIN; range [0, 100000], BBR default: N/A */
-module_param_cb(kcc_drain_skip_qdelay_us, &kcc_param_ops, &kcc_drain_skip_qdelay_us, 0644); /* sysctl: kcc_drain_skip_qdelay_us */
-
-/*
  * kcc_kalman_probe_band_mult — Upper bound multiplier for PROBE_RTT
  *     interval transition band.  When p_est is between converged_p_est
  *     and mult × converged_p_est, interval is linearly interpolated.
@@ -1139,7 +1129,7 @@ static int kcc_kalman_q_boost_mult = 4;               /* Q-boost threshold multi
 module_param_cb(kcc_kalman_q_boost_mult, &kcc_param_ops, &kcc_kalman_q_boost_mult, 0644); /* sysctl: kcc_kalman_q_boost_mult */
 static int kcc_kalman_q_max = 2000;                   /* maximum adaptive Q ceiling; clamps the adapted Q' = Q * max(q_min_factor, min_rtt_us/1000); prevents Q from growing unbounded on long-RTT paths; KCC-only; range [1, 100000], BBR default: N/A */
 module_param_cb(kcc_kalman_q_max, &kcc_param_ops, &kcc_kalman_q_max, 0644); /* sysctl: kcc_kalman_q_max */
-static int kcc_kalman_q_scale_cap = 20;               /* cap on Q adaptation factor (min_rtt_us/1000); clamps the RTT-based scaling factor to prevent extreme Q values on very long RTT paths (e.g., satellite); KCC-only; range [1, 10000], BBR default: N/A */
+static int kcc_kalman_q_scale_cap = 50;               /* cap on Q adaptation factor (min_rtt_us/1000); a 200 ms path has 10× the inter-sample interval of a 20 ms path and therefore 10× the probability of a model violation per sample; scaling Q proportionally with RTT keeps the filter's re-convergence speed roughly constant in wall-clock time across the RTT range; capped to prevent runaway on satellite links; KCC-only; range [1, 10000], BBR default: N/A */
 module_param_cb(kcc_kalman_q_scale_cap, &kcc_param_ops, &kcc_kalman_q_scale_cap, 0644); /* sysctl: kcc_kalman_q_scale_cap */
 static int kcc_kalman_min_samples = 5;                /* minimum Kalman accepted samples before min_rtt_us may be overwritten by the Kalman estimate; provides convergence guard against premature takeover; KCC-only; range [3, 20], BBR default: N/A (BBR uses windowed min_rtt exclusively) */
 module_param_cb(kcc_kalman_min_samples, &kcc_param_ops, &kcc_kalman_min_samples, 0644); /* sysctl: kcc_kalman_min_samples */
@@ -1385,17 +1375,10 @@ module_param_cb(kcc_min_tso_rate_div, &kcc_param_ops, &kcc_min_tso_rate_div, 064
 
 /* ---- Jitter/Qdelay probe scaling (us) -------------------------------- */
 /*
- * kcc_jitter_probe_thresh_us — Jitter threshold above which PROBE_BW
- *     gain decay activates.  Default 4000 us.
  * kcc_jitter_probe_scale_us — Scaling divisor for jitter-based gain
  *     reduction = (jitter - threshold) * BBR_UNIT / scale.  Default 16000 us.
- * kcc_qdelay_probe_thresh_us — Queuing delay threshold for gain decay.
- *     Default 5000 us.
  * kcc_qdelay_probe_scale_us — Scaling divisor for qdelay-based gain
  *     reduction.  Default 20000 us.
- * kcc_jitter_r_thresh_us — Jitter threshold above which measurement noise
- *     R is increased: R' = R + (jitter - thresh) * R / scale.
- *     Default 2000 us.
  * kcc_jitter_r_scale — Scaling divisor for adaptive R.  Default 8000.
  * kcc_kalman_r_max_boost — Maximum multiplier for jitter-based R boost.
  *     R_boost = (jitter - thresh) * base_R / scale, capped at
@@ -1403,20 +1386,70 @@ module_param_cb(kcc_min_tso_rate_div, &kcc_param_ops, &kcc_min_tso_rate_div, 064
  *     the Kalman gain on paths with persistent high jitter (e.g., WiFi
  *     bursts).  Default 8 → max R ≤ 9× base_R, keeping K ≥ ~10%.
  */
-static int kcc_jitter_probe_thresh_us = 4000;         /* jitter threshold (us) above which PROBE_BW gain decay activates; when jitter_ewma exceeds this, pacing_gain is reduced toward 1.0x; KCC extension for jitter-adaptive probing; kernel BBR has no jitter-based gain decay; range [0, 100000], BBR default: N/A */
-module_param_cb(kcc_jitter_probe_thresh_us, &kcc_param_ops, &kcc_jitter_probe_thresh_us, 0644); /* sysctl: kcc_jitter_probe_thresh_us */
 static int kcc_jitter_probe_scale_us = 16000;          /* jitter scaling divisor (us) for gain decay: gain_reduction = (jitter - threshold) * BBR_UNIT / scale; larger = gentler decay; KCC extension; range [1, 100000], BBR default: N/A */
 module_param_cb(kcc_jitter_probe_scale_us, &kcc_param_ops, &kcc_jitter_probe_scale_us, 0644); /* sysctl: kcc_jitter_probe_scale_us */
-static int kcc_qdelay_probe_thresh_us = 5000;          /* queuing delay threshold (us) for PROBE_BW gain decay; when qdelay_avg exceeds this, pacing_gain is reduced toward 1.0x; KCC extension for congestion-adaptive probing; kernel BBR has no qdelay-based gain decay; range [0, 100000], BBR default: N/A */
-module_param_cb(kcc_qdelay_probe_thresh_us, &kcc_param_ops, &kcc_qdelay_probe_thresh_us, 0644); /* sysctl: kcc_qdelay_probe_thresh_us */
 static int kcc_qdelay_probe_scale_us = 20000;          /* qdelay scaling divisor (us) for gain decay; larger = gentler decay; KCC extension; range [1, 100000], BBR default: N/A */
 module_param_cb(kcc_qdelay_probe_scale_us, &kcc_param_ops, &kcc_qdelay_probe_scale_us, 0644); /* sysctl: kcc_qdelay_probe_scale_us */
-static int kcc_jitter_r_thresh_us = 2000;               /* jitter threshold (us) for adaptive Kalman measurement noise R: R' = R + (jitter - thresh) * R / scale; when jitter_ewma exceeds this, R increases to reduce trust in noisy samples; KCC-only; range [0, 100000], BBR default: N/A */
-module_param_cb(kcc_jitter_r_thresh_us, &kcc_param_ops, &kcc_jitter_r_thresh_us, 0644); /* sysctl: kcc_jitter_r_thresh_us */
 static int kcc_jitter_r_scale = 8000;                   /* scaling divisor for jitter-based adaptive R; larger = slower R increase with jitter; KCC-only; range [1, 100000], BBR default: N/A */
 module_param_cb(kcc_jitter_r_scale, &kcc_param_ops, &kcc_jitter_r_scale, 0644); /* sysctl: kcc_jitter_r_scale */
 static int kcc_kalman_r_max_boost = 8;                 /* maximum multiplier for jitter-based R boost: R_boost = min((jitter - thresh)*base_R/scale, base_R * r_max_boost); prevents extreme R values from freezing the Kalman gain on persistently jittery paths (e.g., WiFi); KCC-only; default 8 => max R <= 9x base_R, keeping K >= ~10%; range [1, 1000], BBR default: N/A */
 module_param_cb(kcc_kalman_r_max_boost, &kcc_param_ops, &kcc_kalman_r_max_boost, 0644); /* sysctl: kcc_kalman_r_max_boost */
+
+/* ---- Queue-delay dynamic thresholds (‱ = per-10 000, KCC-only) --------- */
+/*
+ * kcc_qdelay_clean_bp — Queue-delay fraction (‱, basis points) used as
+ *     the "link is clean" threshold.  threshold = max(RTT × bp / KCC_QDELAY_BP_BASE,
+ *     floor).  When observed qdelay is below this fraction of the base
+ *     RTT, the path is considered effectively empty.
+ *
+ *     Applied to: dynamic "link is clean" thresholds.
+ *
+ *     Default 1000‱ (10 % BDP).  BBR's PROBE_UP creates ~0.25 BDP of
+ *     queue naturally; 0.10 BDP is 40 % of that — any residual queue
+ *     below this fraction is less than one DRAIN cycle (0.75× pacing)
+ *     can clear, so skipping the drain is safe.  On a 250 ms path:
+ *     threshold = 25 ms, above normal WAN clock jitter (2–5 ms).
+ *     On a 3 ms path: the 500 µs floor takes over — 500 µs = 17 % RTT.
+ *
+ *     kcc_qdelay_clean_bp and kcc_qdelay_cong_bp together define a
+ *     1500‱ (15 pp) hysteresis band (10 % → 25 %) that prevents
+ *     oscillation between "clean" and "congested" on noisy paths.
+ */
+static int kcc_qdelay_clean_bp = 1000;    /* clean threshold (‱ of min_rtt_us); 1000‱ = 10% BDP — 40% of BBR's PROBE_UP natural queue (0.25 BDP); below this fraction the residual queue is less than one drain cycle can clear; range [1, 10000]; default 1000 */
+module_param_cb(kcc_qdelay_clean_bp, &kcc_param_ops, &kcc_qdelay_clean_bp, 0644);
+/*
+ * kcc_qdelay_cong_bp — Queue-delay fraction (‱, basis points) used as
+ *     the "queue is building — back off" threshold.  When the observed
+ *     qdelay exceeds this fraction, probe gain is decayed and safety
+ *     guards lock in.
+ *
+ *     Applied to: dynamic "queue building — back off" thresholds.
+ *
+ *     Default 2500‱ (25 % BDP).  This is exactly the natural queue
+ *     depth of BBR's PROBE_UP (1.25× pacing gain → 0.25 BDP).  The
+ *     congestion threshold is calibrated to this boundary: probes run
+ *     at full gain up to the PROBE_UP queue and begin decaying beyond
+ *     it — no self-defeating premature backoff.  On a 250 ms path:
+ *     threshold = 62.5 ms, matching the probe's own queue footprint.
+ */
+static int kcc_qdelay_cong_bp = 2500;     /* congestion threshold (‱ of min_rtt_us); 2500‱ = 25% BDP — exactly BBR's PROBE_UP natural queue depth; probes run at full gain up to this boundary and begin decaying beyond it; range [1, 10000]; default 2500 */
+module_param_cb(kcc_qdelay_cong_bp, &kcc_param_ops, &kcc_qdelay_cong_bp, 0644);
+/*
+ * kcc_qdelay_floor_us — Absolute floor (µs) for all dynamic qdelay/jitter
+ *     thresholds.  On sub-millisecond or low-latency paths the RTT-based
+ *     percentage would produce unrealistically small thresholds; this
+ *     floor prevents false triggers from clock quantisation noise.
+ *
+ *     Default 500 µs.  Clock quantisation noise on LAN paths is
+ *     ~100 µs; a single PROBE_UP micro-burst on 3 ms contributes
+ *     750 µs (0.25 BDP).  500 µs sits above the former and below
+ *     the latter — it anchors the thresholds to a physically
+ *     meaningful minimum without scaling below measurement precision.
+ *     For RTT ≥ 10 ms the percentage thresholds naturally exceed
+ *     500 µs, making the floor transparent.
+ */
+static int kcc_qdelay_floor_us = 500;
+module_param_cb(kcc_qdelay_floor_us, &kcc_param_ops, &kcc_qdelay_floor_us, 0644);
 
 /* ---- PROBE_RTT trigger thresholds (us) ------------------------------- */
 /*
@@ -1456,7 +1489,7 @@ module_param_cb(kcc_probe_rtt_long_interval_div, &kcc_param_ops, &kcc_probe_rtt_
  */
 static int kcc_lt_intvl_min_rtts = 4;                     /* minimum RTTs required before an LT BW estimate can be produced; ensures the sampling window has enough data; KCC extension: kernel BBR has no LT BW mechanism; range [1, 127], BBR default: N/A */
 module_param_cb(kcc_lt_intvl_min_rtts, &kcc_param_ops, &kcc_lt_intvl_min_rtts, 0644); /* sysctl: kcc_lt_intvl_min_rtts */
-static int kcc_lt_loss_thresh = 15;                       /* minimum loss ratio (BBR_UNIT units, 15 ≈ 5.9%) for an LT sampling interval to be considered valid; KCC extension; range [1, 65535], BBR default: N/A */
+static int kcc_lt_loss_thresh = 25;                       /* minimum loss ratio (BBR_UNIT units, 25 ≈ 9.8%) for an LT sampling interval to be considered valid; WAN paths typical loss is 0–1% — 5.9% (15) would trigger false LT BW activation on occasional loss bursts; 9.8% activates only on genuinely policed/throttled links; KCC extension; range [1, 65535], BBR default: N/A */
 module_param_cb(kcc_lt_loss_thresh, &kcc_param_ops, &kcc_lt_loss_thresh, 0644); /* sysctl: kcc_lt_loss_thresh */
 static int kcc_lt_intvl_max_mult = 4;                    /* LT BW sampling timeout multiplier: timeout = mult * kcc_lt_intvl_min_rtts; prevents an LT interval from persisting indefinitely; KCC extension; range [1, 32], BBR default: N/A */
 module_param_cb(kcc_lt_intvl_max_mult, &kcc_param_ops, &kcc_lt_intvl_max_mult, 0644); /* sysctl: kcc_lt_intvl_max_mult */
@@ -1475,8 +1508,6 @@ static int kcc_lt_bw_ema_num = 1;                         /* LT BW EMA update nu
 module_param_cb(kcc_lt_bw_ema_num, &kcc_param_ops, &kcc_lt_bw_ema_num, 0644); /* sysctl: kcc_lt_bw_ema_num */
 static int kcc_lt_bw_ema_den = 2;                         /* LT BW EMA update denominator; default 1/2 gives exponential moving average; range [1, 100000], BBR default: N/A */
 module_param_cb(kcc_lt_bw_ema_den, &kcc_param_ops, &kcc_lt_bw_ema_den, 0644); /* sysctl: kcc_lt_bw_ema_den */
-static int kcc_lt_bw_inst_qdelay_thresh_us = 5000;      /* LT BW gate: instantaneous queuing delay threshold (us); if qdelay exceeds this, LT BW sampling is suppressed to avoid false policer detection during transient bloat; KCC extension; range [0, 100000], BBR default: N/A */
-module_param_cb(kcc_lt_bw_inst_qdelay_thresh_us, &kcc_param_ops, &kcc_lt_bw_inst_qdelay_thresh_us, 0644); /* sysctl: kcc_lt_bw_inst_qdelay_thresh_us */
 static int kcc_lt_bw_max_rtts = 48;                     /* maximum RTTs with LT BW active before forced reset; must fit in 12-bit lt_rtt_cnt bitfield (< 4095); default 48 (~0.5s at 10ms RTT); KCC extension; range [1, 4094], BBR default: N/A */
 module_param_cb(kcc_lt_bw_max_rtts, &kcc_param_ops, &kcc_lt_bw_max_rtts, 0644); /* sysctl: kcc_lt_bw_max_rtts */
 
@@ -1507,7 +1538,7 @@ static int kcc_kalman_outlier_ms = 5;                     /* base outlier gate t
 module_param_cb(kcc_kalman_outlier_ms, &kcc_param_ops, &kcc_kalman_outlier_ms, 0644); /* sysctl: kcc_kalman_outlier_ms */
 static int kcc_kalman_q_boost_ms = 1;                     /* Q-boost time constant (ms): multiplied by q_boost_mult and kalman_scale to derive the innovation threshold that triggers p_est reset; KCC-only; range [1, 5000], BBR default: N/A */
 module_param_cb(kcc_kalman_q_boost_ms, &kcc_param_ops, &kcc_kalman_q_boost_ms, 0644); /* sysctl: kcc_kalman_q_boost_ms */
-static int kcc_kalman_qboost_cdwn = 15;                  /* Q-boost cooldown: minimum accepted Kalman samples between consecutive qboost events; prevents runaway gain resets on lossy paths with large innovations; KCC-only; range [1, 255], BBR default: N/A */
+static int kcc_kalman_qboost_cdwn = 8;                   /* Q-boost cooldown: minimum accepted Kalman samples between consecutive qboost events; 8 samples balances the RTT asymmetry — on a 3 ms path 8 RTTs = 24 ms (negligible), on a 200 ms path 8 RTTs = 1.6 s (allows re-convergence after a routing flap without extended paralysis); prevents runaway gain resets while giving the filter a reasonable recovery window; KCC-only; range [1, 255], BBR default: N/A */
 module_param_cb(kcc_kalman_qboost_cdwn, &kcc_param_ops, &kcc_kalman_qboost_cdwn, 0644); /* sysctl: kcc_kalman_qboost_cdwn */
 static int kcc_kalman_scale = 1024;                       /* Kalman fixed-point scaling factor (power-of-two); x_est = rtt_us * scale in fixed point; rounded up to power-of-two for fast division via shift; KCC-only; range [64, 1048576], BBR default: N/A */
 module_param_cb(kcc_kalman_scale, &kcc_param_ops, &kcc_kalman_scale, 0644); /* sysctl: kcc_kalman_scale */
@@ -1522,7 +1553,7 @@ module_param_cb(kcc_kalman_scale, &kcc_param_ops, &kcc_kalman_scale, 0644); /* s
  *     in terms of RTT: p_est = max(p_est_init, rtt_us / div).
  *     Default 10/1 = 10.
  */
-static int kcc_kalman_outlier_jitter_mult_num = 4;       /* outlier jitter multiplier numerator: dynamic outlier threshold = max(base, jitter_ewma * num/den * scale); KCC-only; default 4/1 = 4x; range [0, 1000], BBR default: N/A */
+static int kcc_kalman_outlier_jitter_mult_num = 3;       /* outlier jitter multiplier numerator: dynamic outlier threshold = max(base, jitter_ewma * num/den * scale); 3× avoids the positive-feedback loop (jitter↑→threshold↑→more rejections→jitter doesn't decay) that 4× creates; base threshold (5 ms) already provides a reasonable floor; KCC-only; range [0, 1000], BBR default: N/A */
 module_param_cb(kcc_kalman_outlier_jitter_mult_num, &kcc_param_ops, &kcc_kalman_outlier_jitter_mult_num, 0644); /* sysctl: kcc_kalman_outlier_jitter_mult_num */
 static int kcc_kalman_outlier_jitter_mult_den = 1;       /* outlier jitter multiplier denominator; range [1, 100000], BBR default: N/A */
 module_param_cb(kcc_kalman_outlier_jitter_mult_den, &kcc_param_ops, &kcc_kalman_outlier_jitter_mult_den, 0644); /* sysctl: kcc_kalman_outlier_jitter_mult_den */
@@ -1586,9 +1617,9 @@ static int kcc_kalman_noise_beta_num = 1;                /* BBR-S covariance-mat
 module_param_cb(kcc_kalman_noise_beta_num, &kcc_param_ops, &kcc_kalman_noise_beta_num, 0644); /* sysctl: kcc_kalman_noise_beta_num */
 static int kcc_kalman_noise_beta_den = 10;               /* BBR-S adaptive R learning rate denominator; range [1, 100000], BBR default: N/A */
 module_param_cb(kcc_kalman_noise_beta_den, &kcc_param_ops, &kcc_kalman_noise_beta_den, 0644); /* sysctl: kcc_kalman_noise_beta_den */
-static int kcc_kalman_q_est_max = 1000000000;            /* upper bound on covariance-matched Q estimate; prevents unbounded Q growth from numerical artifacts; KCC-only; range [1, 2000000000], BBR default: N/A */
+static int kcc_kalman_q_est_max = 50000;                  /* upper bound on covariance-matched Q estimate; 10 × Q_hmax (100 × q_scale_cap=50 = 5000) — gives the matched estimator one order of magnitude of learning headroom beyond the heuristic noise budget; derived from p_ss(50000, 32000) = 22170 < recal_p_est_thresh = 25000 per the steady-state bound R_cap ≤ p_target·(p_target+Q_cap)/Q_cap; KCC-only; range [1, 2000000000], BBR default: N/A */
 module_param_cb(kcc_kalman_q_est_max, &kcc_param_ops, &kcc_kalman_q_est_max, 0644); /* sysctl: kcc_kalman_q_est_max */
-static int kcc_kalman_r_est_max = 1000000000;            /* upper bound on covariance-matched R estimate; prevents unbounded R growth; KCC-only; range [1, 2000000000], BBR default: N/A */
+static int kcc_kalman_r_est_max = 32000;                  /* upper bound on covariance-matched R estimate; 10 × R_hmax (base_R × r_max_boost = 400 × 8 = 3200) — symmetrical 10× rule: both matched caps are one order of magnitude above their heuristic counterparts; p_ss(Q_hmax × 10, R_hmax × 10) = 22170 < 25000, keeping the recalibration safety net out of the matched estimator's normal operating range; KCC-only; range [1, 2000000000], BBR default: N/A */
 module_param_cb(kcc_kalman_r_est_max, &kcc_param_ops, &kcc_kalman_r_est_max, 0644); /* sysctl: kcc_kalman_r_est_max */
 static int kcc_kalman_q_est_floor = 1;                   /* lower bound on covariance-matched Q estimate; prevents floor from hitting zero; KCC-only; range [1, 100000], BBR default: N/A */
 module_param_cb(kcc_kalman_q_est_floor, &kcc_param_ops, &kcc_kalman_q_est_floor, 0644); /* sysctl: kcc_kalman_q_est_floor */
@@ -1657,14 +1688,14 @@ module_param_cb(kcc_rtt_mode, &kcc_param_ops, &kcc_rtt_mode, 0644); /* sysctl: k
  *        PROBE_RTT is suppressed.  The filter tracks true propagation
  *        delay via outlier gating and adaptive Q/R noise estimation
  *        without draining the pipe.  In normal operation p_est converges
- *        to ~p_est_floor (4--10), far below the 250k threshold, so
+ *        to ~p_est_floor (4--10), far below the threshold (25000), so
  *        PROBE_RTT suppression is the steady state.  Zero throughput
  *        cliffs, zero PROBE_RTT sync collapses.
  *
  *      - Kalman diverged (p_est > kcc_recal_p_est_thresh):
  *        PROBE_RTT is reactivated as a safety net.  This triggers when
- *        p_est exceeds kcc_recal_p_est_thresh (default 250k = 25 % of
- *        p_est_max).  A single traditional 4-packet drain provides a
+ *        p_est exceeds kcc_recal_p_est_thresh (default 25000).  A single
+ *        traditional 4-packet drain provides a fresh min_rtt baseline;
  *        fresh min_rtt baseline; the filter re-converges and decoupling
  *        resumes automatically — an "on-demand" calibration rather than
  *        a "blind periodic" one.
@@ -1676,18 +1707,90 @@ module_param_cb(kcc_rtt_mode, &kcc_param_ops, &kcc_rtt_mode, 0644); /* sysctl: k
 static int kcc_probe_rtt_decouple = 1;         /* PROBE_RTT decouple mode: 1 = skip PROBE_RTT when kcc_rtt_mode==FILTER and Kalman is healthy (p_est <= kcc_recal_p_est_thresh); eliminates the periodic throughput cliff of BBR's PROBE_RTT; 0 = traditional periodic PROBE_RTT; KCC-only: kernel BBR always uses periodic PROBE_RTT; range [0, 1], BBR default: N/A (always periodic) */
 module_param_cb(kcc_probe_rtt_decouple, &kcc_param_ops, &kcc_probe_rtt_decouple, 0644); /* sysctl: kcc_probe_rtt_decouple */
 /*
- * kcc_recal_p_est_thresh — Kalman error-covariance threshold for recalibration.
- * When kcc_probe_rtt_decouple is active and filter_expired fires, the Kalman
- * health is checked: if p_est > kcc_recal_p_est_thresh, the filter has lost
- * confidence and a traditional PROBE_RTT drain is triggered as a safety net.
- * Otherwise the probe is suppressed (the filter is tracking accurately).
+ * kcc_recal_p_est_thresh — Kalman error-covariance threshold for
+ *     PROBE_RTT recalibration.  When kcc_probe_rtt_decouple is active
+ *     and filter_expired fires, Kalman health is checked: if
+ *     p_est > kcc_recal_p_est_thresh, the filter has lost confidence
+ *     and a traditional PROBE_RTT drain is triggered as a safety net.
+ *     Otherwise the probe is suppressed (the filter is healthy).
  *
- * Default 250000 = 25 % of p_est_max (1,000,000).  During normal operation,
- * p_est converges to ~p_est_floor (typically 4--10).  A rising p_est signals
- * divergence (path change, noise model mismatch), at which point a hard
- * min_rtt re-measurement restores the filter baseline.
+ * Default 25000.
+ *
+ *   ——— How p_est gets pushed up ———
+ *
+ *   p_est follows the Kalman covariance update:
+ *     p_pred = p_est + Q          (prediction: add process noise)
+ *     p_new  = p_pred * R / (p_pred + R)   (posterior: shrink toward R)
+ *
+ *   This is self-limiting — p_est always converges to an asymptote
+ *   determined by Q and R.  For the heuristic noise path alone
+ *   (Q ≤ 2000, R ≤ r_max_boost × base_R = 3200), the steady-state
+ *   is p_ss ≈ 1700 — two orders of magnitude below 25000.
+ *
+ *   However, BBR-S covariance-matched noise estimation (noise_mode = 1,
+ *   the default) adds a second path for R to grow beyond the heuristic
+ *   budget:
+ *
+ *   1. Sustained large RTT innovations feed the matched estimator:
+ *        matched_r_est += α × max(0, innov² − p_pred)
+ *      α = 1/10 (default).  The matched R is capped at
+ *      kcc_kalman_r_est_max = 32 000 = 10 × R_hmax (3200).
+ *
+ *   2. noise_mode = 1 selects effective R = max(heuristic_r,
+ *      matched_r_est).  At most, effective R = 32 000.
+ *
+ *   3. Similarly, matched Q is capped at kcc_kalman_q_est_max =
+ *      50 000 = 10 × Q_hmax (5000).
+ *
+ *   4. Both caps are derived from the steady-state constraint:
+ *        R_cap ≤ p_target · (p_target + Q_cap) / Q_cap
+ *      With p_target = 25 000 and Q_cap = 50 000, R_cap ≤ 37 500.
+ *      The chosen 10× rule (R = 32 000, Q = 50 000) produces
+ *      p_ss = 22 170 — safely below the recalibration threshold.
+ *
+ *   5. The matched estimator therefore cannot push p_est across
+ *      25 000 in normal operation.  The recalibration threshold is a
+ *      true safety net, unreachable by legitimately calibrated noise
+ *      — only structural filter failure (numerical corruption,
+ *      overflow) can trigger it.
+ *
+ *   Note what does NOT push p_est up: directional update (positive
+ *   innovations skip the state update), outlier gating (rejected
+ *   samples still converge p_est toward heuristic_r, not matched_r),
+ *   and Q-boost (resets p_est to p_est_init = 1000).
+ *
+ *   ——— Parameter derivation from p_target = 25 000 ———
+ *
+ *   The Kalman covariance converges to the steady state:
+ *
+ *       p_ss = (−Q + √(Q² + 4·Q·R)) / 2
+ *
+ *   The heuristic noise budget:
+ *
+ *       Q_hmax = base_Q × q_scale_cap  = 100 × 50 = 5 000
+ *       R_hmax = base_R × r_max_boost  = 400 × 8  = 3 200
+ *
+ *   p_ss(Q_hmax, R_hmax) = 2 217 — heuristic path alone never
+ *   approaches the threshold.
+ *
+ *   Applying the 10× rule symmetrically gives the matched caps:
+ *
+ *       kcc_kalman_q_est_max  = 10 × Q_hmax  = 50 000
+ *       kcc_kalman_r_est_max  = 10 × R_hmax  = 32 000
+ *
+ *   p_ss(50 000, 32 000) = 22 170 < 25 000.  The recalibration
+ *   threshold stays safely above the matched estimator's ceiling.
+ *
+ *   The 10× rule is not arbitrary — it is the lowest integer factor
+ *   that gives the matched estimator one full order of magnitude of
+ *   learning headroom beyond the instantaneous heuristic budget,
+ *   while still keeping p_ss provably below the threshold.  Larger
+ *   factors (11×, 12×) add marginal learning headroom at the cost
+ *   of approaching the threshold asymptotically; smaller factors
+ *   (9×, 8×) unnecessarily constrain the matched estimator's
+ *   ability to track consistently high measurement noise.
  */
-static int kcc_recal_p_est_thresh = 250000;    /* Kalman error-covariance threshold for PROBE_RTT recalibration; default 250000 = 25% of p_est_max (1,000,000); when kcc_probe_rtt_decouple is active and p_est exceeds this, a PROBE_RTT drain is triggered as a safety net; KCC-only; range [1, 100000000], BBR default: N/A */
+static int kcc_recal_p_est_thresh = 25000;    /* Kalman recalibration threshold; the only path that pushes p_est up is matched_r_est via BBR-S noise mode; 25000 sits above realistic matched-R noise (p_ss ≤ 21k @ R ≈ 250k) and resists hostile-path DOS; KCC-only; range [1, 100000000] */
 module_param_cb(kcc_recal_p_est_thresh, &kcc_param_ops, &kcc_recal_p_est_thresh, 0644); /* sysctl: kcc_recal_p_est_thresh */
 /*
  * kcc_kalman_noise_avg_num / _den — Weighted blend ratio for noise mode 2.
@@ -1711,27 +1814,6 @@ static int kcc_alone_confirm_rounds = 3;             /* consecutive qualifying r
 module_param_cb(kcc_alone_confirm_rounds, &kcc_param_ops, &kcc_alone_confirm_rounds, 0644); /* sysctl: kcc_alone_confirm_rounds */
 
 /*
- * kcc_alone_qdelay_thresh_us — Queuing delay upper bound (us) for
- *     single-flow detection.  qdelay_avg must be strictly below this
- *     value for the flow to qualify as alone.  Default 1000 us (1 ms).
- *     Lower = stricter (only enters on truly idle paths); higher =
- *     more permissive (enters even with minor queue).
- *     Range [0, 100000] us.
- */
-static int kcc_alone_qdelay_thresh_us = 1000;          /* max queuing delay (us) for single-flow detection; qdelay_avg must be strictly below this for the flow to qualify as alone; lower = stricter; KCC extension; range [0, 100000], BBR default: N/A */
-module_param_cb(kcc_alone_qdelay_thresh_us, &kcc_param_ops, &kcc_alone_qdelay_thresh_us, 0644); /* sysctl: kcc_alone_qdelay_thresh_us */
-
-/*
- * kcc_alone_jitter_thresh_us — Jitter upper bound (us) for
- *     single-flow detection.  jitter_ewma must be strictly below this
- *     value.  Competing flows induce inter-packet timing variance;
- *     a quiet single-flow path shows only ACK-clock micro-jitter.
- *     Default 2000 us (2 ms).  Range [0, 100000] us.
- */
-static int kcc_alone_jitter_thresh_us = 2000;           /* max jitter (us) for single-flow detection; jitter_ewma must be strictly below this; KCC extension; range [0, 100000], BBR default: N/A */
-module_param_cb(kcc_alone_jitter_thresh_us, &kcc_param_ops, &kcc_alone_jitter_thresh_us, 0644); /* sysctl: kcc_alone_jitter_thresh_us */
-
-/*
  * kcc_alone_agg_state_level — ACK aggregation strictness for single-flow
  *     detection.  Controls how much aggregation is tolerated before
  *     disqualifying the flow from alone mode:
@@ -1752,7 +1834,7 @@ module_param_cb(kcc_alone_agg_state_level, &kcc_param_ops, &kcc_alone_agg_state_
  *     Set to 0 to keep ECN backoff active even when alone (conservative).
  *     Range [0, 1].
  */
-static int kcc_alone_bypass_ecn = 1;                   /* when alone_on_path is active, skip ECN backoff (default: 1 = bypass); on single-flow paths, ECN marks are likely false positives from over-sensitive AQM; KCC extension; range [0, 1], BBR default: N/A */
+static int kcc_alone_bypass_ecn = 0;                   /* when alone_on_path is active, skip ECN backoff (default: 0 = honour ECN); ECN marks from switch/router AQM are end-to-end signals, trustworthy even on single-flow paths; set to 1 to bypass ECN when alone (legacy behaviour); KCC extension; range [0, 1], BBR default: N/A */
 module_param_cb(kcc_alone_bypass_ecn, &kcc_param_ops, &kcc_alone_bypass_ecn, 0644); /* sysctl: kcc_alone_bypass_ecn */
 
 /* ---- ECN (Explicit Congestion Notification) --------------------------- */
@@ -1766,8 +1848,6 @@ module_param_cb(kcc_alone_bypass_ecn, &kcc_param_ops, &kcc_alone_bypass_ecn, 064
  *     conditions are met (see kcc_ecn_backoff() for full trigger logic).
  *     Default (20/100) × BBR_UNIT ≈ 20% reduction.
  *
- * kcc_ecn_qdelay_thresh_us — Qdelay threshold (us) for ECN backoff
- *     activation via queue buildup.  Default 2000 us.
  * kcc_ecn_ewma_retained / kcc_ecn_ewma_total — EWMA weights for ECN
  *     mark ratio.  Default 3/4 -> weight 0.75 old, 0.25 new.
  */
@@ -1778,8 +1858,6 @@ static int kcc_ecn_backoff_num = 20;                     /* ECN backoff percenta
 module_param_cb(kcc_ecn_backoff_num, &kcc_param_ops, &kcc_ecn_backoff_num, 0644); /* sysctl: kcc_ecn_backoff_num */
 static int kcc_ecn_backoff_den = 100;                    /* ECN backoff percentage denominator; range [1, 100000], BBR default: N/A */
 module_param_cb(kcc_ecn_backoff_den, &kcc_param_ops, &kcc_ecn_backoff_den, 0644); /* sysctl: kcc_ecn_backoff_den */
-static int kcc_ecn_qdelay_thresh_us = 2000;              /* qdelay threshold (us) for ECN backoff activation via queue buildup; ECN backoff only activates when qdelay_avg exceeds this; KCC extension; range [0, 100000], BBR default: N/A */
-module_param_cb(kcc_ecn_qdelay_thresh_us, &kcc_param_ops, &kcc_ecn_qdelay_thresh_us, 0644); /* sysctl: kcc_ecn_qdelay_thresh_us */
 static int kcc_ecn_ewma_retained = 3;                    /* ECN EWMA retained weight (old part): ecn_ewma = (ecn_ewma*retained + instant)/total; default 3/4 = 0.75 old, 0.25 new weight; KCC extension; range [0, 100], BBR default: N/A */
 module_param_cb(kcc_ecn_ewma_retained, &kcc_param_ops, &kcc_ecn_ewma_retained, 0644); /* sysctl: kcc_ecn_ewma_retained */
 static int kcc_ecn_ewma_total = 4;                       /* ECN EWMA total weight (old + new); must be >= retained; range [1, 100000], BBR default: N/A */
@@ -1863,7 +1941,7 @@ static int kcc_agg_enable = 1;                           /* ACK aggregation conf
 module_param_cb(kcc_agg_enable, &kcc_param_ops, &kcc_agg_enable, 0644); /* sysctl: kcc_agg_enable */
 static int kcc_agg_confidence_thresh = 512;              /* minimum confidence score (0..1024) to enable cwnd compensation; default 512 = CONFIRMED state; set > kcc_agg_confidence_max to disable cwnd comp while keeping signal layer active; KCC extension; range [0, 10000], BBR default: N/A */
 module_param_cb(kcc_agg_confidence_thresh, &kcc_param_ops, &kcc_agg_confidence_thresh, 0644); /* sysctl: kcc_agg_confidence_thresh */
-static int kcc_agg_max_comp_ratio = 75;                 /* maximum cwnd compensation as percentage of BDP; default 75 = 75% of BDP; 0 = no cwnd compensation; KCC extension; range [0, 100], BBR default: N/A (BBR uses direct extra_acked addition) */
+static int kcc_agg_max_comp_ratio = 50;                 /* maximum cwnd compensation as percentage of BDP; cwnd baseline is 2× BDP and the safety guard blocks at 3× BDP; 50% keeps total cwnd at 2.5× BDP, leaving 0.5 BDP of safety margin between the compensation ceiling and the absolute guard; 0 = no cwnd compensation; KCC extension; range [0, 100], BBR default: N/A */
 module_param_cb(kcc_agg_max_comp_ratio, &kcc_param_ops, &kcc_agg_max_comp_ratio, 0644); /* sysctl: kcc_agg_max_comp_ratio */
 static int kcc_agg_max_comp_duration = 8;               /* maximum consecutive RTTs with active compensation before watchdog forces confidence downgrade; prevents stale extra_acked from persisting beyond the aggregation event; KCC extension; range [1, 128], BBR default: N/A */
 module_param_cb(kcc_agg_max_comp_duration, &kcc_param_ops, &kcc_agg_max_comp_duration, 0644); /* sysctl: kcc_agg_max_comp_duration */
@@ -1875,16 +1953,9 @@ static int kcc_agg_r_multiplier_max = 2048;            /* Kalman R noise scaling
 module_param_cb(kcc_agg_r_multiplier_max, &kcc_param_ops, &kcc_agg_r_multiplier_max, 0644); /* sysctl: kcc_agg_r_multiplier_max */
 
 /*
- * kcc_agg_factor3_qdelay_us — Queue delay threshold for confidence
- *     Factor 3: RTT is considered "near min_rtt" if within this margin.
- *     Default 2000 us (2ms).
- *
  * kcc_agg_factor4_ratio_num / kcc_agg_factor4_ratio_den — Maximum ratio
  *     of current extra_acked to windowed max for Factor 4 to score.
  *     Default 3/2 = 1.5x.  Values within this ratio are not transient spikes.
- *
- * kcc_agg_safety_qdelay_us — Max allowed RTT above min_rtt before
- *     safety guard 1 triggers and blocks compensation.  Default 4000 us.
  *
  * kcc_agg_safety_bdp_mult — BDP multiplier for cwnd ceiling in safety
  *     guards 3 and 4.  Default 3 (3x BDP).  Compensation is blocked
@@ -1903,14 +1974,10 @@ module_param_cb(kcc_agg_r_multiplier_max, &kcc_param_ops, &kcc_agg_r_multiplier_
  *     from inflating Factor 4 for an entire long RTT.  128 = no per-ACK
  *     decay (default).  127 = ~0.8% per ACK, reaching ~50% after ~87 ACKs.
  */
-static int kcc_agg_factor3_qdelay_us = 2000;         /* confidence Factor 3 qdelay margin (us): RTT is considered "near min_rtt" if within this margin of min_rtt; contributes to aggregation confidence score when true; KCC extension; range [0, 100000], BBR default: N/A */
-module_param_cb(kcc_agg_factor3_qdelay_us, &kcc_param_ops, &kcc_agg_factor3_qdelay_us, 0644); /* sysctl: kcc_agg_factor3_qdelay_us */
 static int kcc_agg_factor4_ratio_num = 3;            /* confidence Factor 4 ratio numerator: maximum ratio of current extra_acked to windowed max for non-spike scoring; default 3/2 = 1.5x; values within this ratio indicate stable aggregation, not transient spikes; KCC extension; range [1, 100000], BBR default: N/A */
 module_param_cb(kcc_agg_factor4_ratio_num, &kcc_param_ops, &kcc_agg_factor4_ratio_num, 0644); /* sysctl: kcc_agg_factor4_ratio_num */
 static int kcc_agg_factor4_ratio_den = 2;            /* confidence Factor 4 ratio denominator; range [1, 100000], BBR default: N/A */
 module_param_cb(kcc_agg_factor4_ratio_den, &kcc_param_ops, &kcc_agg_factor4_ratio_den, 0644); /* sysctl: kcc_agg_factor4_ratio_den */
-static int kcc_agg_safety_qdelay_us = 4000;          /* Safety Guard 1: max allowed RTT above min_rtt (us) before blocking compensation; if current RTT - min_rtt exceeds this, compensation is blocked to prevent cwnd overshoot; KCC extension; range [0, 100000], BBR default: N/A */
-module_param_cb(kcc_agg_safety_qdelay_us, &kcc_param_ops, &kcc_agg_safety_qdelay_us, 0644); /* sysctl: kcc_agg_safety_qdelay_us */
 static int kcc_agg_safety_bdp_mult = 3;              /* Safety Guard 3/4: BDP multiplier for cwnd ceiling; compensation is blocked if cwnd or inflight exceeds this multiple of BDP; default 3 = 3x BDP; KCC extension; range [1, 100], BBR default: N/A */
 module_param_cb(kcc_agg_safety_bdp_mult, &kcc_param_ops, &kcc_agg_safety_bdp_mult, 0644); /* sysctl: kcc_agg_safety_bdp_mult */
 static int kcc_agg_max_window_ms = 100;              /* extra_acked cap window (ms): cap = bw * window_ms used in kcc_measure_ack_aggregation(); KCC extension; range [1, 10000], BBR default: N/A */
@@ -2070,12 +2137,15 @@ static u32 kcc_full_bw_cnt_val;                            /* clamped full-BW ro
 static u32 kcc_kalman_p_est_max_val;                       /* clamped p_est max (computed at module init) */
 static u32 kcc_kalman_converged_p_est_val;                  /* clamped convergence p_est (computed at module init) */
 static u32 kcc_recal_p_est_thresh_val;                     /* clamped recalibration p_est threshold (computed at module init) */
-static u32 kcc_drain_skip_qdelay_us_val;                   /* clamped drain skip qdelay (computed at module init) */
+
 static u32 kcc_kalman_q_boost_thresh_val;                    /* computed Q-boost threshold (computed at module init) */
 static u32 kcc_kalman_qboost_cdwn_val;                       /* clamped Q-boost cooldown (computed at module init) */
 static int kcc_kalman_q_max_val;                            /* clamped Q max (computed at module init) */
 static int kcc_kalman_q_scale_cap_val;                      /* clamped Q scale cap (computed at module init) */
 static int kcc_kalman_min_samples_val;                      /* clamped min samples for takeover (computed at module init) */
+static u32 kcc_qdelay_clean_bp_val;                          /* clamped clean bp (computed at module init) */
+static u32 kcc_qdelay_cong_bp_val;                           /* clamped congestion bp (computed at module init) */
+static u32 kcc_qdelay_floor_us_val;                         /* clamped absolute floor (computed at module init) */
 static u32 kcc_rtt_sample_max_us_val;                       /* clamped max RTT sample (computed at module init) */
 static int kcc_minrtt_fast_fall_cnt_val;                    /* clamped fast-fall count (computed at module init) */
 static u32 kcc_minrtt_sticky_num_val;                       /* cached sticky num (computed at module init) */
@@ -2094,10 +2164,10 @@ static int kcc_agg_max_comp_duration_val;                /* clamped max comp dur
 static int kcc_agg_r_hysteresis_val;                     /* clamped R hysteresis (computed at module init) */
 static u32 kcc_agg_r_multiplier_min_val;                 /* clamped R mult min (computed at module init) */
 static u32 kcc_agg_r_multiplier_max_val;                 /* clamped R mult max (computed at module init) */
-static int kcc_agg_factor3_qdelay_us_val;            /* clamped Factor 3 qdelay (computed at module init) */
+
 static int kcc_agg_factor4_ratio_num_val;            /* snapped Factor 4 ratio num (computed at module init) */
 static int kcc_agg_factor4_ratio_den_val;            /* snapped Factor 4 ratio den (computed at module init) */
-static int kcc_agg_safety_qdelay_us_val;             /* clamped safety qdelay (computed at module init) */
+
 static int kcc_agg_safety_bdp_mult_val;              /* clamped safety BDP mult (computed at module init) */
 static int kcc_agg_max_window_ms_val;                /* clamped max window ms (computed at module init) */
 static int kcc_agg_max_decay_pct_val;                /* clamped max decay pct (computed at module init) */
@@ -2116,11 +2186,11 @@ static u32 kcc_kalman_noise_alpha_complement;           /* precomputed alpha_d -
 static u32 kcc_kalman_noise_beta_complement;             /* precomputed beta_d - beta_n (computed at module init) */
 static bool kcc_agg_per_ack_decay_active;                 /* precomputed: per_ack_decay < den (computed at module init) */
 
-static int kcc_jitter_probe_thresh_us_val;                  /* clamped jitter threshold for gain decay (computed at module init) */
+
 static int kcc_jitter_probe_scale_us_val;                   /* clamped jitter scale for gain decay (computed at module init) */
-static int kcc_qdelay_probe_thresh_us_val;                  /* clamped qdelay threshold for gain decay (computed at module init) */
+
 static int kcc_qdelay_probe_scale_us_val;                   /* clamped qdelay scale for gain decay (computed at module init) */
-static int kcc_jitter_r_thresh_us_val;                      /* clamped jitter threshold for adaptive R (computed at module init) */
+
 static int kcc_jitter_r_scale_val;                          /* clamped jitter scale for adaptive R (computed at module init) */
 static int kcc_kalman_r_max_boost_val;                  /* clamped R max boost (computed at module init) */
 static int kcc_probe_rtt_long_rtt_us_val;                   /* clamped long-RTT threshold (computed at module init) */
@@ -2145,14 +2215,14 @@ static int kcc_kalman_q_val;                             /* clamped Kalman Q (co
 static int kcc_kalman_r_val;                             /* clamped Kalman R (computed at module init) */
 static int kcc_kalman_noise_mode_val;                    /* clamped noise combination mode (computed at module init) */
 static int kcc_alone_confirm_rounds_val;               /* clamped alone confirmation rounds (computed at module init) */
-static int kcc_alone_qdelay_thresh_us_val;              /* clamped alone qdelay threshold (computed at module init) */
-static int kcc_alone_jitter_thresh_us_val;              /* clamped alone jitter threshold (computed at module init) */
+
+
 static int kcc_alone_agg_state_level_val;               /* clamped alone agg state level (computed at module init) */
 static int kcc_alone_bypass_ecn_val;                    /* clamped alone bypass ECN flag (computed at module init) */
 
 static int kcc_ecn_enable_val;                           /* clamped ECN enable flag (computed at module init) */
 static u32 kcc_ecn_backoff_val;                          /* derived ECN backoff ratio in BBR_UNIT (computed at module init) */
-static int kcc_ecn_qdelay_thresh_us_val;                 /* clamped ECN qdelay threshold (computed at module init) */
+
 static int kcc_ecn_ewma_retained_val;                    /* cached ECN EWMA retained weight (computed at module init) */
 static int kcc_ecn_ewma_total_val;                       /* cached ECN EWMA total weight (computed at module init) */
 static int kcc_kalman_max_consec_reject_val;             /* clamped consec reject limit (computed at module init) */
@@ -2170,7 +2240,7 @@ static u32 kcc_lt_loss_thresh_val;                          /* clamped LT loss t
 static u32 kcc_lt_bw_ratio_val;                             /* derived LT BW ratio in BBR_UNIT (computed at module init) */
 static u32 kcc_lt_bw_diff_val;                              /* clamped LT BW absolute diff (computed at module init) */
 static int kcc_lt_bw_max_rtts_val;                          /* clamped LT BW max RTTs (< 4095) (computed at module init) */
-static int kcc_lt_bw_inst_qdelay_thresh_us_val;              /* clamped LT BW instant qdelay thresh (computed at module init) */
+
 
 static u32 kcc_extra_acked_max_ms_val;                       /* derived ACK max aggregation ms (computed at module init) */
 static u32 kcc_probe_rtt_mode_ms_val;                        /* derived PROBE_RTT stay-duration ms (computed at module init) */
@@ -2271,7 +2341,10 @@ static void kcc_init_module_params(void)                          /* clamp all p
     kcc_kalman_p_est_max = clamp(kcc_kalman_p_est_max, 1, 100000000);  /* p_est max [1, 100M] */
     kcc_kalman_converged_p_est = clamp(kcc_kalman_converged_p_est, 1, 1000000); /* convergence p_est [1, 1M] */
     kcc_recal_p_est_thresh = clamp(kcc_recal_p_est_thresh, 1, 100000000); /* recal p_est thresh [1, 100M] */
-    kcc_drain_skip_qdelay_us = clamp(kcc_drain_skip_qdelay_us, 0, 100000);  /* drain skip qdelay [0, 100k us] */
+
+    kcc_qdelay_clean_bp = clamp(kcc_qdelay_clean_bp, 1, 10000);   /* clean bp [1, 10000‱] */
+    kcc_qdelay_cong_bp = clamp(kcc_qdelay_cong_bp, 1, 10000);     /* cong bp [1, 10000‱] */
+    kcc_qdelay_floor_us = clamp(kcc_qdelay_floor_us, 1, 100000);  /* floor [1, 100k us] */
     kcc_kalman_q_boost_mult = clamp(kcc_kalman_q_boost_mult, 1, 10000); /* Q-boost mult [1, 10k] */
     kcc_kalman_q_max = clamp(kcc_kalman_q_max, 1, 100000);              /* Q max [1, 100k] */
     kcc_kalman_q_scale_cap = clamp(kcc_kalman_q_scale_cap, 1, 10000);   /* Q scale cap [1, 10k] */
@@ -2293,11 +2366,11 @@ static void kcc_init_module_params(void)                          /* clamp all p
     kcc_tso_max_segs = clamp(kcc_tso_max_segs, 1, 65535);                /* max TSO segs [1, 65535] */
     kcc_tso_segs_low = clamp(kcc_tso_segs_low, 1, 65535);
     kcc_tso_segs_default = clamp(kcc_tso_segs_default, 1, 65535);
-    kcc_jitter_probe_thresh_us = clamp(kcc_jitter_probe_thresh_us, 0, 100000);   /* jitter probe thresh [0, 100k] */
+
     kcc_jitter_probe_scale_us = clamp(kcc_jitter_probe_scale_us, 1, 100000);     /* jitter probe scale [1, 100k] */
-    kcc_qdelay_probe_thresh_us = clamp(kcc_qdelay_probe_thresh_us, 0, 100000);   /* qdelay probe thresh [0, 100k] */
+
     kcc_qdelay_probe_scale_us = clamp(kcc_qdelay_probe_scale_us, 1, 100000);     /* qdelay probe scale [1, 100k] */
-    kcc_jitter_r_thresh_us = clamp(kcc_jitter_r_thresh_us, 0, 100000);   /* adaptive R jitter thresh [0, 100k] */
+
     kcc_jitter_r_scale = clamp(kcc_jitter_r_scale, 1, 100000);           /* adaptive R scale [1, 100k] */
     kcc_kalman_r_max_boost = clamp(kcc_kalman_r_max_boost, 1, 1000);    /* R max boost [1, 1000] */
     kcc_probe_rtt_long_rtt_us = clamp(kcc_probe_rtt_long_rtt_us, 0, 10000000); /* long-RTT thresh [0, 10M] */
@@ -2345,8 +2418,8 @@ static void kcc_init_module_params(void)                          /* clamp all p
 
     /* Single-flow detection hysteresis */
     kcc_alone_confirm_rounds = clamp(kcc_alone_confirm_rounds, 1, 32);       /* alone confirm [1, 32] */
-    kcc_alone_qdelay_thresh_us = clamp(kcc_alone_qdelay_thresh_us, 0, 100000); /* alone qdelay [0, 100k] us */
-    kcc_alone_jitter_thresh_us = clamp(kcc_alone_jitter_thresh_us, 0, 100000); /* alone jitter [0, 100k] us */
+
+
     kcc_alone_agg_state_level = clamp(kcc_alone_agg_state_level, 0, 2);         /* alone agg level [0, 2] */
     kcc_alone_bypass_ecn = clamp(kcc_alone_bypass_ecn, 0, 1);                   /* alone bypass ECN [0, 1] */
 
@@ -2354,7 +2427,7 @@ static void kcc_init_module_params(void)                          /* clamp all p
     kcc_ecn_enable = clamp(kcc_ecn_enable, 0, 1);                                /* ECN enable [0, 1] */
     kcc_ecn_backoff_num = clamp(kcc_ecn_backoff_num, 0, 100);                    /* ECN backoff num [0, 100] */
     kcc_ecn_backoff_den = clamp(kcc_ecn_backoff_den, 1, 100000);                 /* ECN backoff den [1, 100k] */
-    kcc_ecn_qdelay_thresh_us = clamp(kcc_ecn_qdelay_thresh_us, 0, 100000);       /* ECN qdelay thresh [0, 100k] */
+
     kcc_ecn_ewma_retained = clamp(kcc_ecn_ewma_retained, 0, 100);                /* ECN EWMA retained [0, 100] */
     kcc_ecn_ewma_total = clamp(kcc_ecn_ewma_total, 1, 100000);                   /* ECN EWMA total [1, 100k] */
     /* EWMA formula requires retained <= total, otherwise new-sample weight > 1 */
@@ -2379,7 +2452,7 @@ static void kcc_init_module_params(void)                          /* clamp all p
     kcc_lt_bw_ema_den = clamp(kcc_lt_bw_ema_den, 1, 100000);
     kcc_lt_bw_ema_num = min_t(int, kcc_lt_bw_ema_num, kcc_lt_bw_ema_den);
     kcc_lt_bw_max_rtts = clamp(kcc_lt_bw_max_rtts, 1, 4094);               /* LT BW max RTTs [1, 4094], 12-bit field max = 4095 */
-    kcc_lt_bw_inst_qdelay_thresh_us = clamp(kcc_lt_bw_inst_qdelay_thresh_us, 0, 100000); /* LT BW inst qdelay thresh [0, 100k us] */
+
     kcc_lt_intvl_max_mult = clamp(kcc_lt_intvl_max_mult, 1, 32);            /* LT timeout mult [1, 32] */
 
     kcc_extra_acked_max_ms_num = clamp(kcc_extra_acked_max_ms_num, 0, 100000);          /* ACK-agg max ms num [0, 100k] */
@@ -2400,10 +2473,10 @@ static void kcc_init_module_params(void)                          /* clamp all p
     kcc_agg_r_multiplier_min = clamp(kcc_agg_r_multiplier_min, 1, 10000);  /* R mult min [1, 10000] */
     kcc_agg_r_multiplier_max = clamp(kcc_agg_r_multiplier_max, 1, 10000);  /* R mult max [1, 10000] */
     kcc_agg_r_multiplier_max = max(kcc_agg_r_multiplier_max, kcc_agg_r_multiplier_min);  /* ensure max >= min */
-    kcc_agg_factor3_qdelay_us = clamp(kcc_agg_factor3_qdelay_us, 0, 100000);     /* factor3 qdelay [0, 100k] */
+
     kcc_agg_factor4_ratio_num = clamp(kcc_agg_factor4_ratio_num, 1, 100000);    /* factor4 num [1, 100k] */
     kcc_agg_factor4_ratio_den = clamp(kcc_agg_factor4_ratio_den, 1, 100000);    /* factor4 den [1, 100k] */
-    kcc_agg_safety_qdelay_us = clamp(kcc_agg_safety_qdelay_us, 0, 100000);      /* safety qdelay [0, 100k] */
+
     kcc_agg_safety_bdp_mult = clamp(kcc_agg_safety_bdp_mult, 1, 100);           /* safety bdp mult [1, 100] */
     kcc_agg_max_window_ms = clamp(kcc_agg_max_window_ms, 1, 10000);             /* max window ms [1, 10k] */
     kcc_agg_max_decay_pct = clamp(kcc_agg_max_decay_pct, 0, 100);               /* max decay pct [0, 100] */
@@ -2464,7 +2537,10 @@ static void kcc_init_module_params(void)                          /* clamp all p
     kcc_kalman_p_est_max_val = (u32)kcc_kalman_p_est_max;         /* publish p_est max */
     kcc_kalman_converged_p_est_val = (u32)kcc_kalman_converged_p_est; /* publish converged p_est threshold */
     kcc_recal_p_est_thresh_val = (u32)kcc_recal_p_est_thresh;     /* publish recalibration p_est threshold */
-    kcc_drain_skip_qdelay_us_val = (u32)kcc_drain_skip_qdelay_us;   /* publish drain skip qdelay */
+
+    kcc_qdelay_clean_bp_val   = (u32)kcc_qdelay_clean_bp;       /* publish clean bp */
+    kcc_qdelay_cong_bp_val    = (u32)kcc_qdelay_cong_bp;        /* publish congestion bp */
+    kcc_qdelay_floor_us_val    = (u32)kcc_qdelay_floor_us;        /* publish absolute floor */
     /* Cache clamped Q/R for hot-path use (avoids raw-param read race) */
     kcc_kalman_q_val = kcc_kalman_q;                                /* publish clamped Q */
     kcc_kalman_r_val = kcc_kalman_r;                                /* publish clamped R */
@@ -2537,11 +2613,11 @@ static void kcc_init_module_params(void)                          /* clamp all p
     kcc_tso_headroom_mult_val = kcc_tso_headroom_mult;             /* publish TSO headroom mult */
     kcc_min_tso_rate_div = clamp(kcc_min_tso_rate_div, 1, 256);               /* prevent div-by-zero */
     kcc_min_tso_rate_div_val = kcc_min_tso_rate_div;               /* publish min TSO rate divisor */
-    kcc_jitter_probe_thresh_us_val = kcc_jitter_probe_thresh_us;  /* publish jitter probe thresh */
+
     kcc_jitter_probe_scale_us_val = kcc_jitter_probe_scale_us;    /* publish jitter probe scale */
-    kcc_qdelay_probe_thresh_us_val = kcc_qdelay_probe_thresh_us;  /* publish qdelay probe thresh */
+
     kcc_qdelay_probe_scale_us_val = kcc_qdelay_probe_scale_us;    /* publish qdelay probe scale */
-    kcc_jitter_r_thresh_us_val = kcc_jitter_r_thresh_us;          /* publish adaptive R jitter thresh */
+
     kcc_jitter_r_scale_val = kcc_jitter_r_scale;                   /* publish adaptive R jitter scale */
     kcc_kalman_r_max_boost_val = kcc_kalman_r_max_boost;          /* publish R max boost */
     kcc_probe_rtt_long_rtt_us_val = kcc_probe_rtt_long_rtt_us;     /* publish long-RTT threshold */
@@ -2556,10 +2632,10 @@ static void kcc_init_module_params(void)                          /* clamp all p
     kcc_agg_r_hysteresis_val = kcc_agg_r_hysteresis;            /* publish R hysteresis */
     kcc_agg_r_multiplier_min_val = (u32)kcc_agg_r_multiplier_min; /* publish R mult min */
     kcc_agg_r_multiplier_max_val = (u32)kcc_agg_r_multiplier_max; /* publish R mult max */
-    kcc_agg_factor3_qdelay_us_val = kcc_agg_factor3_qdelay_us;       /* publish factor3 qdelay */
+
     kcc_agg_factor4_ratio_num_val = kcc_agg_factor4_ratio_num;       /* publish factor4 ratio num */
     kcc_agg_factor4_ratio_den_val = kcc_agg_factor4_ratio_den;       /* publish factor4 ratio den */
-    kcc_agg_safety_qdelay_us_val = kcc_agg_safety_qdelay_us;         /* publish safety qdelay */
+
     kcc_agg_safety_bdp_mult_val = kcc_agg_safety_bdp_mult;           /* publish safety bdp mult */
     kcc_agg_max_window_ms_val = kcc_agg_max_window_ms;               /* publish max window ms */
     kcc_agg_max_decay_pct_val = kcc_agg_max_decay_pct;               /* publish max decay pct */
@@ -2655,13 +2731,13 @@ static void kcc_init_module_params(void)                          /* clamp all p
 
     /* ECN: publish clamped values and derived backoff ratio */
     kcc_alone_confirm_rounds_val = kcc_alone_confirm_rounds;         /* publish alone confirm rounds */
-    kcc_alone_qdelay_thresh_us_val = kcc_alone_qdelay_thresh_us;    /* publish alone qdelay threshold */
-    kcc_alone_jitter_thresh_us_val = kcc_alone_jitter_thresh_us;    /* publish alone jitter threshold */
+
+
     kcc_alone_agg_state_level_val = kcc_alone_agg_state_level;      /* publish alone agg state level */
     kcc_alone_bypass_ecn_val = kcc_alone_bypass_ecn;                /* publish alone bypass ECN flag */
     kcc_ecn_enable_val = kcc_ecn_enable;                            /* publish ECN enable */
     kcc_ecn_backoff_val = (u32)((u64)BBR_UNIT * (u32)kcc_ecn_backoff_num / (u32)kcc_ecn_backoff_den); /* backoff = BBR_UNIT * num / den */
-    kcc_ecn_qdelay_thresh_us_val = kcc_ecn_qdelay_thresh_us;       /* publish ECN qdelay threshold */
+
     kcc_ecn_ewma_retained_val = kcc_ecn_ewma_retained;              /* publish ECN EWMA retained */
     kcc_ecn_ewma_total_val = kcc_ecn_ewma_total;                    /* publish ECN EWMA total */
 
@@ -2681,7 +2757,7 @@ static void kcc_init_module_params(void)                          /* clamp all p
     kcc_lt_bw_ratio_val = (u32)((u64)BBR_UNIT * (u32)kcc_lt_bw_ratio_num / (u32)kcc_lt_bw_ratio_den); /* num/den * BBR_UNIT */
     kcc_lt_bw_diff_val = (u32)kcc_lt_bw_diff;                     /* publish LT BW absolute diff */
     kcc_lt_bw_max_rtts_val = kcc_lt_bw_max_rtts;                  /* publish LT BW max RTTs */
-    kcc_lt_bw_inst_qdelay_thresh_us_val = kcc_lt_bw_inst_qdelay_thresh_us; /* publish LT BW inst qdelay thresh */
+
     kcc_lt_bw_ema_num_val = kcc_lt_bw_ema_num;
     kcc_lt_bw_ema_den_val = kcc_lt_bw_ema_den;
 
@@ -2789,6 +2865,45 @@ static u64 kcc_kf_get_init_bw(struct sock* sk);                  /* bootstrapped
 static inline struct kcc_ext* kcc_ext_get(const struct sock* sk)
 {
     return ((struct kcc*)inet_csk_ca(sk))->ext;
+}
+
+/*
+ * kcc_clean_thresh — Dynamic "link is clean" threshold (µs).
+ *   clean = max(min_rtt_us * kcc_qdelay_clean_bp_val / KCC_QDELAY_BP_BASE, floor).
+ *
+ *   Used where the question is "is there any meaningful queue?"
+ *   (drain skip, jitter-R adaptive, alone qdelay, agg factor 3).
+ *
+ *   Default 1000‱ (10 % BDP) — 40 % of BBR's PROBE_UP natural queue
+ *   (0.25 BDP).  On a 250 ms path threshold = 25 ms, above normal
+ *   WAN clock jitter (2–5 ms).
+ */
+static inline u32 kcc_clean_thresh(const struct sock* sk)
+{
+    const struct kcc* kcc = (const struct kcc*)inet_csk_ca(sk);
+    return max_t(u32,
+        (u64)kcc->min_rtt_us * kcc_qdelay_clean_bp_val / KCC_QDELAY_BP_BASE,
+        kcc_qdelay_floor_us_val);
+}
+
+/*
+ * kcc_cong_thresh — Dynamic "queue is building" threshold (µs).
+ *   cong = max(min_rtt_us * kcc_qdelay_cong_bp_val / KCC_QDELAY_BP_BASE, floor).
+ *
+ *   Used where the question is "should we back off?"
+ *   (probe gain decay, ECN backoff, LT BW suppress, agg safety).
+ *
+ *   Default 2500‱ (25 % BDP) — exactly BBR's PROBE_UP natural
+ *   queue depth.  On a 250 ms path threshold = 62.5 ms, matching
+ *   the probe's own queue footprint.  With 1000‱ clean = 25 ms,
+ *   the 15 pp hysteresis band prevents oscillation.
+ */
+static inline u32 kcc_cong_thresh(const struct sock* sk)
+{
+    const struct kcc* kcc = (const struct kcc*)inet_csk_ca(sk);
+    return max_t(u32,
+        (u64)kcc->min_rtt_us * kcc_qdelay_cong_bp_val / KCC_QDELAY_BP_BASE,
+        kcc_qdelay_floor_us_val);
 }
 
 /*
@@ -3557,7 +3672,7 @@ static void kcc_update_ecn_ewma(struct sock* sk, const struct rate_sample* rs, /
  *   2. ext valid and Kalman filter converged (p_est < converged_p_est,
  *      sample_cnt >= min_samples).
  *   3. ecn_ewma > 0 (CE marks have been observed).
- *   4. qdelay_avg > kcc_ecn_qdelay_thresh_us (queue buildup confirms
+ *   4. qdelay_avg > congestion threshold (queue buildup confirms
  *       congestion).
  *   5. Not in PROBE_BW mode (cwnd_gain remains at 2x matching BBR).
  *   6. During probing, backoff is graduated (scaled to BBR_UNIT/gain)
@@ -3629,7 +3744,7 @@ static void kcc_ecn_backoff(struct sock* sk, struct kcc_ext* ext)               
      * — it is fixed at 2x.  During PROBE_BW, ECN signals affect pacing_gain
      * (via the probing-suppression gate above) but never the inflight ceiling. */
     if (kcc->mode != KCC_PROBE_BW &&
-        ext->qdelay_avg > (u32)kcc_ecn_qdelay_thresh_us_val) {
+        ext->qdelay_avg > kcc_cong_thresh(sk)) {
         kcc->cwnd_gain = min_t(u32, kcc->cwnd_gain,
             max_t(u32, 1U,
                 kcc->cwnd_gain * factor >> BBR_SCALE));
@@ -3680,7 +3795,7 @@ static u32 kcc_get_cycle_pacing_gain(const struct sock* sk,                   /*
      */
     if (kcc_cycle_decay_enabled(idx) && base_gain > BBR_UNIT && ext) {        /* decay enabled + above cruise + ext valid */
         u32 max_red = base_gain - BBR_UNIT;                                   /* maximum reduction budget: down to 1.0x */
-        u32 qthresh = (u32)kcc_qdelay_probe_thresh_us_val;              /* read qdelay threshold */
+        u32 qthresh = kcc_cong_thresh(sk);                                  /* dynamic "queue is building" threshold */
         u32 qscale = (u32)kcc_qdelay_probe_scale_us_val;                /* read qdelay scale divisor */
         u32 conv = (u32)kcc_kalman_converged_p_est_val;           /* cache converged threshold (single read for consistency) */
 
@@ -3706,7 +3821,7 @@ static u32 kcc_get_cycle_pacing_gain(const struct sock* sk,                   /*
         /* Jitter reduction: any remaining max_red budget, also confidence-scaled */
         if (max_red > 0 && conf_scale > 0) {                                    /* remaining reduction budget */
             u32 jitter = ext->jitter_ewma;                                    /* read jitter EWMA */
-            u32 jthresh = (u32)kcc_jitter_probe_thresh_us_val;           /* read jitter threshold */
+            u32 jthresh = kcc_cong_thresh(sk);                              /* dynamic "queue is building" threshold */
             u32 jscale = (u32)kcc_jitter_probe_scale_us_val;             /* read jitter scale divisor */
             if (jitter > jthresh) {                                      /* jitter exceeds threshold */
                 u32 jr = min_t(u32, ((u64)(jitter - jthresh) * BBR_UNIT) / jscale, max_red); /* jitter reduction */
@@ -4371,7 +4486,7 @@ static bool kcc_is_next_cycle_phase(struct sock* sk,                            
          *
          * KCC optimisation; kernel BBR always drains. */
         if (ext && ext->p_est < kcc_kalman_converged_p_est_val &&
-            ext->qdelay_avg < kcc_drain_skip_qdelay_us_val &&
+            ext->qdelay_avg < kcc_clean_thresh(sk) &&
             delta > kcc->min_rtt_us / KCC_DRAIN_SKIP_MIN_RTT_DIV) {
             return true;
         }
@@ -4681,8 +4796,8 @@ static void kcc_lt_bw_interval_done(struct sock* sk, u64 bw)                    
                      */
                     {
                         struct kcc_ext* ext = kcc_ext_get(sk);
-                        u32 qthresh = (u32)kcc_ecn_qdelay_thresh_us_val;
-                        u32 ithresh = (u32)kcc_lt_bw_inst_qdelay_thresh_us_val;
+                        u32 qthresh = kcc_cong_thresh(sk);
+                        u32 ithresh = kcc_cong_thresh(sk);
                         struct tcp_sock* tp = tcp_sk(sk);
                         u32 srtt_us = tp->srtt_us >> 3;                 /* SRTT in µs (kernel stores as 8x) */
 
@@ -5355,9 +5470,9 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
      */
     {
         u32 base_r = max_t(u32, kcc_kalman_r_val, 1U);                                                                     /* base measurement noise R (clamped cache) */
-        u32 jitter = ext->jitter_ewma;                                                                              /* current jitter EWMA */
-        u32 jr_thresh = (u32)kcc_jitter_r_thresh_us_val;                                                       /* jitter threshold for R increase */
-        u32 jr_scale = (u32)kcc_jitter_r_scale_val;                                                             /* scaling divisor for R increase */
+        u32 jitter = ext->jitter_ewma;                                              /* current jitter EWMA */
+        u32 jr_thresh = kcc_clean_thresh(sk);                                       /* dynamic "link is clean" threshold */
+        u32 jr_scale = (u32)kcc_jitter_r_scale_val;                             /* scaling divisor for R increase */
 
         if (jitter > (u32)jr_thresh) {                                                                                   /* jitter exceeds threshold */
             u64 r_boost = (u64)(jitter - jr_thresh) * (u64)base_r / (u64)jr_scale;                       /* linear R boost in u64 to avoid truncation */
@@ -6423,7 +6538,7 @@ static u16 kcc_evaluate_agg_confidence(struct sock* sk, struct kcc_ext* ext, /* 
      * Requires valid Kalman state — cold start scores 0, not a free pass. */
     if (ext->x_est > 0 && kcc->min_rtt_us != KCC_MIN_RTT_UNINIT && kcc->min_rtt_us > 0) {
         u32 est_rtt = ext->x_est >> kcc_kalman_scale_shift_val;
-        if (est_rtt <= kcc->min_rtt_us + (u32)kcc_agg_factor3_qdelay_us_val) {  /* within configurable margin */
+        if (est_rtt <= kcc->min_rtt_us + kcc_clean_thresh(sk)) {  /* within dynamic "clean" margin */
             conf += (u16)kcc_agg_factor_weight_val;  /* + configured weight */
         }
     }
@@ -6477,7 +6592,7 @@ static bool kcc_agg_safety_check(struct sock* sk, struct kcc_ext* ext, u32 bw) /
     /* Guard 1: Queue delay rising? Skip if Kalman cold (x_est == 0). */
     if (kcc->min_rtt_us != KCC_MIN_RTT_UNINIT && kcc->min_rtt_us > 0 && ext->x_est > 0) {
         u32 est_rtt = ext->x_est >> kcc_kalman_scale_shift_val;
-        if ((u64)est_rtt > (u64)kcc->min_rtt_us + (u64)kcc_agg_safety_qdelay_us_val) {  /* >configurable margin */
+        if ((u64)est_rtt > (u64)kcc->min_rtt_us + (u64)kcc_cong_thresh(sk)) {  /* >dynamic "congested" margin */
             return false;  /* queue building, stop compensation */
         }
     }
@@ -6802,13 +6917,13 @@ static void kcc_alone_on_path_eval(struct sock* sk,                            /
      *    During early startup, these values are a random walk —
      *    acting on them would produce false positives.
      *
-     * 1. qdelay_avg < kcc_alone_qdelay_thresh_us_val (default 1000 us):
-     *    Queue must be nearly empty (< 1 ms by default).  BBR-style
-     *    1 % pacing margin plus one TSO burst create ~1 - 2 ms of
-     *    queue on a loaded path; a sub-millisecond queue means there
-     *    is no competing bulk traffic.
-     *
-     * 2. jitter_ewma < kcc_alone_jitter_thresh_us_val (default 2000 us):
+      * 1. qdelay_avg < kcc_clean_thresh(sk) (dynamic, 10 % BDP):
+      *    Queue must be effectively empty.  BBR-style
+      *    1 % pacing margin plus one TSO burst create ~1–2 ms of
+      *    queue on a loaded path; a sub-threshold queue means there
+      *    is no competing bulk traffic.
+      *
+      * 2. jitter_ewma < kcc_cong_thresh(sk) (dynamic, 25 % BDP):
      *    Low packet - timing variance (< 2 ms by default).  Competing
      *    flows induce inter - packet gaps that push jitter well above
      *    this threshold.  A quiet single - flow path shows only
@@ -6852,8 +6967,8 @@ static void kcc_alone_on_path_eval(struct sock* sk,                            /
         default: max_agg = KCC_AGG_SUSPECTED; break; /* moderate: allow SUSPECTED (default) */
         }
         if (ext->sample_cnt >= kcc_kalman_min_samples_val &&                            /* Kalman must be converged */
-            ext->qdelay_avg < (u32)kcc_alone_qdelay_thresh_us_val &&                   /* queue below configurable threshold */
-            ext->jitter_ewma < (u32)kcc_alone_jitter_thresh_us_val &&                  /* jitter below configurable threshold */
+            ext->qdelay_avg < kcc_clean_thresh(sk) &&                                /* queue below dynamic "clean" threshold */
+            ext->jitter_ewma < kcc_cong_thresh(sk) &&                                /* jitter below dynamic "congested" threshold */
             ext->ecn_ewma == 0 &&                                                       /* no ECN marks from AQM */
             ext->agg_state <= max_agg) {                                                /* configurable agg strictness */
             /* All five conditions hold on this round boundary.
@@ -7651,11 +7766,10 @@ static struct ctl_table kcc_ctl_table[] = {                                     
     /* Kalman bounds (Kalman 1960) */
     {.procname = "kcc_kalman_p_est_max",        .data = &kcc_kalman_p_est_max,        .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100M] p_est absolute max covariance; KCC-only; default 1,000,000 */
     {.procname = "kcc_kalman_converged_p_est",  .data = &kcc_kalman_converged_p_est,  .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..1M] p_est convergence threshold; KCC-only; default 500 */
-    {.procname = "kcc_recal_p_est_thresh",       .data = &kcc_recal_p_est_thresh,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100M] p_est threshold for PROBE_RTT recalibration trigger; KCC-only; default 250,000 */
-    {.procname = "kcc_drain_skip_qdelay_us",     .data = &kcc_drain_skip_qdelay_us,     .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100k us] qdelay below which DRAIN phase is skipped; KCC-only; default 1000us */
+    {.procname = "kcc_recal_p_est_thresh",       .data = &kcc_recal_p_est_thresh,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100M] Kalman recalibration threshold; 25000 balances matched-R noise vs hostile-path DOS resistance; KCC-only */
     {.procname = "kcc_kalman_q_boost_mult",     .data = &kcc_kalman_q_boost_mult,     .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..10k] Q-boost threshold multiplier; KCC-only; default 4 */
     {.procname = "kcc_kalman_q_max",            .data = &kcc_kalman_q_max,            .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] adaptive Q max ceiling; KCC-only; default 2000 */
-    {.procname = "kcc_kalman_q_scale_cap",      .data = &kcc_kalman_q_scale_cap,      .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..10k] Q adaptation factor cap (min_rtt_us/1000); KCC-only; default 20 */
+    {.procname = "kcc_kalman_q_scale_cap",      .data = &kcc_kalman_q_scale_cap,      .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..10k] Q adaptation factor cap (min_rtt_us/1000); scales Q to keep convergence speed RTT-invariant; default 50 */
     {.procname = "kcc_kalman_min_samples",      .data = &kcc_kalman_min_samples,      .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [3..20] min Kalman samples before min_rtt takeover; KCC-only; default 5 */
     /* RTT / min-RTT tracking */
     {.procname = "kcc_rtt_sample_max_us",       .data = &kcc_rtt_sample_max_us,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..10M us] max RTT sample accepted by Kalman filter; KCC-only; default 500,000us */
@@ -7671,32 +7785,32 @@ static struct ctl_table kcc_ctl_table[] = {                                     
     {.procname = "kcc_min_tso_rate",            .data = &kcc_min_tso_rate,            .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..1B bytes/s] pacing rate threshold for min TSO segs; BBR default: ~1.2M */
     {.procname = "kcc_tso_max_segs",            .data = &kcc_tso_max_segs,            .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..65535 segs] max TSO segments per GSO skb; BBR default: 127 */
     /* Jitter / qdelay probe tuning */
-    {.procname = "kcc_jitter_probe_thresh_us",  .data = &kcc_jitter_probe_thresh_us,  .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100k us] jitter threshold for PROBE_BW gain decay; KCC-only; default 4000 */
     {.procname = "kcc_jitter_probe_scale_us",   .data = &kcc_jitter_probe_scale_us,   .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k us] jitter scaling divisor for gain decay; KCC-only; default 16000 */
-    {.procname = "kcc_qdelay_probe_thresh_us",  .data = &kcc_qdelay_probe_thresh_us,  .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100k us] qdelay threshold for PROBE_BW gain decay; KCC-only; default 5000 */
     {.procname = "kcc_qdelay_probe_scale_us",   .data = &kcc_qdelay_probe_scale_us,   .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k us] qdelay scaling divisor for gain decay; KCC-only; default 20000 */
-    {.procname = "kcc_jitter_r_thresh_us",      .data = &kcc_jitter_r_thresh_us,      .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100k us] jitter threshold for adaptive Kalman R; KCC-only; default 2000 */
     {.procname = "kcc_jitter_r_scale",          .data = &kcc_jitter_r_scale,          .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] jitter scaling divisor for adaptive R; KCC-only; default 8000 */
     {.procname = "kcc_kalman_r_max_boost",      .data = &kcc_kalman_r_max_boost,      .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..1000] max R boost multiplier; KCC-only; default 8 (max R <= 9x base) */
+    /* Dynamic qdelay/jitter thresholds (percentage of min_rtt_us, with absolute floor) */
+    {.procname = "kcc_qdelay_clean_bp",           .data = &kcc_qdelay_clean_bp,           .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..10000‱] clean threshold (‱ of min_rtt_us); 1000‱=10% BDP, 40% of PROBE_UP natural queue; KCC-only */
+    {.procname = "kcc_qdelay_cong_bp",            .data = &kcc_qdelay_cong_bp,            .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..10000‱] congestion threshold (‱ of min_rtt_us); 2500‱=25% BDP exactly matching PROBE_UP natural queue; KCC-only */
+    {.procname = "kcc_qdelay_floor_us",           .data = &kcc_qdelay_floor_us,           .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k us] absolute floor; 500us > clock noise (~100us), < PROBE_UP micro-burst (750us at 3ms); KCC-only */
     /* Long RTT threshold */
     {.procname = "kcc_probe_rtt_long_rtt_us",   .data = &kcc_probe_rtt_long_rtt_us,   .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..10M us] long-RTT threshold; KCC extension; default 20,000us */
     /* LT BW parameters */
     {.procname = "kcc_lt_intvl_min_rtts",       .data = &kcc_lt_intvl_min_rtts,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..127 RTTs] LT BW min sampling interval; KCC-only; default 4 */
     {.procname = "kcc_lt_intvl_max_mult",       .data = &kcc_lt_intvl_max_mult,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..32] LT BW timeout = mult*min_rtts; KCC-only; default 4 */
-    {.procname = "kcc_lt_loss_thresh",          .data = &kcc_lt_loss_thresh,          .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..65535] LT BW min loss ratio (BBR_UNIT); KCC-only; default 15 */
+    {.procname = "kcc_lt_loss_thresh",          .data = &kcc_lt_loss_thresh,          .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..65535] LT BW min loss ratio (BBR_UNIT); 25=9.8% avoids false triggers on WAN; KCC-only */
     {.procname = "kcc_lt_bw_ratio_num",         .data = &kcc_lt_bw_ratio_num,         .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100k] LT BW relative tolerance numerator; KCC-only; default 1 */
     {.procname = "kcc_lt_bw_ratio_den",         .data = &kcc_lt_bw_ratio_den,         .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] LT BW relative tolerance denominator; KCC-only; default 8 (12.5%) */
     {.procname = "kcc_lt_bw_diff",              .data = &kcc_lt_bw_diff,              .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100k bytes/s] LT BW absolute tolerance; KCC-only; default 500 */
     {.procname = "kcc_lt_bw_max_rtts",          .data = &kcc_lt_bw_max_rtts,          .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..4094 RTTs] LT BW max before reset (fits 12 bits); KCC-only; default 48 */
-    {.procname = "kcc_lt_bw_inst_qdelay_thresh_us", .data = &kcc_lt_bw_inst_qdelay_thresh_us, .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100k us] LT BW instantaneous qdelay gate; KCC-only; default 5000 */
     /* Kalman core (Kalman 1960) */
     {.procname = "kcc_kalman_p_est_init",       .data = &kcc_kalman_p_est_init,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..10M] initial error covariance p_est; KCC-only; default 1000 */
     {.procname = "kcc_kalman_p_est_floor",      .data = &kcc_kalman_p_est_floor,      .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] p_est lower bound (prevents over-confidence); KCC-only; default 10 */
     {.procname = "kcc_kalman_outlier_ms",       .data = &kcc_kalman_outlier_ms,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..10k ms] base outlier gate threshold; KCC-only; default 5 */
     {.procname = "kcc_kalman_q_boost_ms",       .data = &kcc_kalman_q_boost_ms,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..5000 ms] Q-boost time constant; KCC-only; default 1 */
-    {.procname = "kcc_kalman_qboost_cdwn",       .data = &kcc_kalman_qboost_cdwn,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..255] Q-boost cooldown (min samples between events); KCC-only; default 15 */
+    {.procname = "kcc_kalman_qboost_cdwn",       .data = &kcc_kalman_qboost_cdwn,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..255] Q-boost cooldown (min samples between events); 8 balances 250ms-path recovery (1.6s) vs runaway; KCC-only */
     {.procname = "kcc_kalman_scale",            .data = &kcc_kalman_scale,            .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [64..1M] Kalman fixed-point scale (power-of-two); KCC-only; default 1024 */
-    {.procname = "kcc_kalman_outlier_jitter_mult_num", .data = &kcc_kalman_outlier_jitter_mult_num, .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..1000] outlier jitter multiplier numerator; KCC-only; default 4 */
+    {.procname = "kcc_kalman_outlier_jitter_mult_num", .data = &kcc_kalman_outlier_jitter_mult_num, .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..1000] outlier jitter multiplier numerator; 3 breaks the positive-feedback loop; KCC-only */
     {.procname = "kcc_kalman_outlier_jitter_mult_den", .data = &kcc_kalman_outlier_jitter_mult_den, .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] outlier jitter multiplier denominator; KCC-only; default 1 */
     {.procname = "kcc_kalman_q_min_factor_num", .data = &kcc_kalman_q_min_factor_num, .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..1000] Q min factor numerator; KCC-only; default 10 */
     {.procname = "kcc_kalman_q_min_factor_den", .data = &kcc_kalman_q_min_factor_den, .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] Q min factor denominator; KCC-only; default 1 */
@@ -7707,21 +7821,18 @@ static struct ctl_table kcc_ctl_table[] = {                                     
     {.procname = "kcc_kalman_noise_alpha_den",   .data = &kcc_kalman_noise_alpha_den,   .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] BBR-S Q learning rate denominator; KCC-only; default 10 */
     {.procname = "kcc_kalman_noise_beta_num",    .data = &kcc_kalman_noise_beta_num,    .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100] BBR-S R learning rate numerator; KCC-only; default 1 */
     {.procname = "kcc_kalman_noise_beta_den",    .data = &kcc_kalman_noise_beta_den,    .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] BBR-S R learning rate denominator; KCC-only; default 10 */
-    {.procname = "kcc_kalman_q_est_max",         .data = &kcc_kalman_q_est_max,         .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..2e9] Q estimate upper bound (covariance-matched); KCC-only; default 1e9 */
-    {.procname = "kcc_kalman_r_est_max",         .data = &kcc_kalman_r_est_max,         .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..2e9] R estimate upper bound (covariance-matched); KCC-only; default 1e9 */
+    {.procname = "kcc_kalman_q_est_max",         .data = &kcc_kalman_q_est_max,         .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..2e9] Q estimate upper bound; 10× Q_hmax(5000)=50000 per steady-state derivation; KCC-only */
+    {.procname = "kcc_kalman_r_est_max",         .data = &kcc_kalman_r_est_max,         .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..2e9] R estimate upper bound; 10× R_hmax(3200)=32000 per steady-state derivation; KCC-only */
     {.procname = "kcc_kalman_q_est_floor",       .data = &kcc_kalman_q_est_floor,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] Q estimate lower bound; KCC-only; default 1 */
     {.procname = "kcc_kalman_r_est_floor",       .data = &kcc_kalman_r_est_floor,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] R estimate lower bound; KCC-only; default 1 */
     {.procname = "kcc_kalman_noise_mode",        .data = &kcc_kalman_noise_mode,        .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..2] noise mode: 0=off(heuristic), 1=max(default), 2=weighted blend; KCC-only */
     /* ECN */
     {.procname = "kcc_alone_confirm_rounds",     .data = &kcc_alone_confirm_rounds,     .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..32] alone mode hysteresis rounds; KCC-only; default 3 */
-    {.procname = "kcc_alone_qdelay_thresh_us",   .data = &kcc_alone_qdelay_thresh_us,   .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100k us] alone mode max qdelay; KCC-only; default 1000 */
-    {.procname = "kcc_alone_jitter_thresh_us",   .data = &kcc_alone_jitter_thresh_us,   .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100k us] alone mode max jitter; KCC-only; default 2000 */
     {.procname = "kcc_alone_agg_state_level",    .data = &kcc_alone_agg_state_level,    .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..2] alone mode agg strictness; KCC-only; default 1 */
-    {.procname = "kcc_alone_bypass_ecn",         .data = &kcc_alone_bypass_ecn,         .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0/1] alone mode ECN bypass; KCC-only; default 1=bypass */
+    {.procname = "kcc_alone_bypass_ecn",         .data = &kcc_alone_bypass_ecn,         .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0/1] alone mode ECN bypass; 0=honour ECN (default), 1=bypass; KCC-only */
     {.procname = "kcc_ecn_enable",              .data = &kcc_ecn_enable,              .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0/1] ECN master switch; KCC extension; default 1=enabled */
     {.procname = "kcc_ecn_backoff_num",         .data = &kcc_ecn_backoff_num,         .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100] ECN backoff percentage numerator; KCC extension; default 20 */
     {.procname = "kcc_ecn_backoff_den",         .data = &kcc_ecn_backoff_den,         .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] ECN backoff percentage denominator; KCC extension; default 100 */
-    {.procname = "kcc_ecn_qdelay_thresh_us",    .data = &kcc_ecn_qdelay_thresh_us,    .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100k us] ECN qdelay threshold; KCC extension; default 2000 */
     {.procname = "kcc_ecn_ewma_retained",       .data = &kcc_ecn_ewma_retained,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100] ECN EWMA retained weight; KCC extension; default 3 */
     {.procname = "kcc_ecn_ewma_total",          .data = &kcc_ecn_ewma_total,          .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] ECN EWMA total weight; KCC extension; default 4 */
     {.procname = "kcc_ecn_idle_decay_num",      .data = &kcc_ecn_idle_decay_num,      .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..den-1] ECN per-ACK idle decay numerator; KCC-only; default 31 */
@@ -7743,15 +7854,13 @@ static struct ctl_table kcc_ctl_table[] = {                                     
     /* ACK agg confidence compensation */
     {.procname = "kcc_agg_enable",              .data = &kcc_agg_enable,              .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0/1] agg compensation master switch; KCC extension (BBRplus-inspired); default 1 */
     {.procname = "kcc_agg_confidence_thresh",   .data = &kcc_agg_confidence_thresh,   .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..10k] min confidence for cwnd comp; KCC-only; default 512 */
-    {.procname = "kcc_agg_max_comp_ratio",      .data = &kcc_agg_max_comp_ratio,      .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100%] max cwnd comp % of BDP; KCC-only; default 75 */
+    {.procname = "kcc_agg_max_comp_ratio",      .data = &kcc_agg_max_comp_ratio,      .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100%] max cwnd compensation % of BDP; 50% keeps total cwnd at 2.5× BDP below 3× safety guard; KCC-only */
     {.procname = "kcc_agg_max_comp_duration",   .data = &kcc_agg_max_comp_duration,   .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..128] max consecutive comp RTTs; KCC-only; default 8 */
     {.procname = "kcc_agg_r_hysteresis",        .data = &kcc_agg_r_hysteresis,        .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100%] R recovery hysteresis % retained/RTT; KCC-only; default 75 */
     {.procname = "kcc_agg_r_multiplier_min",    .data = &kcc_agg_r_multiplier_min,    .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..10k] R scaling floor (256=1x); KCC-only; default 256 */
     {.procname = "kcc_agg_r_multiplier_max",    .data = &kcc_agg_r_multiplier_max,    .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..10k] R scaling ceiling (2048=8x); KCC-only; default 2048 */
-    {.procname = "kcc_agg_factor3_qdelay_us",    .data = &kcc_agg_factor3_qdelay_us,    .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100k us] confidence Factor 3 qdelay margin; KCC-only; default 2000 */
     {.procname = "kcc_agg_factor4_ratio_num",    .data = &kcc_agg_factor4_ratio_num,    .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] Factor 4 ratio numerator; KCC-only; default 3 */
     {.procname = "kcc_agg_factor4_ratio_den",    .data = &kcc_agg_factor4_ratio_den,    .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] Factor 4 ratio denominator; KCC-only; default 2 (1.5x) */
-    {.procname = "kcc_agg_safety_qdelay_us",     .data = &kcc_agg_safety_qdelay_us,     .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100k us] safety guard 1 qdelay; KCC-only; default 4000 */
     {.procname = "kcc_agg_safety_bdp_mult",      .data = &kcc_agg_safety_bdp_mult,      .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100x] safety guard 3/4 BDP multiplier; KCC-only; default 3 */
     {.procname = "kcc_agg_max_window_ms",        .data = &kcc_agg_max_window_ms,        .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..10k ms] extra_acked cap window; KCC-only; default 100 */
     {.procname = "kcc_agg_max_decay_pct",        .data = &kcc_agg_max_decay_pct,        .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100%] watchdog decay pct retained/RTT; KCC-only; default 75 */
