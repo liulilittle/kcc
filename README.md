@@ -4,7 +4,7 @@
 
 # TCP KCC v1.0 (Kalman Congestion Control)
 
-TCP congestion control module for shared-bandwidth VPS environments combining the BBRv1 state machine with a Kalman filter for propagation-delay estimation.
+General-purpose TCP congestion control module combining the BBRv1 state machine with a Kalman filter for propagation-delay estimation.
 
 ## Design Principles
 
@@ -38,8 +38,8 @@ KCC introduces a configurable strategy for the RTT estimate used in BDP (Bandwid
 
 | Mode | Value | Behavior | Use Case |
 |------|-------|----------|----------|
-| FILTER | 1 (default) | Use `x_est_us` directly — the raw Kalman/sliding-window filter estimate | Production WAN/VPS: resilient to route changes, zero-throughput-cliff |
-| MIN | 0 | `min(x_est_us, min_rtt_us)` — clamp Kalman estimate against windowed minimum | Kernel-module stability verification; static-RTT links |
+| FILTER | 1 (default) | Use `x_est_us` directly — the raw Kalman/sliding-window filter estimate | General purpose: resilient to path changes, zero throughput cliff |
+| MIN | 0 | `min(x_est_us, min_rtt_us)` — clamp Kalman estimate against windowed minimum | Conservative mode: clamps Kalman against windowed minimum for static-RTT environments |
 
 **Why FILTER is the default:**
 
@@ -150,7 +150,7 @@ R = min(R, R_base × kcc_kalman_r_max_boost)
 
 **Kalman takeover**: when `x_est > 0` and `sample_cnt ≥ kcc_kalman_min_samples` (default 5), `min_rtt_us` is replaced by `x_est / kcc_kalman_scale`. `min_rtt_stamp` is not updated — PROBE_RTT interval trigger remains independent.
 
-**Model RTT strategy**: The RTT estimate used for BDP calculation is controlled by `kcc_rtt_mode`. In FILTER mode (default), `model_rtt = x_est_us` directly — the Kalman/sliding-window estimate is used without clamping. In MIN mode, `model_rtt = min(x_est_us, min_rtt_us)` — the Kalman estimate is clamped against the windowed minimum to guarantee BDP never inflates. The FILTER default is recommended for production WAN/VPS deployments where path latency can change abruptly (BGP reroutes, LEO handovers, mobile cell switches). See [Model RTT Strategy](#model-rtt-strategy).
+**Model RTT strategy**: The RTT estimate used for BDP calculation is controlled by `kcc_rtt_mode`. In FILTER mode (default), `model_rtt = x_est_us` directly — the Kalman/sliding-window estimate is used without clamping. In MIN mode, `model_rtt = min(x_est_us, min_rtt_us)` — the Kalman estimate is clamped against the windowed minimum to guarantee BDP never inflates. The FILTER default is recommended for general-purpose deployments. Path latency can change abruptly in production (BGP reroutes, LEO handovers, mobile cell switches), and FILTER mode adapts within a few RTTs where MIN mode deadlocks on the stale `min_rtt_us`. See [Model RTT Strategy](#model-rtt-strategy).
 
 ## BBR Enhancements
 
@@ -577,6 +577,54 @@ bbr_min_rtt:         current min_rtt_us
 bbr_pacing_gain:     current pacing gain (BBR_UNIT, 256=1.0x)
 bbr_cwnd_gain:       current cwnd gain (BBR_UNIT)
 ```
+
+### `/proc/kcc/status`
+
+KCC exposes a read-only proc file at `/proc/kcc/status` for per-connection
+diagnostics.  Unlike `ss -i` (which shows only BBR-compatible fields),
+this file reveals the internal Kalman filter state, queue pressure, and
+degradation flags of every active KCC connection.
+
+**Global section** — aggregate counters since module load:
+- `kf_active` / `kf_x` — global Kalman BDP filter state
+- `conn_start` / `conn_end` / `conn_active` — connection lifecycle
+- `ext_fail` — count of `kzalloc` failures for `struct kcc_ext`
+  (non-zero means ≥1 connection is running in degraded BBR-only mode)
+
+**Per-connection table** — one row per active KCC connection:
+
+| Column | Field | Meaning |
+|--------|-------|---------|
+| ident | IP:port | source → destination |
+| min_rtt | µs | windowed-minimum RTT baseline |
+| mode | enum | STARTUP / DRAIN / PROBE_BW / PROBE_RTT |
+| rtt_m | F/M | F=Kalman FILTER, M=BBR window MIN |
+| p_est | scalar | Kalman error covariance (low=converged, high=diverged) |
+| samp | count | accepted Kalman samples |
+| x_est | µs | Kalman propagation-delay estimate |
+| qdelay | µs | EWMA queue pressure |
+| jitter | µs | EWMA absolute innovation (noise magnitude) |
+| ecn% | 0–100 | ECN-CE mark ratio |
+| agg | enum | ACK-aggregation state (IDLE/SUSPECT/CONFIRM/TRUSTED) |
+| alone | 0/1 | single-flow detection flag |
+| lt | 0/1 | LT-BW pacing lock active |
+| qb_cd | count | qboost cooldown counter (0=armed) |
+| rej | count | consecutive outlier rejections |
+
+Example output:
+
+```
+# cat /proc/kcc/status
+[Global]
+  kf_active=1  kf_x=100000 (≈5960 seg/s)
+  conn_start=47  conn_end=39  conn_active=8  ext_fail=1
+
+[Connections] (ident  min_rtt  mode       rtt_m  p_est  samp  x_est  …)
+10.0.1.2:8080 -> 10.0.2.3:443  15000   PROBE_BW  F      8      1234  14500  …
+```
+
+If `ext_fail > 0`, check `dmesg` for `KCC: ext alloc failed` warnings
+and investigate host memory pressure (cgroup limits, system OOM).
 
 ## Usage
 

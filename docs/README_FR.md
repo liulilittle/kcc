@@ -4,7 +4,7 @@
 
 # TCP KCC v1.0 (Contrôle de Congestion de Kalman)
 
-Module de contrôle de congestion TCP pour environnements VPS à bande passante partagée, combinant la machine d'état BBRv1 avec un filtre de Kalman pour l'estimation du délai de propagation.
+Module universel de contrôle de congestion TCP, combinant la machine d'état BBRv1 avec un filtre de Kalman pour l'estimation du délai de propagation.
 
 ## Principes de Conception
 
@@ -38,8 +38,8 @@ KCC introduit une stratégie configurable pour l'estimation RTT utilisée dans l
 
 | Mode | Valeur | Comportement | Cas d'utilisation |
 |------|--------|--------------|-------------------|
-| FILTER | 1 (défaut) | Utilisation directe de `x_est_us` — l'estimation brute du filtre de Kalman/à fenêtre glissante | WAN/VPS de production : résistant aux changements de route, pas de chute de débit |
-| MIN | 0 | `min(x_est_us, min_rtt_us)` — limiter l'estimation de Kalman par le minimum fenêtré | Vérification de stabilité du module noyau ; liaisons à RTT statique |
+| FILTER | 1 (défaut) | Utilisation directe de `x_est_us` — l'estimation brute du filtre de Kalman/à fenêtre glissante | Usage général : résistant aux changements de chemin, sans falaise de débit |
+| MIN | 0 | `min(x_est_us, min_rtt_us)` — limiter l'estimation de Kalman par le minimum fenêtré | Mode conservateur : borner Kalman par le minimum de fenêtre, pour environnements à RTT statique |
 
 **Pourquoi FILTER est le défaut :**
 
@@ -154,7 +154,7 @@ R = min(R, R_base × kcc_kalman_r_max_boost)
 
 **Prise de contrôle de Kalman** : lorsque `x_est > 0` et `sample_cnt ≥ kcc_kalman_min_samples` (par défaut 5), `min_rtt_us` est remplacé par `x_est / kcc_kalman_scale`. `min_rtt_stamp` n'est pas mis à jour — le déclencheur d'intervalle PROBE_RTT reste indépendant.
 
-**Stratégie de RTT modèle** : L'estimation RTT utilisée pour le calcul du BDP est contrôlée par `kcc_rtt_mode`. En mode FILTER (défaut), `model_rtt = x_est_us` est utilisé directement — l'estimation de Kalman/à fenêtre glissante sans limitation. En mode MIN, `model_rtt = min(x_est_us, min_rtt_us)` — l'estimation de Kalman est limitée par le minimum fenêtré pour garantir que le BDP ne gonfle jamais. Le défaut FILTER est recommandé pour les déploiements WAN/VPS de production où la latence du chemin peut changer brusquement (reroutages BGP, handovers LEO, changements de cellule mobile). Voir [Stratégie de RTT modèle](#strat%C3%A9gie-de-rtt-mod%C3%A8le).
+**Stratégie de RTT modèle** : L'estimation RTT utilisée pour le calcul du BDP est contrôlée par `kcc_rtt_mode`. En mode FILTER (défaut), `model_rtt = x_est_us` est utilisé directement — l'estimation de Kalman/à fenêtre glissante sans limitation. En mode MIN, `model_rtt = min(x_est_us, min_rtt_us)` — l'estimation de Kalman est limitée par le minimum fenêtré pour garantir que le BDP ne gonfle jamais. La valeur par défaut FILTER est recommandée pour les déploiements universels. Dans les environnements où la latence du chemin peut changer brusquement (reroutage BGP, handover LEO, changement de cellule mobile), le mode FILTER s'adapte en quelques RTTs, tandis que le mode MIN reste bloqué sur l'ancien `min_rtt_us`. Voir [Stratégie de RTT modèle](#strat%C3%A9gie-de-rtt-mod%C3%A8le).
 
 ## Améliorations BBR
 
@@ -572,6 +572,18 @@ bbr_min_rtt :         min_rtt_us actuel
 bbr_pacing_gain :     gain de pacing actuel (BBR_UNIT, 256=1,0x)
 bbr_cwnd_gain :       gain de cwnd actuel (BBR_UNIT)
 ```
+
+### `/proc/kcc/status`
+
+KCC expose `/proc/kcc/status` pour le diagnostic par connexion, affichant
+l'état interne du filtre de Kalman, la pression de file d'attente et les drapeaux de dégradation.
+
+**Section globale :**
+- `ext_fail` — échecs d'allocation de `struct kcc_ext` (>0 = ≥1 connexion dégradée)
+
+**Colonnes par connexion :** ident, min_rtt, mode, rtt_m(F=Kalman/M=BBR), p_est, samp, x_est, qdelay, jitter, ecn%, agg, alone, lt, qb_cd, rej
+
+Si `ext_fail > 0`, vérifiez `dmesg` pour les avertissements `KCC: ext alloc failed`.
 
 ## Utilisation
 

@@ -2,10 +2,9 @@
 /*
  * KCC: Kalman Congestion Control v1.0
  *
- * A TCP congestion control module for shared-bandwidth VPS environments
- * (e.g. 1-10 Gbps multi-tenant hosting) combining the BBRv1 state machine
- * (Cardwell et al. 2016) with a single-state Kalman filter (Kalman 1960)
- * for propagation-delay estimation.
+ * A general-purpose TCP congestion control module combining the BBRv1
+ * state machine (Cardwell et al. 2016) with a single-state Kalman filter
+ * (Kalman 1960) for propagation-delay estimation.
  *
  * Kernel BBR practice (tcp_bbr.c) uses a sliding-window minimum of recent
  * RTT samples to estimate base propagation delay (`min_rtt_us` / `min_rtt_stamp`).
@@ -27,8 +26,8 @@
  *   1. BBRv1 PROVIDES a well-understood state machine (STARTUP, DRAIN,
  *      PROBE_BW, PROBE_RTT) with proven pacing and gain-cycling
  *      strategies.  KCC adopts these mechanisms without modification,
- *      preserving compatibility with the BBR congestion-control framework
- *      and its empirical validation across diverse network paths.
+ * preserving compatibility with the BBR congestion-control framework
+ * and its established performance across the range of Internet paths.
  *
  *   2. The KALMAN FILTER augments the BBRv1 foundation by estimating
  *      true propagation delay separately from queuing delay and
@@ -213,6 +212,9 @@
 #include <linux/win_minmax.h>   /* struct minmax, minmax_running_max — sliding-window max for bandwidth estimation; KCC retains this directly from kernel BBR's bw filter unchanged */
 #include <linux/math64.h>       /* div_u64, mul_u64_u32_shr — 64-bit fixed-point helpers for BDP and Kalman arithmetic; kernel BBR relies on the same helpers for the same purpose */
 #include <linux/random.h>       /* prandom_u32_max (pre-6.2) / get_random_u32_below (6.2+) — uniform random for PROBE_BW cycle-phase start offset randomization (Cardwell et al. 2016 Section 4.3) */
+#include <linux/list.h>         /* LIST_HEAD, list_add, list_del, INIT_LIST_HEAD, list_entry — /proc/kcc/status per-connection tracking */
+#include <linux/proc_fs.h>      /* proc_create, proc_mkdir, remove_proc_entry — /proc/kcc/status diagnostic interface */
+#include <linux/seq_file.h>     /* seq_file, seq_open, seq_read, seq_lseek, seq_release, seq_printf, seq_list_start_head, seq_list_next — /proc/kcc/status formatted output */
 
  /*
   * BTF (BPF Type Format) / kfunc support for struct_ops BPF programs.
@@ -769,6 +771,33 @@ struct kcc_ext {                                     /* extended per-connection 
      * Kernel BBR: no qboost mechanism — no equivalent.
      */
     u8  qboost_cdwn;                                 /* cooldown counter: minimum accepted samples between qboost events; prevents runaway gain resets on lossy paths; no kernel BBR equivalent */
+
+    /*
+     * Per-connection tracking for /proc/kcc/status.
+     *
+     * kcc_node — list node in the module-global kcc_conn_list.
+     *     Life-cycle: INIT_LIST_HEAD in kcc_init(), list_add_tail
+     *     after full initialisation, list_del in kcc_ext_destruct()
+     *     before kfree(ext).  While the node is in the list the
+     *     owning socket is guaranteed alive.
+     *
+     * sk — weak back-reference to the containing TCP socket.
+     *     Used by the seq_file iterator to read IP/port identity
+     *     and the per-connection struct kcc (bitfields for mode,
+     *     alone_on_path, lt_use_bw, etc.).  Never dereferenced
+     *     after list_del — the node is removed before the socket
+     *     destruction path nulls CA state.
+     *
+     * Only connections WITH a successfully allocated ext appear
+     * in this list.  Degraded (ext == NULL) connections are
+     * counted globally by kcc_ext_alloc_fail_cnt but cannot be
+     * individually enumerated — struct kcc has exactly 16 free
+     * bytes remaining in its 104-byte ICSK_CA_PRIV_SIZE budget,
+     * exactly enough for a list_head but leaving zero headroom
+     * for any future fields.
+     */
+    struct list_head kcc_node;
+    struct sock* sk;
 };
 
 /*
@@ -2289,6 +2318,69 @@ static atomic64_t kcc_kf_P = ATOMIC64_INIT(0);          /* error covariance (ini
 static atomic64_t kcc_kf_x_steady = ATOMIC64_INIT(0);   /* steady-mode peak floor: monotonic max (BW_UNIT) */
 static atomic_t kcc_kf_active = ATOMIC_INIT(0);         /* 1 = filter has been seeded (cold-start guard) */
 
+/* ---- /proc/kcc/status diagnostic counters -------------------------- */
+/*
+ * kcc_ext_alloc_fail_cnt — Monotonic count of kzalloc failures for
+ *     struct kcc_ext.  Incremented in kcc_init() when the heap allocation
+ *     for Kalman/ECN/ACK-agg state fails.  Non-zero means at least one
+ *     connection on this host is (or was) running in degraded BBR-only
+ *     mode — no Kalman filter, no ECN backoff, no ACK-aggregation
+ *     compensation.  The operator should investigate memory pressure
+ *     (cgroup limits, system-wide OOM) if this counter is non-zero.
+ *     Checked via cat /proc/kcc/status.
+ *
+ * kcc_conn_start_cnt  — Monotonic count of kcc_init() calls (connections
+ *     that selected the "kcc" congestion-control algorithm).  Incremented
+ *     before any initialisation, so this includes connections where ext
+ *     allocation subsequently failed.
+ *
+ * kcc_conn_end_cnt    — Monotonic count of kcc_release() calls (socket
+ *     close / CC-change-away).  Incremented before ext destruction.
+ *     active_connections = start_cnt - end_cnt gives the instantaneous
+ *     connection count.  Both counters are monotonic, so start_cnt >=
+ *     end_cnt always holds at any single instant, but a non-atomic
+ *     double-read (two separate atomic_read calls) can transiently
+ *     capture a negative difference if a connection starts and ends
+ *     between the two reads.  The /proc/kcc/status display clamps to
+ *     zero to prevent displaying a spuriously negative value.
+ *
+ * All three counters are atomic_t — inc/read without locks, safe for
+ * concurrent softirq (kcc_init/kcc_release) and process-context
+ * (/proc/kcc/status reader).
+ */
+static atomic_t kcc_ext_alloc_fail_cnt = ATOMIC_INIT(0);
+static atomic_t kcc_conn_start_cnt = ATOMIC_INIT(0);
+static atomic_t kcc_conn_end_cnt = ATOMIC_INIT(0);
+
+/*
+ * kcc_proc_dir / kcc_proc_status — proc filesystem entries for
+ *     the diagnostic interface.  Created in kcc_register() after
+ *     all other initialisation succeeds (non-fatal — the module
+ *     continues to function if proc creation fails).  Torn down
+ *     in kcc_unregister() before CC-ops and sysctl teardown.
+ */
+static struct proc_dir_entry* kcc_proc_dir;
+static struct proc_dir_entry* kcc_proc_status;
+
+/*
+ * Per-connection linked list for /proc/kcc/status iteration.
+ *
+ * kcc_conn_list — doubly-linked list of struct kcc_ext nodes.
+ *     Only connections with a successfully allocated ext appear
+ *     here (degraded connections are invisible to the iterator
+ *     but counted in kcc_ext_alloc_fail_cnt).
+ *
+ * kcc_conn_lock — bottom-half spinlock protecting kcc_conn_list
+ *     against concurrent add (kcc_init, process or softirq context),
+ *     del (kcc_release, process context), and read (seq_file iterator,
+ *     process context).  Using _bh is required because passive-open
+ *     kcc_init() fires from NET_RX softirq via tcp_create_openreq_child();
+ *     kcc_release runs in process context via socket close; neither path
+ *     runs in hard-IRQ.
+ */
+static LIST_HEAD(kcc_conn_list);
+static DEFINE_SPINLOCK(kcc_conn_lock);
+
 /* ---- Module init + derived scalar computation ----------------------- */
 /*
  * kcc_init_module_params - Validate all raw module parameters against
@@ -2922,6 +3014,18 @@ static void kcc_ext_destruct(struct sock* sk)
         return;
     }
 
+    /*
+     * Unlink from /proc/kcc/status BEFORE nulling kcc->ext and
+     * freeing the memory.  The list_del must happen under the
+     * lock that the seq_file iterator uses (kcc_conn_lock), so
+     * the iterator never sees a freed or partially-unlinked node.
+     * After list_del returns, this ext is invisible to new
+     * iterations and safe to destroy.
+     */
+    spin_lock_bh(&kcc_conn_lock);
+    list_del(&ext->kcc_node);                        /* unregister from /proc/kcc/status */
+    spin_unlock_bh(&kcc_conn_lock);
+
     kcc->ext = NULL;
     kfree(ext);
 }
@@ -2931,6 +3035,14 @@ static void kcc_ext_destruct(struct sock* sk)
  */
 static void kcc_release(struct sock* sk)                                     /* socket close callback */
 {
+    /*
+     * Increment the end counter BEFORE destroying extended state.
+     * This preserves the invariant conn_active = start_cnt - end_cnt
+     * for the diagnostic display — the increment of the end counter
+     * (which reduces the active-connection count) must precede the
+     * list removal of this specific connection.
+     */
+    atomic_inc(&kcc_conn_end_cnt);
     kcc_ext_destruct(sk);                                                    /* destroy extended state */
 }
 /*
@@ -7422,13 +7534,60 @@ KCC_KFUNC void kcc_main(struct sock* sk, const struct rate_sample* rs)          
  * (mode = KCC_STARTUP = 0, flags = 0).  snd_ssthresh is set to
  * TCP_INFINITE_SSTHRESH to prevent the stack from imposing its own cwnd
  * clamp.  min_rtt_us is u32, initialised from tcp_min_rtt() which returns
- * u32.  Extended state is allocated with GFP_KERNEL (may sleep).  The
+ * u32.  Extended state is allocated with GFP_NOWAIT (never sleeps,
+ * never touches emergency reserves).  GFP_NOWAIT is preferred over
+ * GFP_ATOMIC here for three interdependent reasons:
+ *
+ *   1. CONTEXT SAFETY — kcc_init fires from both process context
+ *      (active open, setsockopt) and softirq context (passive open via
+ *      tcp_create_openreq_child in NET_RX).  GFP_NOWAIT never calls
+ *      direct reclaim or enters the page allocator slow-path — safe
+ *      in all contexts without disabling preemption or IRQs.
+ *
+ *   2. NO EMERGENCY-POOL THEFT — GFP_ATOMIC carries __GFP_HIGH,
+ *      draining the MEMALLOC reserve (~5 % of system memory) reserved
+ *      for packet reception, swap I/O, OOM-killer cleanup, and
+ *      filesystem journal commits.  A burst of 1000 passive connections
+ *      (~800 KB of ext allocations) stealing from this pool starves
+ *      the TCP receive path of the memory it needs to free socket
+ *      buffers — a positive-feedback loop where KCC causes the very
+ *      congestion it aims to control.
+ *
+ *   3. GRACEFUL DEGRADATION — the code already handles allocation
+ *      failure by nulling kcc->ext and running in bare-BBR mode
+ *      (no Kalman, no ECN backoff, no ACK-agg compensation).
+ *      /proc/kcc/status reports ext_alloc_fail > 0 so the operator
+ *      knows the path is degraded.  Deferring to bare BBR under
+ *      memory pressure is safer than stealing critical memory from
+ *      the network stack.
+ *
+ *   GFP_KERNEL is unconditionally wrong here (would sleep in softirq
+ *   under memory pressure, triggering "scheduling while atomic").
+ *   GFP_ATOMIC is correct for atomic context but dangerously consumes
+ *   emergency reserves when a graceful fallback exists.
+ *   GFP_NOWAIT is the engineering optimum: correct in all contexts,
+ *   preserves system stability, and degrades gracefully.
+ *
+ *   Reference: Linux-MM "Network Receive Livelock" (2012 LWN);
+ *   Mel Gorman, "Understanding the Linux Virtual Memory Manager"
+ *   (2004), §2.7 GFP flags; kernel Documentation/core-api/gfp_mask.rst.
+ *
+ *  The
  * function is marked KCC_KFUNC for BPF struct_ops compatibility.
  */
 KCC_KFUNC void kcc_init(struct sock* sk)                                             /* per-connection init callback */
 {
     struct kcc* kcc = (struct kcc*)inet_csk_ca(sk);                                           /* get CA private area */
     struct kcc_ext* ext;                                                                         /* extended state pointer */
+
+    /*
+     * Increment the connection-start counter BEFORE any initialisation.
+     * This ensures conn_active = start_cnt - end_cnt never goes negative,
+     * even if a concurrent reader samples start_cnt before we increment
+     * end_cnt in kcc_release.  The counter is monotonic — used only for
+     * diagnostic display in /proc/kcc/status.
+     */
+    atomic_inc(&kcc_conn_start_cnt);
 
     memset(kcc, 0, sizeof(*kcc));                                                                /* zero the CA private area */
     /* Match BBR: set snd_ssthresh to TCP_INFINITE_SSTHRESH so the TCP stack
@@ -7512,7 +7671,7 @@ KCC_KFUNC void kcc_init(struct sock* sk)                                        
      * start from current delivery, not zero (bbr_init:1065). */
     kcc_reset_lt_bw_sampling_interval(sk);
 
-    ext = kzalloc(sizeof(*ext), GFP_KERNEL);                                                          /* allocate extended state block (kzalloc zeroes memory) */
+    ext = kzalloc(sizeof(*ext), GFP_NOWAIT);                             /* allocate extended state block; GFP_NOWAIT never sleeps — safe for both process and softirq contexts (passive-open connections fire from tcp_create_openreq_child in NET_RX softirq); gracefully degrades to bare-BBR on allocation failure */
     if (likely(ext)) {                                                                                  /* allocation succeeded */
 
         ext->p_est = kcc_kalman_p_est_init_val;                                                 /* initialize Kalman covariance (Kalman 1960) */
@@ -7531,9 +7690,33 @@ KCC_KFUNC void kcc_init(struct sock* sk)                                        
         ext->sample_cnt = 0;                         /* no accepted samples yet */
         ext->consec_reject_cnt = 0;                  /* no rejections yet */
         ext->dyn_probe_rtt_interval_jiffies = 0;      /* disabled until kalman converges */
+
+        /*
+         * Register this connection in /proc/kcc/status.
+         * ext->sk stores a weak back-reference used by the
+         * seq_file iterator to read socket identity and CA state.
+         * The list node is initialised before list_add_tail to
+         * satisfy the kernel's list debugging (CONFIG_DEBUG_LIST).
+         * Under kcc_conn_lock because the list is read lock-free
+         * by the seq_file iterator and must never observe a
+         * partially-linked node.
+         */
+        ext->sk = sk;
+        INIT_LIST_HEAD(&ext->kcc_node);
         kcc->ext = ext;
+        spin_lock_bh(&kcc_conn_lock);
+        list_add_tail(&ext->kcc_node, &kcc_conn_list);
+        spin_unlock_bh(&kcc_conn_lock);
     }
     else {                                                                                                   /* allocation failed */
+        /*
+         * Increment the degradation counter.  This connection will
+         * run in bare-BBR mode (no Kalman filter, no ECN backoff,
+         * no ACK-aggregation compensation).  The operator can detect
+         * this by monitoring cat /proc/kcc/status for ext_fail > 0,
+         * or by checking dmesg for the pr_warn_once message below.
+         */
+        atomic_inc(&kcc_ext_alloc_fail_cnt);
         pr_warn_once("KCC: ext alloc failed, advanced features disabled\n");                                     /* warn: running degraded */
     }
 }
@@ -7966,6 +8149,186 @@ static DEFINE_KFUNC_BTF_ID_SET(&tcp_kcc_check_kfunc_ids, tcp_kcc_kfunc_btf_set);
 
 #endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0) */                                                                     /* end BTF support block */
 
+/* ---- /proc/kcc/status seq_file -------------------------------------- */
+/*
+ * /proc/kcc/status — per-connection KCC diagnostic snapshot.
+ *
+ * LOCKING:
+ *   Iterator holds kcc_conn_lock (bottom-half spinlock) across each batch
+ *   of seq_file output.  Individual fields (kcc->mode, ext->p_est, etc.)
+ *   are read without the per-sock lock — consistent with the kernel's
+ *   own /proc/net/tcp, which also snapshots sockets lock-free.  Transient
+ *   incoherence is harmless for diagnostics.
+ *
+ * LIST LIFE-CYCLE:
+ *   list_add_tail  — kcc_init(), after ext initialisation, before
+ *                    releasing the reference to the caller.
+ *   list_del       — kcc_ext_destruct(), BEFORE kcc->ext = NULL and
+ *                    kfree(ext).  While a node is in kcc_conn_list the
+ *                    back-reference ext->sk is guaranteed valid.
+ *
+ * OUTPUT COLUMNS (per-connection line):
+ *   1. ident         source IP:port -> dest IP:port
+ *   2. min_rtt       windowed-minimum RTT (µs), the BBR-compatible baseline
+ *   3. mode          current FSM state (STARTUP/DRAIN/PROBE_BW/PROBE_RTT)
+ *   4. rtt_m         RTT estimation mode: F=FILTER (Kalman), M=MIN (BBR window)
+ *   5. p_est         Kalman error covariance (low = converged, >recal_thresh = diverged)
+ *   6. samp          accepted Kalman sample count (converged >= min_samples)
+ *   7. x_est         Kalman propagation-delay estimate (µs); 0 = cold-start
+ *   8. qdelay        EWMA queue pressure (µs), max(0, observation - x_est)
+ *   9. jitter        EWMA absolute innovation (µs), noise magnitude
+ *  10. ecn%          ECN-CE mark ratio (0 = no marks, >0 = active AQM)
+ *  11. agg           ACK-aggregation state: IDLE/SUSPECT/CONFIRM/TRUSTED
+ *  12. alone         single-flow detection flag (1 = path has no competitors)
+ *  13. lt            LT-BW lock active flag (1 = pacing locked at 1.0x)
+ *  14. qb_cd         qboost cooldown count (0 = ready, >0 = suppressed)
+ *  15. rej           consecutive outlier rejections (25 = about to force-accept)
+ */
+
+static void* kcc_status_start(struct seq_file* m, loff_t* pos)
+{
+    spin_lock_bh(&kcc_conn_lock);
+    return seq_list_start_head(&kcc_conn_list, *pos);
+}
+
+static void* kcc_status_next(struct seq_file* m, void* v, loff_t* pos)
+{
+    return seq_list_next(v, &kcc_conn_list, pos);
+}
+
+static void kcc_status_stop(struct seq_file* m, void* v)
+{
+    spin_unlock_bh(&kcc_conn_lock);
+}
+
+static int kcc_status_show(struct seq_file* m, void* v)
+{
+    if (v == &kcc_conn_list) {
+        /*
+         * HEADER CALLBACK (pos == 0): print global counters and column
+         * titles once per cat invocation.  seq_list_start_head returns
+         * the list head itself when *pos == 0, so we recognise it by
+         * identity.
+         * Column widths are aligned to the widest expected value:
+         *   mode    = 9 chars (PROBE_RTT)
+         *   agg     = 8 chars (CONFIRM)
+         *   ident   = variable (IPv6 uses abbreviated [v6]:port format)
+         */
+        seq_printf(m, "KCC  status  snapshot  (jiffies %lu)\n", jiffies);
+        seq_printf(m, "=============================================================="
+            "=================================\n");
+        seq_printf(m, "[Global]\n");
+        if (atomic_read(&kcc_kf_active)) {
+            u64 bw_raw = (u64)atomic64_read(&kcc_kf_x);
+            /* Convert BW_UNIT (segments * 2^24 per usec) to segments/s.
+             * Avoid intermediate overflow: split the BW_SCALE=24 shift
+             * across the USEC_PER_SEC multiply so the intermediate product
+             * stays within u64 for paths up to ~200 Gbps.
+             *   seg/s = bw_raw * 10^6 / 2^24
+             *         = (bw_raw >> 12) * (10^6 >> 12)  [both halves ≪ 2^64]
+             */
+            u64 bw_sps = (bw_raw >> 12) * (USEC_PER_SEC >> 12);
+            seq_printf(m, "  kf_active=1  kf_x=%llu (≈%llu seg/s)\n",
+                bw_raw, bw_sps);
+        } else {
+            seq_printf(m, "  kf_active=0\n");
+        }
+        {
+            int cs = atomic_read(&kcc_conn_start_cnt);
+            int ce = atomic_read(&kcc_conn_end_cnt);
+            seq_printf(m, "  conn_start=%d  conn_end=%d  conn_active=%d  ext_fail=%d\n",
+                cs, ce,
+                cs > ce ? cs - ce : 0,
+                atomic_read(&kcc_ext_alloc_fail_cnt));
+        }
+
+        seq_printf(m, "\n[Connections] "
+            "(ident  min_rtt  mode       rtt_m  p_est  samp  x_est  "
+            "qdelay  jitter  ecn%%  agg       alone  lt  qb_cd  rej)\n");
+        seq_printf(m, "--------------------  -------  ---------  -----  -----  ----  "
+            "-----  ------  ------  ----  --------  -----  --  -----  ---\n");
+        return 0;
+    }
+
+    /*
+     * PER-CONNECTION ROW: one line per KCC connection with full Kalman
+     * state.  ext->sk is guaranteed non-NULL because list_add_tail runs
+     * only after ext->sk = sk in kcc_init(), and list_del runs before
+     * kfree(ext) in kcc_ext_destruct() — a node in the list implies a
+     * live socket whose CA slot contains a valid struct kcc.
+     */
+    {
+        struct kcc_ext* ext = list_entry(v, struct kcc_ext, kcc_node);
+        struct sock* sk = ext->sk;
+        struct kcc* kcc = (struct kcc*)inet_csk_ca(sk);
+
+        /* ---- column 1: connection identity (IPv4 / IPv6) ---- */
+        if (sk->sk_family == AF_INET) {
+            struct inet_sock* inet = inet_sk(sk);
+            seq_printf(m, "%pI4:%u -> %pI4:%u",
+                &inet->inet_saddr, ntohs(inet->inet_sport),
+                &inet->inet_daddr, ntohs(inet->inet_dport));
+        } else {
+            seq_printf(m, "[v6]:%u -> [v6]:%u",
+                ntohs(inet_sk(sk)->inet_sport),
+                ntohs(inet_sk(sk)->inet_dport));
+        }
+
+        /* ---- columns 2-15: state snapshot ---- */
+        seq_printf(m,
+            "  %-7u  %-9s  %-5s  %-5u  %-4u  %-5u  %-6u  %-6u  %4u  %-8s  %-5u  %-2u  %-5u  %-3u\n",
+            kcc->min_rtt_us,                                        /* col  2 */
+            kcc->mode == KCC_STARTUP   ? "STARTUP"   :              /* col  3 */
+            kcc->mode == KCC_DRAIN     ? "DRAIN  "   :
+            kcc->mode == KCC_PROBE_BW  ? "PROBE_BW"  :
+            kcc->mode == KCC_PROBE_RTT ? "PROBE_RTT" : "?",
+            kcc_rtt_mode ? "F" : "M",                                /* col  4: F=Kalman filter, M=BBR window min */
+            ext->p_est,                                              /* col  5 */
+            ext->sample_cnt,                                         /* col  6 */
+            ext->x_est >> kcc_kalman_scale_shift_val,               /* col  7: Kalman x_est in µs */
+            ext->qdelay_avg,                                         /* col  8 */
+            ext->jitter_ewma,                                        /* col  9 */
+            ext->ecn_ewma * 100 / BBR_UNIT,                         /* col 10: ECN mark % */
+            ext->agg_state == KCC_AGG_IDLE      ? "IDLE" :           /* col 11 */
+            ext->agg_state == KCC_AGG_SUSPECTED ? "SUSPECT" :
+            ext->agg_state == KCC_AGG_CONFIRMED ? "CONFIRM" :
+            ext->agg_state == KCC_AGG_TRUSTED   ? "TRUSTED" : "?",
+            kcc->alone_on_path,                                      /* col 12 */
+            kcc->lt_use_bw,                                          /* col 13 */
+            ext->qboost_cdwn,                                        /* col 14: qboost cooldown */
+            ext->consec_reject_cnt);                                 /* col 15: outlier rejection count */
+    }
+    return 0;
+}
+
+static const struct seq_operations kcc_status_seq_ops = {
+    .start = kcc_status_start,
+    .next  = kcc_status_next,
+    .stop  = kcc_status_stop,
+    .show  = kcc_status_show,
+};
+
+static int kcc_status_open(struct inode* inode, struct file* file)
+{
+    return seq_open(file, &kcc_status_seq_ops);
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
+static const struct proc_ops kcc_status_fops = {
+    .proc_open    = kcc_status_open,
+    .proc_read    = seq_read,
+    .proc_lseek   = seq_lseek,
+    .proc_release = seq_release,
+};
+#else
+static const struct file_operations kcc_status_fops = {
+    .open    = kcc_status_open,
+    .read    = seq_read,
+    .llseek  = seq_lseek,
+    .release = seq_release,
+};
+#endif
+
 /* ---- Module Init / Exit ----------------------------------------------- */
 
 /*
@@ -7980,6 +8343,7 @@ static DEFINE_KFUNC_BTF_ID_SET(&tcp_kcc_check_kfunc_ids, tcp_kcc_kfunc_btf_set);
  *   4. Register sysctl interface under /proc/sys/net/kcc/.
  *   5. Register BTF kfunc set for BPF struct_ops (5.16+, 5.18+).
  *   6. Register the congestion_control ops with the TCP stack.
+ *   7. Create /proc/kcc/status (non-fatal — module continues without it).
  *
  * Cleanup on failure: unregister_sysctl -> return error.
  */
@@ -8049,6 +8413,25 @@ static int __init kcc_register(void)                                            
     }
 #endif
 #endif
+    /*
+     * Create /proc/kcc/status — the per-connection diagnostic interface.
+     *
+     * Non-fatal: if procfs creation fails the module continues to
+     * function normally (all congestion-control operations are
+     * unaffected).  The operator simply won't have the status file.
+     * We use NULL as the parent directory to create /proc/kcc/ at
+     * the procfs root — this is a module-global file, not per-netns.
+     */
+    kcc_proc_dir = proc_mkdir("kcc", NULL);
+    if (kcc_proc_dir) {
+        kcc_proc_status = proc_create("status", 0444, kcc_proc_dir,
+            &kcc_status_fops);
+        if (!kcc_proc_status) {
+            pr_warn("KCC: failed to create /proc/kcc/status\n");
+        }
+    } else {
+        pr_warn("KCC: failed to create /proc/kcc directory\n");
+    }
     return 0;                                                                                                                                  /* success */
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0) && defined(CONFIG_X86) && defined(CONFIG_DYNAMIC_FTRACE)
@@ -8067,15 +8450,31 @@ unregister_sysctl:                                                              
  * kcc_unregister - Module exit function.
  *
  * Reverse of kcc_register:
- *   1. Unregister legacy BTF kfunc set (5.16-5.17).
- *   2. Unregister congestion control ops.
- *   3. Unregister sysctl table.
+ *   1. Tear down /proc/kcc/status (blocks all current readers).
+ *   2. Unregister legacy BTF kfunc set (5.16-5.17).
+ *   3. Unregister congestion control ops.
+ *   4. Unregister sysctl table.
  *
  * Note: BTF kfunc sets registered via register_btf_kfunc_id_set() (5.18+)
  * are automatically cleaned up by the kernel on module unload.
  */
 static void __exit kcc_unregister(void)                                                                                                              /* module exit handler */
 {
+    /*
+     * Tear down /proc/kcc/status before any other resource.
+     * remove_proc_entry blocks until all current readers of the
+     * file have finished, so no seq_file iteration can race with
+     * the subsequent tcp_unregister_congestion_control() or
+     * unregister_sysctl_table() calls.
+     */
+    if (kcc_proc_status) {
+        remove_proc_entry("status", kcc_proc_dir);
+        kcc_proc_status = NULL;
+    }
+    if (kcc_proc_dir) {
+        remove_proc_entry("kcc", NULL);
+        kcc_proc_dir = NULL;
+    }
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0) && LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0)                                                    /* legacy BTF API */
 #if defined(CONFIG_X86) && defined(CONFIG_DYNAMIC_FTRACE)
     unregister_kfunc_btf_id_set(&bpf_tcp_ca_kfunc_list, &tcp_kcc_kfunc_btf_set);                                                                        /* unregister legacy kfunc set */

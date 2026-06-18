@@ -2,7 +2,7 @@
 
 # TCP KCC v1.0 (칼만 혼잡 제어)
 
-공유 대역폭 VPS 환경을 위한, BBRv1 상태 머신과 칼만 필터를 결합하여 전파 지연을 추정하는 TCP 혼잡 제어 모듈입니다.
+범용 TCP 혼잡 제어 모듈입니다. BBRv1 상태 머신과 칼만 필터를 결합하여 전파 지연을 추정합니다.
 
 ## 설계 원칙
 
@@ -36,8 +36,8 @@ KCC는 BDP(대역폭 지연 곱) 계산에 사용되는 RTT 추정 전략을 `kc
 
 | 모드 | 값 | 동작 | 용도 |
 |------|----|------|----------|
-| FILTER | 1(기본값) | `x_est_us` 직접 사용 — 원시 칼만/슬라이딩 윈도우 필터 추정치 | 프로덕션 WAN/VPS: 경로 변경에 강함, 처리량 절벽 제로 |
-| MIN | 0 | `min(x_est_us, min_rtt_us)` — 칼만 추정치를 윈도우 최소값으로 클램프 | 커널 모듈 안정성 검증, 정적 RTT 링크 |
+| FILTER | 1(기본값) | `x_est_us` 직접 사용 — 원시 칼만/슬라이딩 윈도우 필터 추정치 | 범용: 경로 변경 탄력적, 처리량 단절 없음 |
+| MIN | 0 | `min(x_est_us, min_rtt_us)` — 칼만 추정치를 윈도우 최소값으로 클램프 | 보수 모드: 창 최소값으로 칼만 추정치 클램핑, 정적 RTT 환경용 |
 
 **FILTER가 기본값인 이유:**
 
@@ -152,7 +152,7 @@ R = min(R, R_base × kcc_kalman_r_max_boost)
 
 **칼만 인계**: `x_est > 0`이고 `sample_cnt ≥ kcc_kalman_min_samples`(기본값 5)인 경우, `min_rtt_us`가 `x_est / kcc_kalman_scale`로 대체됩니다. `min_rtt_stamp`는 업데이트되지 않습니다——PROBE_RTT 간격 트리거는 독립적으로 유지됩니다.
 
-**모델 RTT 전략**: BDP 계산에 사용되는 RTT 추정은 `kcc_rtt_mode`로 제어됩니다. FILTER 모드(기본값)에서는 `model_rtt = x_est_us`를 직접 사용 — 칼만/슬라이딩 윈도우 추정치를 클램프 없이 사용. MIN 모드에서는 `model_rtt = min(x_est_us, min_rtt_us)` — 칼만 추정치를 윈도우 최소값으로 클램프하여 BDP가 절대 팽창하지 않음을 보장. FILTER 기본값은 경로 지연이 갑자기 변경될 수 있는 프로덕션 WAN/VPS 배포(BGP 재라우팅, LEO 핸드오버, 모바일 셀 전환)에 권장됩니다.[모델 RTT 전략](#모델-rtt-전략) 참조.
+**모델 RTT 전략**: BDP 계산에 사용되는 RTT 추정은 `kcc_rtt_mode`로 제어됩니다. FILTER 모드(기본값)에서는 `model_rtt = x_est_us`를 직접 사용 — 칼만/슬라이딩 윈도우 추정치를 클램프 없이 사용. MIN 모드에서는 `model_rtt = min(x_est_us, min_rtt_us)` — 칼만 추정치를 윈도우 최소값으로 클램프하여 BDP가 절대 팽창하지 않음을 보장. 범용 배포에 FILTER 기본값을 권장합니다. 경로 지연이 급변할 수 있는 환경(BGP 재라우팅, LEO 핸드오버, 모바일 셀 전환)에서 FILTER 모드는 수 RTT 내에 적응하지만, MIN 모드는 오래된 `min_rtt_us`에 고정됩니다.
 
 ## BBR 개선 사항
 
@@ -573,6 +573,18 @@ bbr_min_rtt:         현재 min_rtt_us
 bbr_pacing_gain:     현재 페이싱 게인(BBR_UNIT, 256=1.0x)
 bbr_cwnd_gain:       현재 cwnd 게인(BBR_UNIT)
 ```
+
+### `/proc/kcc/status`
+
+KCC는 `/proc/kcc/status`에 연결별 진단용 proc 파일을 제공하며,
+칼만 필터 내부 상태, 큐 압력, 저하 플래그를 표시합니다.
+
+**글로벌 섹션:**
+- `ext_fail` — `struct kcc_ext` 할당 실패 횟수 (>0 = 1개 이상의 연결이 저하 모드)
+
+**연결별 열:** ident, min_rtt, mode, rtt_m(F=Kalman/M=BBR), p_est, samp, x_est, qdelay, jitter, ecn%, agg, alone, lt, qb_cd, rej
+
+`ext_fail > 0`인 경우 `dmesg`에서 `KCC: ext alloc failed` 경고를 확인하십시오.
 
 ## 사용 방법
 

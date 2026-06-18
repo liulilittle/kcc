@@ -4,7 +4,7 @@
 
 # TCP KCC v1.0 (Kalman-Überlastkontrolle)
 
-TCP-Überlastungssteuerungsmodul für Shared-Bandwidth-VPS-Umgebungen, das die BBRv1-Zustandsmaschine mit einem Kalman-Filter zur Schätzung der Ausbreitungsverzögerung kombiniert.
+Universelles TCP-Überlastungssteuerungsmodul, das die BBRv1-Zustandsmaschine mit einem Kalman-Filter zur Schätzung der Ausbreitungsverzögerung kombiniert.
 
 ## Design-Prinzipien
 
@@ -38,8 +38,8 @@ KCC führt eine konfigurierbare Strategie für die RTT-Schätzung ein, die bei d
 
 | Modus | Wert | Verhalten | Anwendungsfall |
 |-------|------|-----------|---------------|
-| FILTER | 1 (Standard) | Direkte Verwendung von `x_est_us` — der rohen Kalman/Gleitfenster-Schätzung | Produktions-WAN/VPS: robust gegenüber Routenänderungen, kein Null-Durchsatz-Abruch |
-| MIN | 0 | `min(x_est_us, min_rtt_us)` — Kalman-Schätzung gegen Fensterminimum klammern | Kernel-Modul-Stabilitätsverifikation; statische-RTT-Links |
+| FILTER | 1 (Standard) | Direkte Verwendung von `x_est_us` — der rohen Kalman/Gleitfenster-Schätzung | Universell: robust gegenüber Pfadänderungen, kein Durchsatzabsturz |
+| MIN | 0 | `min(x_est_us, min_rtt_us)` — Kalman-Schätzung gegen Fensterminimum klammern | Konservativer Modus: clamp Kalman gegen Fensterminimum, für Umgebungen mit statischer RTT |
 
 **Warum FILTER der Standard ist:**
 
@@ -154,7 +154,7 @@ R = min(R, R_base × kcc_kalman_r_max_boost)
 
 **Kalman-Übernahme**: wenn `x_est > 0` und `sample_cnt ≥ kcc_kalman_min_samples` (Standard 5), wird `min_rtt_us` durch `x_est / kcc_kalman_scale` ersetzt. `min_rtt_stamp` wird nicht aktualisiert — der PROBE_RTT-Intervallauslöser bleibt unabhängig.
 
-**Modell-RTT-Strategie**: Die für die BDP-Berechnung verwendete RTT-Schätzung wird durch `kcc_rtt_mode` gesteuert. Im FILTER-Modus (Standard) wird `model_rtt = x_est_us` direkt verwendet — die Kalman/Gleitfenster-Schätzung ohne Begrenzung. Im MIN-Modus wird `model_rtt = min(x_est_us, min_rtt_us)` verwendet — die Kalman-Schätzung wird gegen das Fensterminimum begrenzt, um sicherzustellen, dass das BDP niemals aufgebläht wird. Der FILTER-Standard wird für Produktions-WAN/VPS-Bereitstellungen empfohlen, bei denen sich die Pfadlatenz abrupt ändern kann (BGP-Umleitungen, LEO-Übergaben, Mobilfunkzellenwechsel). Siehe [Modell-RTT-Strategie](#modell-rtt-strategie).
+**Modell-RTT-Strategie**: Die für die BDP-Berechnung verwendete RTT-Schätzung wird durch `kcc_rtt_mode` gesteuert. Im FILTER-Modus (Standard) wird `model_rtt = x_est_us` direkt verwendet — die Kalman/Gleitfenster-Schätzung ohne Begrenzung. Im MIN-Modus wird `model_rtt = min(x_est_us, min_rtt_us)` verwendet — die Kalman-Schätzung wird gegen das Fensterminimum begrenzt, um sicherzustellen, dass das BDP niemals aufgebläht wird. Der FILTER-Standard wird für universelle Bereitstellungen empfohlen. In Umgebungen mit möglichen abrupten Pfadlatenzänderungen (BGP-Neukonfiguration, LEO-Handover, Mobilfunkzellenwechsel) passt sich der FILTER-Modus innerhalb weniger RTTs an, während der MIN-Modus an veralteten `min_rtt_us`-Werten festhängt. Siehe [Modell-RTT-Strategie](#modell-rtt-strategie).
 
 ## BBR-Erweiterungen
 
@@ -572,6 +572,18 @@ bbr_min_rtt:         aktuelles min_rtt_us
 bbr_pacing_gain:     aktuelle Pacing-Verstärkung (BBR_UNIT, 256=1,0x)
 bbr_cwnd_gain:       aktuelle cwnd-Verstärkung (BBR_UNIT)
 ```
+
+### `/proc/kcc/status`
+
+KCC stellt `/proc/kcc/status` für verbindungsbezogene Diagnose bereit,
+zeigt den internen Kalman-Filterzustand, Warteschlangendruck und Degradierungsflags.
+
+**Globaler Abschnitt:**
+- `ext_fail` — Anzahl fehlgeschlagener `struct kcc_ext`-Allokationen (>0 = ≥1 degradierte Verbindung)
+
+**Spalten pro Verbindung:** ident, min_rtt, mode, rtt_m(F=Kalman/M=BBR), p_est, samp, x_est, qdelay, jitter, ecn%, agg, alone, lt, qb_cd, rej
+
+Bei `ext_fail > 0` prüfen Sie `dmesg` auf `KCC: ext alloc failed`-Warnungen.
 
 ## Verwendung
 
