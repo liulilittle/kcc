@@ -884,6 +884,8 @@ q(t) ≤ max(0, q_0 − (1−g_drain)C · t)
 
 With g_drain = 0.344, q(t) = 0 at t = q_0 / (0.656·C). For the queue contributed by KCC's own PROBE phase (q_0 ≤ C·T_prop/2, a conservative 2× overestimate of the actual 0.25·BDP probe excess), t_drain ≤ T_prop / (2·0.656) ≈ 0.76·T_prop. The 4-RTT safety timeout provides ≥5× margin over the KCC-contributed queue. For the worst-case total queue (q_0 = BDP, cross-traffic + KCC probe), Lemma Q.1 guarantees ≥2.6× margin. Both satisfy the Liberzon dwell-time condition τ_d > 0. ∎
 
+**Drain-skip qualification.** The engineering implementation includes drain-skip (see §Drain-Skip): when the Kalman is converged AND qdelay_avg < clean_thresh (≤10% BDP) AND at least 1/8 RTT has elapsed, the phase may transition from DRAIN to CRUISE before the queue reaches zero. When drain-skip fires, the residual queue is bounded by clean_thresh (a function of min_rtt_us, typically ≤10% BDP). This residual does not accumulate across cycles: the next PROBE phase adds to it, but the subsequent DRAIN (or drain-skip with stricter qdelay_avg threshold) clears it. The ISS cascade bound (Theorem 5) covers drain-skip; the Liberzon dwell-time argument applies to the worst-case (drain-enabled) path. Readers should interpret Lemma Q.2's "q → 0 every cycle" as applying to the full-DRAIN path; under drain-skip the residual queue is bounded by clean_thresh.
+
 Therefore, within every 8-phase PROBE_BW cycle, at least one phase (DRAIN) guarantees q → 0, producing at least one clean sample. ∎
 
 **Corollary Q.2.1 (Clean Sample Frequency).** Clean samples arrive with deterministic periodicity bounded by the cycle length L = 8 phases. This is a PROOF of the condition previously labeled "A1 (p_clean > 0)" — it is not an assumption about external traffic, it is a consequence of the controller design. No M/D/1 queue model or traffic utilization estimate is required.
@@ -1634,7 +1636,7 @@ This is an **upper bound** on cwnd, not a throughput determinant.  Pacing rate (
 
 $$pacing_i = bw_i \cdot pacing\_gain$$
 
-Because `bw_i` and `pacing\_gain` are identical in both modes, the **actual sending rates converge identically** regardless of how `model_rtt` is computed.
+Because `bw_i` and `pacing_gain` are identical in both modes, the **actual sending rates converge identically** regardless of how `model_rtt` is computed.
 
 ---
 
@@ -1682,11 +1684,11 @@ The only case where MIN mode deviates significantly is route-change scenarios, w
 
 *(a) Symmetric controller dynamics.*  Each flow i executes the same control law:
 
-$$\pacing_gain_i(t) = G(\phase_i(t)), \quad \phase_i \in \{0, \dots, 7\}$$
+$$\mathrm{pacing}_{\mathrm{gain}\,i}(t) = G(\mathrm{phase}_i(t)), \quad \mathrm{phase}_i \in \{0, \dots, 7\}$$
 
 with randomised initial phase offset.  The bandwidth estimate evolves as:
 
-$$bw_i^{(k+1)} = \max(bw_i^{(k)}, \deliver_rate_i^{(k)})$$
+$$bw_i^{(k+1)} = \max(bw_i^{(k)}, {deliver\_rate\_i}^{(k)})$$
 
 Both equations are symmetric (identical for all i).  No `model_rtt_i` appears in either, so both modes produce identical {bw_i}, {pacing_gain_i} trajectories given identical inputs.
 
@@ -3187,9 +3189,9 @@ R = R_base + max(0, jitter_ewma − clean_thresh) × R_base / kcc_jitter_r_scale
 R = min(R, R_base × kcc_kalman_r_max_boost)
 ```
 
-**Q-Boost path-change detection**: when `|innovation| > kcc_kalman_q_boost_thresh_val` (default ≈ 4 ms RTT shift) AND the filter has converged (`p_est ≤ kcc_kalman_converged_p_est_val`, default 500), `p_est` is reset to `kcc_kalman_p_est_init_val`, boosting Kalman gain toward 1.0 for rapid convergence.  A cooldown of `kcc_kalman_qboost_cdwn` (default 8) samples between successive qboost events prevents runaway triggering on lossy paths with high RTT jitter. Q-boost is additionally suppressed when pos_skip_cnt ≥ kcc_kalman_pos_skip_thresh (default 8), preventing TSO/GRO batch-induced innovation spikes from perpetually resetting the covariance.
+**Q-Boost path-change detection**: when `|innovation| > kcc_kalman_q_boost_thresh_val` (default ≈ 4 ms RTT shift) AND the filter has converged (`p_est < kcc_kalman_converged_val`, the endogenous threshold computed from `kcc_kalman_converged_k_ppm` per Lemma O.3), `p_est` is reset to `kcc_kalman_p_est_init_val`, boosting Kalman gain toward 1.0 for rapid convergence.  A cooldown of `kcc_kalman_qboost_cdwn` (default 8) samples between successive qboost events prevents runaway triggering on lossy paths with high RTT jitter. Q-boost is additionally suppressed when pos_skip_cnt ≥ kcc_kalman_pos_skip_thresh (default 8), preventing TSO/GRO batch-induced innovation spikes from perpetually resetting the covariance.
 
-**Outlier gating**: dynamic threshold $$dyn_thresh = max(outlier_ms × 1000 × scale, jitter_ewma × outlier_jitter_mult × scale)$$. Applied only when `p_pred ≤ kcc_kalman_converged_p_est_val`. After `kcc_kalman_max_consec_reject` (default 25) consecutive rejections, the next sample is force-accepted to prevent self-reinforcing lock-in.
+**Outlier gating**: dynamic threshold $$dyn_thresh = max(outlier_ms × 1000 × scale, jitter_ewma × outlier_jitter_mult × scale)$$. Applied only when `p_pred ≤ kcc_kalman_converged_val` (the endogenous convergence threshold per Lemma O.3). After `kcc_kalman_max_consec_reject` (default 25) consecutive rejections, the next sample is force-accepted to prevent self-reinforcing lock-in.
 
 **Covariance-matched noise estimation (BBR-S)**: $$q_est = (1−α) × q_est + α × (K × innov)²$$, $$r_est = (1−β) × r_est + β × max(0, innov² − p_pred)$$. Combination mode: mode 0 = nominal only, mode 1 = max (default), mode 2 = weighted blend.
 
@@ -3244,7 +3246,7 @@ $$
 effective = \max(probe\_gain - qdelay\_decay - jitter\_decay,\; BBR\_UNIT)
 $$
 
-Kalman confidence scaling: when `p_est > kcc_kalman_converged_p_est`, decay is proportionally reduced, avoiding excessive backoff when the filter is uncertain.
+Kalman confidence scaling: when `p_est > kcc_kalman_converged_val`, decay is proportionally reduced, avoiding excessive backoff when the filter is uncertain.
 
 ### ECN Backoff
 
@@ -3517,7 +3519,7 @@ Parameters are exposed under `/proc/sys/net/kcc/`. Writes trigger `kcc_init_modu
 | `kcc_kalman_q` | 100 | 0 | 100k | Base process noise Q |
 | `kcc_kalman_r` | 400 | 0 | 100k | Base measurement noise R |
 | `kcc_kalman_p_est_max` | 1,000,000 | 1 | 100M | p_est absolute max |
-| `kcc_kalman_converged_p_est` | 500 | 1 | 1M | Convergence threshold |
+| `kcc_kalman_converged_k_ppm` | 1 | 0 | 1M | Kalman gain threshold (PPM); K ≤ ppm/1e6 → converged; 0=block, 1M=always |
 | `kcc_kalman_p_est_init` | 1000 | 1 | 10M | Initial p_est |
 | `kcc_kalman_p_est_floor` | 10 | 1 | 100k | p_est floor |
 | `kcc_kalman_scale` | 1024 | 64 | 1,048,576 | Fixed-point scale (power of two) |
@@ -4197,7 +4199,7 @@ $$
 
 The Fisher Information Matrix has **rank 1** while the parameter space has **dimension 4**. The rank deficiency is 3 — three independent linear combinations of the four parameters cannot be estimated from any number of scalar observations.
 
-**Step 2 — Cramér-Rao Bound.** For any unbiased estimator \hat{θ} of the four-component vector:
+**Step 2 — Cramér-Rao Bound.** For any unbiased estimator $$\hat{θ}$$ of the four-component vector:
 
 $$
 Cov(\hat{θ}) ⪰ I⁻¹(θ)
