@@ -815,7 +815,7 @@
  *           Within 4 RTTs at 10Gbps, 100ms RTT:  dQ = 0.25×1.25×10⁹×0.4 = 125MB.
  *           MAX cumulative queue backlog drained per cycle = 0.25 × C × 4 × RTT.
  *
- *       (b) PROBE_RTT window:  Every N_PROBE_RTT_CYCLES, KCC enters a
+ *       (b) PROBE_RTT window:  Periodically (based on PROBE_RTT interval from
  *           200ms min_rtt window that forces pacing rate = 0.5 x BDP and
  *           cwnd = 4 segments.  This guarantees T_probe_rtt_dwell = 200ms
  *           of near-zero sending rate, during which any bottleneck queue
@@ -1160,7 +1160,9 @@
  *
  * The gate is the uniformly most powerful (UMP) test for the simple
  * one-sided hypothesis H_0: μ = 0 vs H_1: μ > 0 under Gaussian
- * innovations (Neyman-Pearson Lemma). Rejecting H_0 when ν_k > 0
+ * innovations with known variance (Neyman-Pearson Lemma). Under
+ * the composite case (unknown σ²), the one-sided t-test is UMP
+ * unbiased (Lehmann 1959, §3.5). Rejecting H_0 when ν_k > 0
  * (positive innovation ⇒ queue present) achieves:
  *   P(accept clean | H_0) = 1 − α/2  (for symmetric α-level test)
  *   P(reject tainted | H_1) → power(μ_q/σ)  (increases with SNR)
@@ -1895,11 +1897,12 @@
  *
  *       The log marginal likelihood for model M with singular FIM is:
  *         ln p(data | M_4) = ln ∫ L(θ | data)·π(θ) dθ
- *       Under the Laplace approximation:
- *         ln p(data | M_4) ≈ ln L(θ̂) + ln π(θ̂) + (k/2)·ln(2π) − (1/2)·ln|H|
- *       When |H| = 0 (singular Hessian = singular FIM), this approximation
- *       diverges to +∞ because ln(0) = −∞ subtracts to +∞ — the integral
- *       is improper and the Bayesian evidence for M_4 is undefined.
+   *       Under the Laplace approximation:
+   *         ln p(data | M_4) ≈ ln L(θ̂) + ln π(θ̂) + (k/2)·ln(2π) − (1/2)·ln|H|
+   *       When |H| = 0 (singular Hessian = singular FIM), the ln|H| term is
+   *       undefined (ln(0) diverges to −∞), making the Laplace approximation
+   *       ill-posed — the integral is improper and the Bayesian evidence for
+   *       M_4 cannot be computed via this route.
  *
  *     For the 3-component model, by contrast:
  *       det(H_3) = (N/R)·λ₁·(p_clean·N/R) > 0  (see determinant derivation
@@ -4692,12 +4695,12 @@
  *   | Proof A Corollary (Why 3 Not 2/4) | §Proof A Corollary | §Proof A Corollary | SVD rank + 2-comp underfits |
  *   | Proof B (T_noise Existence) | §Proof B | §Proof B | T_noise physically distinct + Chebyshev |
  *   | Proof C (Directional Update) | §Proof C | §Proof C | Censored gate separates T_prop from T_queue |
- *   | Lemma C.1 (Running-Minimum MLE) | §Lemma C.1 | §Lemma C.1 | Running min = MLE under one-sided noise eps≥0 |
- *   | Lemma C.2 (Censored Kalman Min-Var) | §Lemma C.2 | §Lemma C.2 | CKF = conditional min-variance under one-sided constraint |
+ *   | Lemma C.1 (Running-Minimum MLE) | §Lemma C.1 | — (see tcp_kcc.c) | Running min = MLE under one-sided noise eps≥0 |
+ *   | Lemma C.2 (Censored Kalman Min-Var) | §Lemma C.2 | — (see tcp_kcc.c) | CKF = conditional min-variance under one-sided constraint |
  *   | Proof C.1 (Censored Kalman) | §Proof C.1 | §Proof C.1 | Tobit-type formulation + a.s. convergence |
  *   | Proof C.2 (Switching KF + NP) | §Proof C.2 | §Proof C.2 | Two-mode SPRT drift detection |
  *   | Proof C.3 (Truncated KF Optimality) | §Proof C.3 | §Proof C.3 | min(0,·) conditional min-variance under (A1)-(A3) |
- *   | Proof C.4 (Std KF + Prior = Trunc) | §Proof C.4 | §Proof C.4 | Constrained Kalman w/ T_prop≥0 ⇒ truncated KF |
+ *   | Proof C.4 (Std KF + Prior = Trunc) | §Proof C.4 | §Proof C.4 | Constrained Kalman w/ ΔT_prop≤0 ⇒ truncated KF |
  *   | Proof D (T_noise Isolation) | §Proof D | §Proof D | Noise enters only attenuated path |
  *   | Proof E (FIM 4-comp Impossible) | §Proof E | §Proof E | det(I)=0; CRB infinite |
  *   | Proof E1 (Bayesian Cannot Salvage) | §Proof E1 | §Proof E1 | Lambda_post singular on T_prop vs T_queue |
@@ -4706,23 +4709,24 @@
  *   | Proof M (BBR Degeneracy) | §Proof M | §Proof M | BBR's 2-comp = degenerate KCC 3-comp; Blackwell dominance |
  *   | Proof K (Clean-Sample Starvation) | §Proof K | §Proof K | Fundamental lower bound on T_prop error |
  *   | Corollary K.1 (Starvation Condition) | §Cor K.1 | §Cor K.1 | If T_queue>ε for all samples, BDP inflated |
- *   | Theorem K.2 (Graceful Degradation) | §K.2 | §K.2 | KCC 3-mechanism composite bound |
+ *   | Theorem K.2 (Graceful Degradation) | §K.2 | — (see tcp_kcc.c §K.2) | KCC 3-mechanism composite bound |
  *   | AIC/BIC (Model Selection Vacuous) | §AIC/BIC | §AIC/BIC | 4-comp likelihood degenerate; selection undefined |
+ *   | Theorem C.1 (Conditional Convergence) | — (see tcp_kcc.c) | §C.1 | Convergence proven, not assumed |
  *   | Theorem 1 (Lyapunov GUAS) | — (see tcp_kcc.c) | — (see tcp_kcc.c) | Replaced: Lemmas O.1-O.3 + Q.1-Q.3 + C.1 → no circular premises |
  *   | Lemma Q.1 (DRAIN Monotonic) | §Lemma Q.1 | §Q.1 | dq/dt < 0 strictly ∀ DRAIN phases |
  *   | Theorem S.2 (Contraction) | §Thm S.2 | §S.2 | Rebuilt on ISS: no convergence premise |
  *   | Theorem 3 (Small-Gain) | §Thm 3 | §Thm 3 | ISS cascade: gamma_loop <= K_ss < 1 |
  *   | Theorem 4 (BIBO) | §Thm 4 | §Thm 4 | Bounded input -> bounded output |
- *   | Theorem 5 (ISS Cascade) | §Thm 5 | §Thm 5 | Full closed-loop GAS |
- *   | Corollary (N-flow Fairness) | §Cor | §Cor | Derived from ISS cycle-average: all flows -> C/N |
+ *   | Theorem 5 (ISS Cascade) | §Thm 5, §5.1-5.10 | §Thm 5, §5.1-5.10 | Full closed-loop GAS |
+ *   | Corollary (N-flow Fairness) | §Corollary | §Corollary | Derived from ISS cycle-average: all flows -> C/N |
  *   | Proof I (RTT Asymmetry) | §Proof I | §Proof I | Bounded-error analysis under asymmetry |
- *   | Proof G.1 (ACK-FSM Observer) | §G.1 | §G.1 | Discrete-time Lur'e + Tsypkin Criterion |
- *   | Proof J (Competition with CCAs) | §Proof J | §Proof J | BBR/CUBIC/Reno fairness analysis |
+ *   | Proof G.1 (ACK-FSM Observer) | §Proof G.1 | §Proof G.1 | Discrete-time Lur'e + Tsypkin Criterion |
+ *   | Proof J (Competition with CCAs) | §Proof J, §tcp_kcc.c | — (see tcp_kcc.c) | BBR/CUBIC/Reno fairness analysis |
  *   | B1-B16 (Boundary Conditions) | §B1-B16 | §B1-B16 | Exhaustive edge-case proofs |
- *   | B17-B28 (Deployment Boundaries) | §B17-B28 | §B17-B28 | Loss, AQM, policer, bufferbloat |
- *   | B29-B35 (Adversarial Cases) | §B29-B35 | §B29-B35 | Reordering, ACK comp, TSO, PIE, CAKE, ECN, PMTU |
- *   | B36-B43 (Competition/Network) | §B36-B43 | §B36-B43 | BBR, ICMP, NAT, cellular, DOCSIS, VPN, LRO, asymmetry |
- *   | B44-B51 (Host Stack + Physical Limit) | §B44-B51 | §B44-B51 | TS wrap, SACK renege, zwp, keepalive, TLP, RACK, PRR, clean-sample starvation |
+ *   | B17-B28 (Deployment Boundaries) | §B17-B28 | Extended Boundary Cases | Loss, AQM, policer, bufferbloat |
+ *   | B29-B35 (Adversarial Boundaries) | §B29-B35 | Extended Boundary Cases | Reordering, ACK comp, TSO, PIE, CAKE, ECN, PMTU |
+ *   | B36-B43 (Competition/Network) | §B36-B43 | Extended Boundary Cases | BBR, ICMP, NAT, cellular, DOCSIS, VPN, LRO, asymmetry |
+ *   | B44-B51 (Host Stack + Physical Limit) | §B44-B51 | Extended Boundary Cases | TS wrap, SACK renege, zwp, keepalive, TLP, RACK, PRR, clean-sample starvation |
  *   | Prop 1 (Positive Innovation Bias) | §Prop 1 | §Prop 1 | E[v_k]=mu_q>=0 violated |
  *   | Prop 2 (Conditional Optimality) | §Prop 2 | §Prop 2 | E[nu_k|nu_k<0]~0 restores conditional min-var |
  *   | Prop 3 (Drift Correction = SGD) | §Prop 3 | §Prop 3 | SGD with L(x)=1/2*(z-x)^2 |
@@ -4733,7 +4737,7 @@
  *   | Boundary Expansion Analysis | §BEA | §BEA | T_trans, observability, Bayesian |
  *   | Proof N (5-Scheme Rebuttal) | §Proof N | §Proof N | All 5 alternatives = special case or dominated |
  *   | Proof O (SIGCOMM'18 Boundary) | §Proof O | §Proof O | Delta_lo tightened by directional update |
- *   | Mathematical Guarantees Table | §MGT | §MGT | 19-row comprehensive proof status |
+ *   | Mathematical Guarantees Table | §MGT | §MGT | 32-row comprehensive proof status |
  *
  * BOUNDARY CONDITION PROOFS
  *
@@ -4925,9 +4929,9 @@
  *     Theorem 4's bounded-output guarantee.
  *
  *   B15. Counter saturation.
-     *     (a) sample_cnt: u32, saturated at U32_MAX (L12365: if
+      *     (a) sample_cnt: u32, saturated at U32_MAX (L12548: if
      *     sample_cnt < U32_MAX).  (b) pos_skip_cnt: u8, saturated at
-     *     KCC_POS_SKIP_SATURATION (L12099).  (c) consec_reject_cnt:
+      *     KCC_POS_SKIP_SATURATION (L12249).  (c) consec_reject_cnt:
  *     u32, saturated implicitly by comparison with max_consec_reject
  *     (25) — never reaches U32_MAX.  (d) rtt_cnt, cycle_idx, lt_rtt_cnt:
  *     all bounded by their bitfield widths or clamp guards.  No
@@ -4945,7 +4949,7 @@
  *     (complete outage): kcc_bw() returns 0 → pacing_rate = 0 →
  *     connection stalls.  Recovery when BW returns — no state
      *     corruption.  (d) BW → ∞ (infinite theoretical): bw_raw capped
-     *     at U64_MAX / USEC_PER_SEC before multiplication (L14310:
+      *     at U64_MAX / USEC_PER_SEC before multiplication (L14495:
      *     bw_raw > U64_MAX / USEC_PER_SEC → bw = U64_MAX).
  *     Why this matters: Ensures the physical bounds assumption (Theorem
  *     5-§2, network plant ISS) is not violated by pathological parameter
@@ -5911,7 +5915,7 @@ static inline u32 kcc_tcp_snd_cwnd(const struct tcp_sock* tp) { return READ_ONCE
   */
 #define KCC_MINRTT_FAST_FALL_DIV_MAX       (1 << 8) /* [T_prop] minrtt_fast_fall_div upper clamp (2^8, prevents div-by-zero) */
 #define KCC_PROBE_BAND_MULT_MAX            (1 << 5) /* [K] kalman_probe_band_mult upper clamp (2^5, prevents u32 overflow) */
-#define KCC_KALMAN_PPM_MAX                 1000000 /* [K] PPM full scale: 1,000,000 ppm = 1.0; used in clamp bound (L8593) and convergence denominator (L8841) */
+#define KCC_KALMAN_PPM_MAX                 1000000 /* [K] PPM full scale: 1,000,000 ppm = 1.0; used in clamp bound (L8601) and convergence denominator (L8848) */
 #define KCC_KALMAN_CONVERGED_MIN           1         /* [K] minimum converged_val; sentinel for permanently blocked convergence (K ≥ 1 or K below physical floor for current Q/R — p_est ≥ p_est_floor > converged_val, so p_est ≤ converged_val is always false) */
 #define KCC_KALMAN_Q_RTT_DIV_MAX           1000000 /* [K] kalman_q_rtt_div upper clamp (prevents div-by-zero) */
 #define KCC_RTT_DYN_MULT_MAX               100   /* [K] kalman_rtt_dyn_mult upper clamp (prevents u32 overflow) */
@@ -5969,9 +5973,9 @@ static inline u32 kcc_tcp_snd_cwnd(const struct tcp_sock* tp) { return READ_ONCE
   *   operations in the kernel datapath.
   * UNITS: dimensionless (bit shift count)
   * DERIVATION:
-  *   KCC_SRTT_SHIFT = 3:  The kernel stores srtt in units of 1/8 us
-  *     (TCP_RTT_SCALE = 8, log2(8) = 3).  Shifting right by 3 bits
-  *     converts kernel srtt to plain microseconds: srtt_us = srtt >> 3.
+   *   KCC_SRTT_SHIFT = 3:  The kernel's srtt_us field stores the
+   *     smoothed RTT with <<3 precision (1/8 µs resolution).  Shifting
+   *     right by 3 bits converts to plain microseconds: srtt_us >> 3.
   *   KCC_KALMAN_SCALE_2X_SHIFT = 1:  The Kalman filter uses scaled-integer
   *     arithmetic where measurements and states are multiplied by
   *     kcc_kalman_scale = 1024.  When computing innov^2 / S^2 in the
@@ -5979,10 +5983,10 @@ static inline u32 kcc_tcp_snd_cwnd(const struct tcp_sock* tp) { return READ_ONCE
   *     the implicit scale^2 factor.  The multi-by-2 shift rescales
   *     intermediate products to prevent 64-bit overflow while preserving
   *     the ratio's correctness.
-  * BOUNDS: SRTT_SHIFT = 3 (fixed by kernel ABI; TCP_RTT_SCALE is invariant).
+   * BOUNDS: SRTT_SHIFT = 3 (fixed by kernel ABI; srtt_us <<3 precision is invariant).
   *   SCALE_2X_SHIFT = 1 (must be 1 to cancel the 2x from squaring).
   */
-#define KCC_SRTT_SHIFT              3      /* [T_prop] ilog2(TCP_RTT_SCALE)=3; convert kernel srtt_us to microseconds */
+#define KCC_SRTT_SHIFT              3      /* [T_prop] ilog2(8)=3; srtt_us>>3 converts <<3 kernel srtt to microseconds */
   /*
    * PARAMETER DERIVATION: KCC_RTT_MIN_FLOOR_US
    *
@@ -6047,6 +6051,8 @@ static inline u32 kcc_tcp_snd_cwnd(const struct tcp_sock* tp) { return READ_ONCE
 #define KCC_DRIFT_EARLY_SUM_SHIFT     5      /* [T_noise] early drift amplitude threshold: drift_sum > min_rtt_scaled >> 5 (≈3.1% of path RTT); at 100ms RTT threshold=3.125ms; for +3ms monotonic drift: drift_sum threshold crosses at sample 2 (3+3=6 > 3.125ms), but pos_skip_cnt>=3 gate defers actual trigger to sample 3 */
 #define KCC_DRIFT_EARLY_CORR_SHIFT    2      /* [T_noise] early drift correction: abs_innov >> 2 = innovation/4 (25% per step, K-independent).  Derivation: at p_est=floor (p_pred=10+Q, Q≥100 → K ≈ 110/510 ≈ 0.216), Tier-1's corr/4 = K×innov/4 = 0.054×innov (5.4% per step) — slow even with the corrected K.  Innovation-based correction uses abs_innov/4 (25% per step), bypassing the K pre-scaling entirely: the innovation IS the path shift estimate.  /4 geometric convergence: after 5 corrections (15 RTTs at 3-sample cadence) ~76% converged (1−0.75⁵).  Tier-1: requires 16 consecutive skips per correction, ~74 RTTs at K≈0.216.  Speedup: ~5x. */
 #define KCC_DRIFT_EARLY_MIN_RTT        3      /* [T_noise] minimum consecutive positive samples (pos_skip_cnt) before early drift sum triggers; prevents single isolated noise spikes from resetting x_est; 3 = minimum for "persistent" evidence; must be < drift_thresh (16) */
+#define KCC_NEG_PERSIST_THRESH          3      /* [T_prop] consecutive negative innovations required to bypass outlier+floor gates; Neyman-Pearson: P(neg_skip_cnt >= N | H_0: stable T_prop) <= 2^(-N) = 0.125 at N=3; time-gating (rtt_us/2 inter-sample spacing) filters TSO burst clustering; see kcc_kalman_update() neg_skip_cnt management */
+#define KCC_NEG_SKIP_SATURATION       254      /* [T_prop] neg_skip_cnt saturation ceiling; u8(-1)=255, saturation at 254 provides 1-value wrap guard (same rationale as KCC_POS_SKIP_SATURATION) */
 #define KCC_FORCED_DROP_FLOOR_SHIFT     3      /* [T_prop] floor for one-step negative-innovation drops: reject z < x_est - (x_est >> 3) = x_est × 7/8 (i.e. single-step drop > 12.5% of current estimate).
  *
  * PHYSICAL DERIVATION ($\textit{proof by fiber speed-of-light}$):
@@ -6084,9 +6090,9 @@ static inline u32 kcc_tcp_snd_cwnd(const struct tcp_sock* tp) { return READ_ONCE
  *   TSO burst serialization (1500B at 10Gbps = 1.2µs; at 100Gbps = 0.12µs)
  *   is 2–4 orders of magnitude below the floor for all practical RTTs.
  *   At the smallest plausible RTT (10µs loopback), φ = 1.2µs/10µs = 12%,
- *   which JUST touches the floor — and loopback has no TSO burst artifacts.
- *   ACK-compression residual bias (coalescing delay ≤ O(µs)) is similarly
- *   negligible: at 10µs RTT, 1µs bias = 10%, still below 12.5% floor.
+   *   which approaches but stays below the floor — and loopback has no TSO burst artifacts.
+   *   ACK-compression residual bias (coalescing delay ≤ O(µs)) is likewise
+   *   negligible: at 10µs RTT, 1µs bias = 10%, still below 12.5% floor.
  *
  *   Single-packet reordering delta is bounded by inter-packet gap ≤
  *   jitter_ewma (typically < 5ms on WAN paths).  At 50ms: 5ms/50ms = 10%
@@ -6363,6 +6369,8 @@ struct kcc_ext {
     u8  qboost_cdwn;                                 /* [K] cooldown counter: min accepted samples between qboost events; prevents runaway resets */
 
     u8  pos_skip_cnt;                                /* [T_noise] consecutive directional skips; gates Q-boost; triggers baseline-drift forced update */
+    u8  neg_skip_cnt;                                /* [T_prop] consecutive negative innov; gates outlier+floor bypass when >= KCC_NEG_PERSIST_THRESH (persistent decrease = genuine path change; isolated single/double = ACK compression / TSO noise); reset to 0 on any ν ≥ 0 (confirming or positive) */
+    u32 last_neg_mstamp;                             /* [T_prop] tp->tcp_mstamp of last ν < 0 (~1µs units); time-gated persistence: increment blocked when consecutive negatives arrive within < max(1µs, rtt_us/2) of each other */
     u32 drift_sum;                                   /* [T_noise] running sum of positive innovation magnitudes (kalman_scale units); accumulates per-sample drift amplitude; reset to 0 on any non-positive innovation or accepted update; triggers early drift correction when sum > min_rtt_scaled/32 AND pos_skip_cnt >= KCC_DRIFT_EARLY_MIN_RTT (3); for +3ms drift: sum crosses threshold at sample 2, pos_skip_cnt gate defers fire to sample 3 */
     u8  alone_exit_cnt;                              /* [T_noise] consecutive alone_eval failures; exit hysteresis for multi-flow resonance resistance */
 
@@ -6520,7 +6528,7 @@ module_param_cb(kcc_probe_rtt_dyn_max_sec, &kcc_param_ops, &kcc_probe_rtt_dyn_ma
  *   Ensures pacing_win = cwnd_gain * pacing_rate covers BDP + max expected
  *   queue depth from probe-adapt transients.
  * BOUNDS: num [0, 100000], den [1, 100000]; net multiplier clamped at KCC_GAIN_MAX;
- *   floored at KCC_GAIN_FLOOR in kcc_cwnd_gain_val cache (L8797).
+ *   floored at KCC_GAIN_FLOOR in kcc_cwnd_gain_val cache (L8805).
  */
 static int kcc_cwnd_gain_num = 2;                     /* [T_queue] CWND gain numerator for PROBE_BW; 2x BDP default; num/den*BBR_UNIT */
 module_param_cb(kcc_cwnd_gain_num, &kcc_param_ops, &kcc_cwnd_gain_num, 0644); /* [T_queue] sysctl: kcc_cwnd_gain_num */
@@ -6986,7 +6994,7 @@ module_param_cb(kcc_kf_steady_mode, &kcc_param_ops, &kcc_kf_steady_mode, 0644); 
  * PHYSICS: Maximum physical RTT sample accepted by the Kalman filter; values above this are discarded.
  * UNITS: Microseconds (µs); compared directly against raw RTT measurement from TCP timestamp.
  * DERIVATION: ceiled from (U32_MAX / kalman_scale) / 2 ≈ 2,100,000 µs; lowered to 500 ms to reject route-flap spikes while allowing satellite paths (600 ms via kcc_kalman_rtt_dyn_mult = 2 → 1.2s); §Module Parameters.
- * BOUNDS: [1, 10000000] = [1 µs, 10 s]; clamped at init (L8606).
+ * BOUNDS: [1, 10000000] = [1 µs, 10 s]; clamped at init (L8614).
  * [T_noise] kcc_rtt_sample_max_us -- RTT samples exceeding this value are discarded
  * by the Kalman filter to prevent extreme outliers from distorting x_est.
  * Default 500,000 us = 500 ms.
@@ -7527,7 +7535,7 @@ module_param_cb(kcc_alone_exit_thresh, &kcc_param_ops, &kcc_alone_exit_thresh, 0
  * PHYSICS: Fixed-point scaling factor converting physical RTT (µs) to filter-internal integer units.
  * UNITS: Dimensionless multiplier; x_est ∈ [scale, U32_MAX] in scaled units.
  * DERIVATION: power-of-two for efficient bit-shift; 10 bits = ~0.1% fractional precision; scale² > max(Q,R,P) = 1,048,576 > 1,000,000 prevents overflow in innov²/scale² division (§Parameter Derivation Proofs).
- * BOUNDS: [64, 1048576] = [2^6, 2^20]; clamped and rounded to power-of-two at init (L8653).
+ * BOUNDS: [64, 1048576] = [2^6, 2^20]; clamped and rounded to power-of-two at init (L8661).
  */
 static int kcc_kalman_scale = 1024;                       /* [K] Kalman fixed-point scaling factor (power-of-two); x_est = rtt_us * scale in fixed point; rounded up to power-of-two for fast division via shift; KCC-only; range [64, 1048576], BBR default: N/A */
 module_param_cb(kcc_kalman_scale, &kcc_param_ops, &kcc_kalman_scale, 0644); /* [K] sysctl: kcc_kalman_scale */
@@ -8655,7 +8663,7 @@ static void kcc_init_module_params(void)                          /* clamp all p
     /* Enforce: scale^2 > p_est_max (prevents overflow in innov^2/scale^2 division).
      * Without this cross-validation, an operator could independently set
      * p_est_max > scale^2, violating the arithmetic invariant documented at
-     * L7529 (scale² > max(Q,R,P) prevents overflow in innov²/scale² division) and creating a latent u64 overflow risk. */
+     * L7537 (scale² > max(Q,R,P) prevents overflow in innov²/scale² division) and creating a latent u64 overflow risk. */
     kcc_kalman_p_est_max = min_t(int, kcc_kalman_p_est_max,
         (int)(((u64)kcc_kalman_scale * (u64)kcc_kalman_scale) - 1));
 
@@ -8838,7 +8846,7 @@ static void kcc_init_module_params(void)                          /* clamp all p
         }
         else {
             u64 p_pred_raw = div_u64((u64)kcc_kalman_converged_k_ppm * (u64)kcc_kalman_r_val,
-                                     (u64)KCC_KALMAN_PPM_MAX - (u64)kcc_kalman_converged_k_ppm);
+                (u64)KCC_KALMAN_PPM_MAX - (u64)kcc_kalman_converged_k_ppm);
             s64 diff = (s64)p_pred_raw - (s64)kcc_kalman_q_val;
             /* diff ≤ 0: K_th below minimum achievable gain for current Q/R;
              * KCC_KALMAN_CONVERGED_MIN makes convergence permanently blocked, since
@@ -11767,6 +11775,82 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
         bool qboost_fired = false;                                                                                                  /* Q-boost flag: skip outlier gate */
         bool saturation_fired = false;                                                                                               /* [K] p_est-saturation flag: skip drift tiers and force p_est init */
 
+        /*
+         * [T_prop] Negative-innovation persistence counter.
+         *
+         * Incremented for ν < 0 only when sufficient wall-clock time has
+         * elapsed since the previous negative innovation.  Reset to 0
+         * for every ν ≥ 0 (confirming or positive).
+         *
+         * WHY TIME-GATING IS THE CORRECT DISCRIMINATOR:
+         *
+         *   A TSO/GSO burst produces clustered fake-low RTT samples that
+         *   arrive within microseconds of each other (compressed ACK
+         *   timing).  A genuine propagation-delay decrease produces ν < 0
+         *   samples spaced at approximately one RTT interval (the ACK
+         *   clock is unchanged by routing).
+         *
+         *   Inter-sample time is an orthogonal, physically-causal signal:
+         *   T_prop changes do not compress the ACK stream; TSO/GSO bursts
+         *   do.  The threshold max(1µs, rtt_us/2) — measured via
+         *   tp->tcp_mstamp (~1µs resolution) — ensures that burst samples
+         *   (microseconds apart) cannot accumulate the persistence counter,
+         *   while genuine path-change samples (≥ 1 RTT apart, >> threshold)
+         *   accumulate normally.
+         *
+         *   This discriminator is:
+         *     — Path-independent (works on DC 100µs and GEO 600ms)
+         *     — Stateless between events (only last_neg_mstamp stored)
+         *     — Immune to aggregation-state misclassification
+         *     — Physically grounded (speed-of-light and queuing theory)
+         *
+         * P(3 consecutive TSO burst ν < 0 all spaced ≥ 1 RTT | H_0):
+         *   ≈ 0  (TSO bursts collapse inter-sample time by definition)
+         *
+         * P(3 consecutive genuine ν < 0 all spaced ≥ 1 RTT | H_1):
+         *   ≈ 1  (ACK clock period ≈ RTT, independent of T_prop value)
+         */
+        if (innovation < 0) {
+            struct tcp_sock* tp = tcp_sk(sk);
+            u32 now = tp->tcp_mstamp;  /* ~1µs units */
+            /*
+             * Threshold: half the current RTT sample, floored at 1.
+             *
+             * Using rtt_us (the current measurement) rather than
+             * min_rtt_us (a slow-decaying windowed minimum) ensures
+             * the threshold tracks the path immediately after a
+             * dramatic decrease (e.g. 600ms→50ms).  min_rtt_us
+             * would lag by multiple RTTs, blocking neg_skip_cnt
+             * and stalling convergence.
+             *
+             * TSO burst samples have fake-low rtt_us (e.g. 49ms
+             * when true RTT is 100ms).  The threshold (≈25ms) is
+             * still >> the inter-sample spacing during a burst
+             * (≈ microseconds), so burst samples remain blocked.
+             *
+             * For legitimate path changes on any RTT (DC 100µs to
+             * GEO 600ms), rtt_us reflects the actual path delay
+             * and the threshold is appropriate for the new ACK
+             * clock spacing.
+             */
+            u32 threshold = rtt_us >> 1;
+            bool enough_time_elapsed;
+            threshold = max_t(u32, threshold, 1U);
+
+            enough_time_elapsed = (ext->last_neg_mstamp == 0) ||
+                ((u32)(now - ext->last_neg_mstamp) >= threshold);
+
+            if (enough_time_elapsed) {
+                ext->neg_skip_cnt = (ext->neg_skip_cnt < KCC_NEG_SKIP_SATURATION) ?
+                    ext->neg_skip_cnt + 1 : KCC_NEG_SKIP_SATURATION;
+            }
+            ext->last_neg_mstamp = now;
+        }
+        else {
+            ext->neg_skip_cnt = 0;
+            ext->last_neg_mstamp = 0;
+        }
+
         /* THREE-COMPONENT MODEL: Q-Boost (T_prop path-change detection).
          *
          *   RTT_obs = T_prop + T_queue + T_noise
@@ -11863,53 +11947,93 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
                 dyn_thresh = jitter_thresh;                                                                                                  /* use jitter-based threshold */
             }
 
-            if (unlikely(!qboost_fired && abs_innov > dyn_thresh && ext->p_est <= kcc_kalman_converged_val)) {
-                /* [T_noise] Force-accept guard: prevent self-reinforcing lockout ---- */
+            if (unlikely(!qboost_fired && abs_innov > dyn_thresh)) {
+                bool outlier_reject;
+
                 /*
-                 * If too many consecutive rejections have occurred, bypass the gate.
-                 * Without this, a self-reinforcing cycle can lock in: high
-                 * jitter raises the dynamic threshold, causing more rejections,
-                 * which raise jitter further (jitter is updated even on rejection).
-                 * After kcc_kalman_max_consec_reject_val consecutive rejections,
-                 * the gate is bypassed and the sample enters the filter.
+                 * [T_prop] Outlier gate policy by innovation direction:
+                 *
+                 *   ν < 0 (measurement below estimate):
+                 *     Reject if the negative trend is NOT persistent
+                 *     (neg_skip_cnt < KCC_NEG_PERSIST_THRESH).  Three consecutive
+                 *     negatives with |ν| > jitter_threshold are strong
+                 *     evidence of a real path change — bypass the
+                 *     outlier gate so the sample reaches the floor gate,
+                 *     which independently checks percentage magnitude.
+                 *
+                 *     An isolated negative spike (neg_skip_cnt = 1)
+                 *     or a transient double-spike (neg_skip_cnt = 2),
+                 *     caused by TSO/GSO ACK compression, is rejected here;
+                 *     the next confirming measurement (ν ≥ 0) resets
+                 *     neg_skip_cnt to 0, preventing accumulation.
+                 *
+                 *   ν ≥ 0 (measurement at or above estimate):
+                 *     Reject only when the Kalman filter is confident
+                 *     (p_est ≤ converged_val).  When uncertain (p_est >
+                 *     converged_val), large positive innovations may
+                 *     indicate a genuine path degradation that the
+                 *     directional gate or Q-boost should handle.
+                 *
+                 *   The persistent-negative bypass (innovation < 0 &&
+                 *   neg_skip_cnt >= KCC_NEG_PERSIST_THRESH) does NOT depend
+                 *   on p_est — it relies solely on the Neyman-Pearson
+                 *   persistence test.
                  */
-                u32 raw_jitter;                                                                                          /* jitter in us (C90: decl before stmt) */
-                if (ext->consec_reject_cnt < (u32)kcc_kalman_max_consec_reject_val) {
-                    ext->consec_reject_cnt++;
-                    /* Reject outlier: do not update x_est or p_est.
-                     * Update jitter for threshold dynamics but skip state update. */
-                    raw_jitter = (u32)min_t(u64, abs_innov >> kcc_kalman_scale_shift_val, U32_MAX);           /* |innov| back to us */
-                    ext->jitter_ewma = ext->jitter_ewma ?                                                         /* if existing EWMA */
-                        ((u64)ext->jitter_ewma * kcc_ewma_jitter_num_val +                                  /* old * num + */
-                            raw_jitter * KCC_EWMA_NEW_WEIGHT) / kcc_ewma_jitter_den_val :                                      /* new * 1 / den */
-                        raw_jitter;                                                                                    /* first sample: use raw */
-                    /* [T_noise] Jitter cap: prevent pathological blowup from frozen filter state.
-                     * When x_est is frozen (p_est saturated, all innovations positive), the
-                     * innovation magnitude can be enormous, inflating jitter_ewma without bound.
-                     * By the three-component model, T_noise <= max(RTT_obs, min_rtt_us).  Capping
-                     * jitter_ewma at max(min_rtt_us, rtt_sample_max_us) enforces this physical bound
-                     * and prevents the self-reinforcing cycle: high jitter -> higher outlier threshold
-                     * -> more rejections -> even higher jitter. */
-                    ext->jitter_ewma = min_t(u32, ext->jitter_ewma,
-                        max_t(u32, kcc->min_rtt_us, kcc_rtt_sample_max_us_val));
-                    /* [K] Prediction-only step: grow uncertainty (p_est = p_pred)
-                     * because time elapsed without a valid measurement.  Without this,
-                     * consecutive rejections freeze p_est, locking Kalman gain and
-                     * preventing the filter from ever adapting its confidence.  The
-                     * force-accept guard (max_consec_reject) still provides a safety
-                     * valve against permanent lockout. */
-                    ext->p_est = p_pred;                                                         /* [K] grow uncertainty on rejected samples */
-                    return;                                                                                            /* rejection: no further processing */
+                if (innovation < 0) {
+                    outlier_reject = (ext->neg_skip_cnt < KCC_NEG_PERSIST_THRESH);
+                }
+                else {
+                    outlier_reject = (ext->p_est <= kcc_kalman_converged_val);
                 }
 
-                /* [T_noise] Fall through: force-accept after max consecutive rejections.
-                 * Jitter EWMA will be updated by the normal Kalman post-update
-                 * path below; this prevents the stale outlier-jitter feedback. */
-            }
+                if (outlier_reject) {
+                    /* [T_noise] Force-accept guard: prevent self-reinforcing lockout ---- */
+                    /*
+                     * If too many consecutive rejections have occurred, bypass the gate.
+                     * Without this, a self-reinforcing cycle can lock in: high
+                     * jitter raises the dynamic threshold, causing more rejections,
+                     * which raise jitter further (jitter is updated even on rejection).
+                     * After kcc_kalman_max_consec_reject_val consecutive rejections,
+                     * the gate is bypassed and the sample enters the filter.
+                     */
+                    u32 raw_jitter;                                                                                          /* jitter in us (C90: decl before stmt) */
+                    if (ext->consec_reject_cnt < (u32)kcc_kalman_max_consec_reject_val) {
+                        ext->consec_reject_cnt++;
+                        /* Reject outlier: do not update x_est or p_est.
+                         * Update jitter for threshold dynamics but skip state update. */
+                        raw_jitter = (u32)min_t(u64, abs_innov >> kcc_kalman_scale_shift_val, U32_MAX);           /* |innov| back to us */
+                        ext->jitter_ewma = ext->jitter_ewma ?                                                         /* if existing EWMA */
+                            ((u64)ext->jitter_ewma * kcc_ewma_jitter_num_val +                                  /* old * num + */
+                                raw_jitter * KCC_EWMA_NEW_WEIGHT) / kcc_ewma_jitter_den_val :                                      /* new * 1 / den */
+                            raw_jitter;                                                                                    /* first sample: use raw */
+                        /* [T_noise] Jitter cap: prevent pathological blowup from frozen filter state.
+                         * When x_est is frozen (p_est saturated, all innovations positive), the
+                         * innovation magnitude can be enormous, inflating jitter_ewma without bound.
+                         * By the three-component model, T_noise <= max(RTT_obs, min_rtt_us).  Capping
+                         * jitter_ewma at max(min_rtt_us, rtt_sample_max_us) enforces this physical bound
+                         * and prevents the self-reinforcing cycle: high jitter -> higher outlier threshold
+                         * -> more rejections -> even higher jitter. */
+                        ext->jitter_ewma = min_t(u32, ext->jitter_ewma,
+                            max_t(u32, kcc->min_rtt_us, kcc_rtt_sample_max_us_val));
+                        /* [K] Prediction-only step: grow uncertainty (p_est = p_pred)
+                         * because time elapsed without a valid measurement.  Without this,
+                         * consecutive rejections freeze p_est, locking Kalman gain and
+                         * preventing the filter from ever adapting its confidence.  The
+                         * force-accept guard (max_consec_reject) still provides a safety
+                         * valve against permanent lockout. */
+                        ext->p_est = p_pred;                                                         /* [K] grow uncertainty on rejected samples */
+                        return;                                                                                            /* rejection: no further processing */
+                    }
 
-            /* [K] reset consecutive rejection counter on accepted sample */
-            if (ext->consec_reject_cnt) {
-                ext->consec_reject_cnt = 0;
+                    /* [T_noise] Fall through: force-accept after max consecutive rejections.
+                     * Jitter EWMA will be updated by the normal Kalman post-update
+                     * path below; this prevents the stale outlier-jitter feedback. */
+                }
+
+                /* [K] reset consecutive rejection counter on accepted sample */
+                if (ext->consec_reject_cnt) {
+                    ext->consec_reject_cnt = 0;
+                }
             }
         }
 
@@ -11969,21 +12093,18 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
           *     Layer 2 — Directional gate: ν > 0 ∧ ¬Q-boost ⇒ drift detection
           *       (may apply dampened partial update).  Rejects queue noise.
           *       See three-tier drift detector below for corr/4, corr/8 paths.
-         *     Layer 3 — Physical floor: z < x_est − x_est/8 ⇒ reject (converged only).
-         *       ν < 0 passes Layers 1–2, but single-step |Δ| > 12.5% violates
-         *       fiber speed-of-light constraint (KCC_FORCED_DROP_FLOOR_SHIFT proof:
-         *       for 50ms path, 12.5%=6.25ms requires 625km endpoint movement in 50ms,
-         *       which is physically impossible).  Engaged only when p_est ≤ converged_val
-         *       (Kalman is confident), allowing the learning phase to accept ALL
-         *       negatives unconditionally to escape inflated initial noise.
-         *
-         *   [K] LEARNING-PHASE ESCAPE:
-         *     When p_est > kcc_kalman_converged_val (filter still converging, high
-         *     uncertainty), ALL negative innovations are accepted without floor.
-         *     This is essential: at cold start, x_est may be inflated by initial RTT
-         *     noise (e.g., 300ms on a true 50ms path).  The floor would permanently
-         *     block convergence if activated before x_est is near the truth.
-         *     Once p_est drops below converged → Kalman is confident → floor ON.
+         *     Layer 3 — Physical floor: z < x_est − x_est/8 ⇒ reject (neg_skip_cnt-gated).
+         *       ν < 0 passes Layer 1 (outlier gate via neg_skip_cnt >= 3), but
+         *       single-step |Δ| > 12.5% violates fiber speed-of-light constraint
+         *       (KCC_FORCED_DROP_FLOOR_SHIFT proof: for 50ms path, 12.5%=6.25ms
+         *       requires 625km endpoint movement in 50ms, which is physically
+         *       impossible).  The floor gate is gated by neg_skip_cnt only, not by
+         *       p_est — during the learning phase, the outlier gate's ν ≥ 0 policy
+         *       (accept when p_est > converged_val) ensures positive innovations
+         *       converge x_est downward, while ν < 0 samples require 3 consecutive
+         *       negatives (neg_skip_cnt >= KCC_NEG_PERSIST_THRESH) to bypass both
+         *       layers, providing ~3-RTT convergence from any initial estimate
+         *       (e.g., 300ms → 50ms in three ACK-clock-spaced samples).
          *
          *   [K] Q-BOOST (path-change upward tracking):
          *     For ν > 0 after p_est-reset trigger (detecting path degradation), the
@@ -12037,27 +12158,56 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
             }
             else if (innovation <= 0) {
                 /* [T_prop] Innovation ≤ 0: measurement at or below current estimate.
+                 *
                  *   ν < 0 (clean sample): forced x_est = z — negative innovation
                  *     on an outlier-gated sample carries direct T_prop evidence.
                  *   ν = 0 (neutral): z = x_est → no-op write, but x_updated=true
                  *     resets pos_skip_cnt/drift_sum (neutral sample = no queue
                  *     evidence, counters should not accumulate).
-                 * Speed-of-light floor (ν < 0 only): reject z < x_est - x_est/8
-                 * (KCC_FORCED_DROP_FLOOR_SHIFT).  Floor is engaged ONLY when
-                 * Kalman is converged (p_est <= kcc_kalman_converged_val); the
-                 * first disjunct (p_est > converged_val) short-circuits,
-                 * accepting ALL negatives during learning when p_est is high
-                 * (x_est may be inflated by initial noise, e.g., 300ms on
-                 * 50ms path). */
-                 if (ext->p_est > kcc_kalman_converged_val || z >= ext->x_est - (ext->x_est >> KCC_FORCED_DROP_FLOOR_SHIFT)) {  /* [T_prop] learning(p_est>val)→no check; converged(p_est<=val)→floor check; equality belongs to "converged" to match outlier/Q-boost gates */
-                    ext->x_est = (u32)min_t(u64, z, U32_MAX);            /* [T_prop] direct measurement assignment (no-op when z=x_est), clamp u64→u32 */
-                    x_updated = true;                                      /* [K] state modified, gates covariance reduction and counter reset */
+                 *
+                 * [T_prop] PHYSICAL FLOOR GATE (ν < 0 only):
+                 *
+                 *   Rejects z < x_est - x_est/8 (KCC_FORCED_DROP_FLOOR_SHIFT),
+                 *   i.e., one-step drops exceeding 12.5% of the current estimate,
+                 *   on physical speed-of-light grounds (the endpoints cannot
+                 *   accelerate to >c/24 within a single RTT).
+                 *
+                 *   Single bypass: neg_skip_cnt >= KCC_NEG_PERSIST_THRESH —
+                 *   below-floor negative innovations constitute sufficient
+                 *   persistence evidence that the propagation baseline has
+                 *   genuinely shifted (BGP reroute, fibre path change),
+                 *   rather than being a measurement artifact (TSO/GSO ACK
+                 *   compression, NIC coalescing).
+                 *
+                 *   ν = 0 is always accepted (z = x_est, floor trivially
+                 *   satisfied); this is the confirming-measurement path
+                 *   that shrinks p_est via standard Kalman covariance
+                 *   reduction.
+                 *
+                 *   Small negative innovations (z ≥ floor, within 12.5%)
+                 *   are accepted unconditionally — they are within the
+                 *   physical bounds of endpoint motion.
+                 */
+                {
+                    u64 floor = ext->x_est - (ext->x_est >> KCC_FORCED_DROP_FLOOR_SHIFT);
+
+                    if (ext->neg_skip_cnt >= KCC_NEG_PERSIST_THRESH || z >= floor) {
+                        ext->x_est = (u32)min_t(u64, z, U32_MAX);
+                        x_updated = true;
+                    }
                 }
             }
             else {
                 /* [T_prop] Innovation > 0 without Q-boost: queue noise or baseline drift.
                  *
                  * [T_prop] Baseline drift detection (KCC-specific):
+                 *
+                 * Any positive innovation terminates a negative trend; reset the
+                 * below-floor persistence counter so the next isolated negative
+                 * spike cannot piggyback on a stale counter. */
+                ext->neg_skip_cnt = 0;
+
+                /*
                  *   On wireless links, the physical RTT baseline can permanently
                  *   shift upward.  Positive innovations are normally skipped as
                  *   "queue noise", which can lock x_est on a stale baseline.
@@ -12094,8 +12244,8 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
                     ext->drift_sum = (U32_MAX - ext->drift_sum > am)
                         ? ext->drift_sum + am : U32_MAX;                 /* [T_noise] accumulate positive innovation amplitude for early drift detection */
                 }
-                 /* [T_prop] Saturating increment: prevent u8 255->0 wrap that would
-                  * create a false Q-boost window every 256 samples. */
+                /* [T_prop] Saturating increment: prevent u8 255->0 wrap that would
+                 * create a false Q-boost window every 256 samples. */
                 ext->pos_skip_cnt = (ext->pos_skip_cnt < KCC_POS_SKIP_SATURATION) ? ext->pos_skip_cnt + 1 : KCC_POS_SKIP_SATURATION;
 
                 /* [K] p_est-saturation response: detect filter lock-in from permanent queue.
@@ -12239,6 +12389,7 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
 
             if (x_updated) {
                 ext->pos_skip_cnt = 0;                          /* [T_noise] reset directional skip counter after accepted update */
+                ext->neg_skip_cnt = 0;                          /* [T_prop] reset negative persistence counter after accepted update */
                 ext->drift_sum = 0;                             /* [T_noise] reset drift amplitude accumulator after accepted update */
             }
         } /* [K] K*innov->x_est; dir.gate pos=[T_noise] skip -- [T_prop] drift Tier 1/2 */
@@ -12290,14 +12441,46 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
         {
             if (x_updated) {
                 if (!qboost_fired && innovation <= 0) {
-                    /* [K] Forced convergence: K_eff = 1, Joseph-form P_post = max(R, floor).
-                     * The state was set directly to z (full-innovation step).
-                     * The standard (1-K_opt)×p_pred formula is invalid because
-                     * K_eff = 1 ≠ K_opt.  Post-jump uncertainty is floored at
-                     * p_est_floor: P_post = max(R, p_est_floor) — prevents
-                     * over-convergence when R ≪ floor (e.g., R=0 on clean paths). */
-                    ext->p_est = max_t(u32, r, kcc_kalman_p_est_floor_val); /* [K] K_eff=1 → P_post = max(R, p_est_floor) */
-                } else {
+                    /*
+                     * [K] Negative/zero innovation covariance policy:
+                     *
+                     *   ν < 0 (genuine negative step):
+                     *     x_est = z is a full-innovation step (K_eff = 1).
+                     *     The standard (1-K_opt)×p_pred formula would give
+                     *     P_post = (1-K_opt)×p_pred ≈ (1-0.39)×p_pred for
+                     *     K_eff = 1, which is mathematically inconsistent.
+                     *     Joseph form P_post = (1-K_eff)×P_pred×(1-K_eff) +
+                     *     K_eff×R×K_eff → P_post = R (when K_eff = 1),
+                     *     floored at p_est_floor.  This high post-jump
+                     *     uncertainty correctly arms the gate for any
+                     *     subsequent real step decreases.
+                     *
+                     *   ν = 0 (confirming measurement):
+                     *     x_est = z is a no-op (K_eff ≈ 0).  Joseph form
+                     *     would incorrectly blow up p_est to max(R, floor).
+                     *     Instead, use standard Kalman covariance reduction
+                     *     (L96) — the confirming measurement REDUCES
+                     *     uncertainty, allowing p_est to converge back below
+                     *     the gate threshold and re-arm the outlier/physical-
+                     *     floor defenses against future noise spikes.
+                     *
+                     * The boundary (ν = 0 vs ν < 0) is exact because
+                     * innovation was computed before x_est was overwritten;
+                     * innovation < 0 iff the pre-update measurement was
+                     * strictly below the pre-update estimate.
+                     */
+                    if (innovation < 0) {
+                        /* [K] ν < 0: genuine step decrease, Joseph form */
+                        ext->p_est = max_t(u32, r, kcc_kalman_p_est_floor_val);
+                    }
+                    else {
+                        /* [K] ν = 0: confirming measurement, standard Kalman */
+                        u64 p_reduction = div_u64((u64)p_pred * gain_num, gain_den);
+                        u64 p_new = (u64)p_pred - p_reduction;
+                        ext->p_est = max_t(u32, (u32)p_new, kcc_kalman_p_est_floor_val);
+                    }
+                }
+                else {
                     u64 p_reduction;                                            /* [K] amount to subtract from predicted covariance */
                     u64 p_new;                                                  /* [K] new covariance estimate = p_pred - p_reduction */
                     p_reduction = div_u64((u64)p_pred * gain_num, gain_den);    /* [K] covariance reduction = p_pred * K = p_pred^2 / (p_pred + R) */
@@ -12629,7 +12812,7 @@ static void kcc_update_min_rtt(struct sock* sk, const struct rate_sample* rs,   
                     kcc->min_rtt_fast_fall_cnt = 0;                                                                      /* reset counter */
                 }
                 else {
-                     /* Partial decrease at round-start boundaries only, to limit rate of reduction */
+                    /* Partial decrease at round-start boundaries only, to limit rate of reduction */
                     if (kcc->round_start) {
                         kcc->min_rtt_us = max_t(u32, KCC_RTT_MIN_FLOOR_US,
                             (u64)kcc->min_rtt_us *
@@ -14220,6 +14403,8 @@ KCC_KFUNC void kcc_init(struct sock* sk)                               /* per-co
         ext->sample_cnt = 0;                                              /* initialise Kalman sample counter to zero [K] */
         ext->consec_reject_cnt = 0;                                      /* initialise consecutive outlier rejection counter to zero [T_noise][K] */
         ext->pos_skip_cnt = 0;                                           /* initialise positive-direction skip counter to zero [K] */
+        ext->neg_skip_cnt = 0;                                           /* initialise negative-persistence counter to zero [T_prop] */
+        ext->last_neg_mstamp = 0;                                       /* initialise last-negative timestamp to zero (unset) [T_prop] */
         ext->drift_sum = 0;                                            /* initialise drift amplitude sum to zero [T_noise] */
         ext->alone_exit_cnt = 0;                                         /* initialise alone-mode exit failure counter to zero */
         ext->dyn_probe_rtt_interval_jiffies = 0;                         /* initialise dynamic PROBE_RTT interval to zero (disabled until Kalman converges) [K] */
