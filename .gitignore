@@ -10,3 +10,6 @@ Module.symvers
 modules.order
 .*.cmd
 *.d
+
+# Internal research (not for public submission)
+.research/

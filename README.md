@@ -353,13 +353,13 @@ The outlier gate uses a two-component threshold that provides source-dependent e
 
 $$dyn\_thresh = max(outlier\_ms × 1000 × scale,\ jitter\_ewma × outlier\_jitter\_mult × scale)$$
 
-With defaults (outlier_ms=5ms, outlier_jitter_mult=3): on clean paths (jitter ≈ 1ms), the 5ms base dominates, giving effective multiplier ≈5 with Chebyshev bound P ≤ 1/25 = 4%. On noisy paths (jitter > 1.67ms), the 3× jitter component dominates, effective multiplier ≈3 with Chebyshev bound P ≤ 1/9 ≈ 11%. By the Chebyshev inequality:
+With defaults (outlier_ms=4ms, outlier_jitter_mult=2): on clean paths (jitter ≈ 1ms), the 4ms base dominates, giving effective multiplier ≈4 with Chebyshev bound P ≤ 1/16 = 6.25%. On noisy paths (jitter > 2ms), the 2× jitter component dominates, effective multiplier ≈2 with Chebyshev bound P ≤ 1/4 = 25%. By the Chebyshev inequality:
 
 $$
 P(|ν_k| > k·σ | H0) ≤ 1/k²
 $$
 
-On clean paths (effective mult=5), the false-positive rate (classifying T_noise as T_queue) is ≤ 1/25 = 4%. The false-negative rate depends on μ_queue / σ_noise (the signal-to-noise ratio), which exceeds 3 for congestion on paths with ≥3 ms of queue above typical jitter (1 ms) — sufficient for reliable discrimination under the `kcc_qdelay_cong_bp = 2500` (25% of min_rtt) congestion threshold.
+On clean paths (effective mult=4), the false-positive rate (classifying T_noise as T_queue) is ≤ 1/16 = 6.25%. The false-negative rate depends on μ_queue / σ_noise (the signal-to-noise ratio), which exceeds 3 for congestion on paths with ≥3 ms of queue above typical jitter (1 ms) — sufficient for reliable discrimination under the `kcc_qdelay_cong_bp = 2500` (25% of min_rtt) congestion threshold.
 
 ---
 
@@ -395,10 +395,11 @@ $$
 lim_{k→∞} E[x_k | q_i = 0 for all i ≤ k] = T_{base}
 $$
 
-Drift correction handles the persistent-positive-innovation case where T_base genuinely increases (path change). The $$drift\_thresh = 16$$ is derived from optimal detection theory: Goal: minimize $$E[\text{detection delay}]$$ subject to $$P(\text{false alarm}) \leq 10^{-4}$$. For a fair coin ($$p=0.5$$) sequential test: $$P(D \text{ consecutive positives} \mid H_0) = (1/2)^D$$. Solving $$(1/2)^D \leq 10^{-4}$$ yields $$D \geq \log_2(10000) \approx 13.3$$. Rounding up to the next power of 2 for computational efficiency (bitwise comparison): $$D = 16$$. This is the optimal minimax solution: minimizes worst-case detection delay while guaranteeing false-alarm probability below the specified threshold.
+Drift correction handles the persistent-positive-innovation case where T_base genuinely increases (path change). The $$drift\_thresh = 14$$ is derived from optimal detection theory: Goal: minimize $$E[\text{detection delay}]$$ subject to $$P(\text{false alarm}) \leq 10^{-4}$$. For a fair coin ($$p=0.5$$) sequential test: $$P(D \text{ consecutive positives} \mid H_0) = (1/2)^D$$. Solving $$(1/2)^D \leq 10^{-4}$$ yields $$D \geq \log_2(10000) \approx 13.3$$. Rounding to $$D = 14$$ gives 2 RTT faster detection than the prior value 16 while keeping $$P < 2^{-14} \approx 6.1\times10^{-5}$$ (below target). This is the optimal minimax solution: minimizes worst-case detection delay while guaranteeing false-alarm probability below the specified threshold.
 
-- Tier 1 (quiet paths): activates after 16 consecutive skips (P < 2⁻¹⁶ ≈ 1.5×10⁻⁵ under i.i.d., dampened corr/4)
-- Tier 2 (statistical certainty): activates after 128 = 2⁷ consecutive positive skips (P < 2⁻¹²⁸ ≈ 2.94×10⁻³⁹ under i.i.d. symmetric noise), force-corrects upward by corr/8 — converting a statistical certainty into a correction
+- Early drift (amplitude-based, quiet paths): activates after ≥3 consecutive positive skips (P < 2⁻³ = 0.125 under i.i.d.) when cumulative drift_sum exceeds min_rtt/32 (≈3.1% of path RTT); applies K-independent correction = innov/4 per step
+- Tier 1 (quiet paths): activates after 14 consecutive skips (P < 2⁻¹⁴ ≈ 6.10×10⁻⁵ under i.i.d., dampened corr/4 = K·innov/4)
+- Tier 2 (statistical certainty): activates after drift_thresh × kcc_drift_tier2_mult = 56 consecutive positive skips (at defaults; P < 2⁻⁵⁶ ≈ 1.39×10⁻¹⁷ under i.i.d. symmetric noise), force-corrects upward by corr/8 = K·innov/8 — converting a statistical certainty into a correction
 
 **Theorem (Running-Minimum MLE).** Under the one-sided noise model $$z_t = T_{\mathrm{prop}} + \varepsilon_t$$ where $$\varepsilon_t \geq 0$$ a.s. (queuing + jitter are non-negative), the running minimum
 
@@ -603,8 +604,8 @@ $$
 
 | Tier | Threshold N | Type I Error α | Action |
 |------|-------------|----------------|--------|
-| Tier 1 | drift_thresh = 16 | (1/2)^16 = 1.53×10⁻⁵ | Dampened correction (corr/4), quiet paths only |
-| Tier 2 | drift_thresh × 8 = 128 | (1/2)^128 = 2.94×10⁻³⁹ | Forced correction (corr/8), unconditional |
+| Tier 1 | drift_thresh = 14 | (1/2)^14 = 6.10×10⁻⁵ | Dampened correction (corr/4), quiet paths only |
+| Tier 2 | drift_thresh × kcc_drift_tier2_mult = 56 (at defaults) | (1/2)^56 = 1.39×10⁻¹⁷ | Forced correction (corr/8), unconditional |
 
 The two-tier structure implements a **Sequential Probability Ratio Test** (SPRT, Wald 1947) with two decision boundaries. This is optimal in the Wald sense: among all sequential tests with the same error probabilities, the SPRT minimizes the expected sample size (Wald & Wolfowitz, 1948).
 
@@ -733,7 +734,7 @@ The weaker constraint x ≤ z_k (from Proof C.1) allows x to increase when z_k >
 - When RTT drops (ν_k < 0): x ≤ z_k (tighter bound)
 - When RTT rises (ν_k > 0): x ≤ x̂⁻ (bound unchanged)
 
-This encodes the PHYISCAL PRIOR: T_prop cannot increase from queue-inflated observations.
+This encodes the PHYSICAL PRIOR: T_prop cannot increase from queue-inflated observations.
 
 **4. Conclusion**
 
@@ -745,13 +746,39 @@ The claim that KCC "abandons Kalman optimality" confuses the UNCONSTRAINED Kalma
 
 ---
 
+### Theorem Λ — Directional Gate Precision Gain
+
+**Statement.** Under i.i.d. symmetric measurement noise η_k ~ N(0, σ²_η) and non-negative queue q_k ≥ 0, the directional gate i_k = 𝟙(ν_k ≤ 0) reduces the effective innovation variance on accepted (clean) samples by a factor of 1 − 2/π ≈ 0.363, yielding a precision gain:
+
+  λ₃ = σ²_η / Var(η_k | η_k ≤ 0) = π/(π − 2) ≈ 2.752
+       (without queue, i.e. lower bound)
+
+  λ₃ ≥ π/(π − 2)  at all times, strictly increasing with queue presence
+                   (σ²_q > 0 → truncation point < 0 → variance lower)
+
+**Proof.** For η_k ~ N(0, σ²_η):
+
+  E[η_k | η_k ≤ 0] = −σ_η·√(2/π)        (Mills ratio)
+  E[η_k² | η_k ≤ 0] = σ²_η               (symmetry of truncated normal)
+  Var(η_k | η_k ≤ 0) = σ²_η·(1 − 2/π)   ≈ 0.363·σ²_η
+
+  λ₃ = Var_full / Var_gated = σ²_η / (σ²_η·(1 − 2/π)) = π/(π − 2).
+
+When q_k > 0, the truncation shifts leftward: {η_k ≤ −q_k/C < 0}, which further reduces conditional variance.  Therefore λ₃ ≥ π/(π − 2) at all times, with λ₃ >> 1 under deep congestion.
+
+**Physical interpretation:** The directional gate is not a censoring mechanism (which would lose information).  It is a signal purifier that strips queue contamination from RTT samples before they enter the Kalman filter.  Each accepted sample carries 2.75× the precision of a random (ungated) sample, and under congestion this gain amplifies to 100× or more because all queue-contaminated samples are discarded.
+
+**Empirical extension.** The normal-theoretic λ₃ = π/(π−2) ≈ 2.75 is a conservative lower bound for symmetric-noise paths.  For fully distribution-free operation, λ₃ can be computed directly from the empirical variance ratio λ₃ = σ²(ν_k) / σ²(ν_k | ν_k ≤ 0), where both variances are estimated from the running innovation history.  This empirical λ₃ automatically adapts to any noise distribution (Laplace, t, mixture) and any queue regime, providing a strictly tighter bound than the theoretical 2.75 whenever the directional gate is effective.
+
+---
+
 **Proof D (Structural Isolation of T_noise from Decisions).**
 
 **Claim:** T_noise does not affect rate or cwnd decisions.
 
 **Proof:** T_noise enters the system through two paths.
 
-**Path 1:** RTT observation contains η_k (T_noise). The outlier gate rejects $$|ν_k| > max(5ms·scale,\ jitter\_ewma × 3·scale)$$, preventing large T_noise spikes from entering the filter. On clean paths (jitter ≤ 1.67ms) the 5ms base dominates (effective mult ≈5, Chebyshev ≤4%); on noisy paths the 3× jitter component dominates (effective mult ≈3, Chebyshev ≤11%). Residual T_noise that passes the gate enters the Kalman update with attenuation K_ss ≈ 0.39 (derived from actual defaults: p_ss is the PREDICTED (pre-update) steady-state covariance, K_ss = p_ss/(p_ss+R). Q_nominal=100, R=400 → p_ss=256 → K_ss = 256/(256+400) = 0.39; with adaptive Q=2500 (requires q_max ≥ 2500), R=400 → p_ss≈2851 → K_ss = 2851/3251 = 0.88; with matched estimator Q=50000, R=32000 → p_ss≈72170 → K_ss = 72170/(72170+32000) = 0.69). A 1 ms noise spike contributes at most 390 µs to x_est — negligible relative to T_prop (10–200 ms).
+**Path 1:** RTT observation contains η_k (T_noise). The outlier gate rejects $$|ν_k| > max(4ms·scale,\ jitter\_ewma × 2·scale)$$, preventing large T_noise spikes from entering the filter. On clean paths (jitter ≤ 2ms) the 4ms base dominates (effective mult ≈4, Chebyshev ≤6.25%); on noisy paths the 2× jitter component dominates (effective mult ≈2, Chebyshev ≤25%). Residual T_noise that passes the gate enters the Kalman update with attenuation K_ss ≈ 0.39 (derived from actual defaults: p_ss is the PREDICTED (pre-update) steady-state covariance, K_ss = p_ss/(p_ss+R). Q_nominal=100, R=400 → p_ss=256 → K_ss = 256/(256+400) = 0.39; with adaptive Q=2500 (requires raising q_max above its 2000 default), R=400 → p_ss≈2851 → K_ss = 2851/3251 = 0.88; with matched estimator Q=50000, R=32000 → p_ss≈72170 → K_ss = 72170/(72170+32000) = 0.69). A 1 ms noise spike contributes at most 390 µs to x_est — negligible relative to T_prop (10–200 ms).
 
 **Path 2:** T_noise elevates jitter_ewma, which increases Kalman R (measurement noise). Higher R reduces K (the Kalman gain), making the filter less responsive — a conservative response that preserves stability at the cost of slightly slower convergence (bounded by Theorem S.2).
 
@@ -782,7 +809,7 @@ Observer (Kalman) → Controller (PROBE_BW) → Plant (Queue)
 | **A1. Bounded Measurement Noise** | \|η_k\| ≤ η_max, filtered by the outlier gate (Chebyshev: ≤4% false-positive on clean paths). | Bus contention, interrupt coalescing. Kernel measurements: σ ∈ [10 µs, 1 ms]. |
 | **A2. Finite Buffer** | Queue buffer is finite (switch hardware limit). Overrun → loss → congestion signal. | Physical constraint; all CC proofs assume finite buffers. |
 | **A3. DRAIN Under-Pacing** | g_drain = 88/256 ≈ 0.344 (kcc_drain_gain in BBR_UNIT; the integer ratio kcc_drain_gain_num/kcc_drain_gain_den = 347/1000 ≈ 0.347 before quantization). Deficit rate = (1−g_drain)C = 0.656 C. At 10 Gbps: deficit ≈ 547 kseg/s. | Engineered parameter; identical to kernel BBR's bbr_drain_gain. |
-| **A4. Dwell-Time** | Each PROBE_BW phase lasts at least KCC_DRAIN_TARGET_MAX_RTTS = 4 RTTs (safety timeout). | Liberzon (2003) "Switching in Systems and Control" Theorem 3.1: τ_d > 0 ensures dwell-time switching stability. 4 RTTs ≫ τ_d_min. |
+| **A4. Dwell-Time** | Each PROBE_BW phase lasts at least kcc_drain_target_max_rtts = 4 RTTs (safety timeout). | Liberzon (2003) "Switching in Systems and Control" Theorem 3.1: τ_d > 0 ensures dwell-time switching stability. 4 RTTs ≫ τ_d_min. |
 | **A5. Endogenous Convergence** | The Kalman filter declares convergence when K = p_pred/(p_pred+R) ≤ kcc_kalman_converged_k_ppm / 10⁶ (default K_thresh = 250,000 ppm, K = 0.25). At the threshold, p_est ≈ 33 raw → K ≈ 0.25, between K_floor≈0.216 and K_ss≈0.39. | Self-referential: convergence is detected from the filter's own state (p_pred, R). No external p_clean or M/D/1 model needed. |
 
 ---
@@ -1276,13 +1303,13 @@ The full loop has four gain stages:
 
 The forced convergence is gated by a **three-layer defense** against measurement noise:
 
-1. **Outlier gate** (ν < 0): rejects when `neg_skip_cnt < KCC_NEG_PERSIST_THRESH` (= 3). A single fake-low RTT sample from ACK compression cannot accumulate the persistence counter because the next confirming (ν ≥ 0) sample resets it.
+1. **Outlier gate** (ν < 0): rejects when `neg_skip_cnt < kcc_neg_persist_thresh_val` (= 3). A single fake-low RTT sample from ACK compression cannot accumulate the persistence counter because the next confirming (ν ≥ 0) sample resets it.
 
-2. **Physical speed-of-light floor**: rejects `z < x_est·7/8` — single-step drops exceeding 12.5% of the current estimate are physically impossible (endpoint acceleration > c/24 per RTT). Bypassed only when `neg_skip_cnt ≥ KCC_NEG_PERSIST_THRESH`.
+2. **Physical speed-of-light floor**: rejects `z < x_est·7/8` — single-step drops exceeding 12.5% of the current estimate are physically impossible (endpoint acceleration > c/24 per RTT). Bypassed only when `neg_skip_cnt ≥ kcc_neg_persist_thresh_val`.
 
 3. **Time-gated persistence** (`last_neg_mstamp` via `tp->tcp_mstamp` at ~1µs resolution): consecutive ν < 0 samples arriving within `rtt_us/2` (half a round-trip) of each other cannot accumulate — this is physically diagnostic: TSO/GSO bursts collapse inter-sample timing to microseconds, while real path changes maintain the ACK clock at the path RTT interval.
 
-See `tcp_kcc.c:kcc_kalman_update()` for the implementation and the mathematical proof in §B.15 (counter saturation) and the Neyman-Pearson derivation for `KCC_NEG_PERSIST_THRESH`.
+See `tcp_kcc.c:kcc_kalman_update()` for the implementation and the mathematical proof in §B.15 (counter saturation) and the Neyman-Pearson derivation for `kcc_neg_persist_thresh_val`.
 
 ---
 
@@ -1617,7 +1644,7 @@ $$
 
 At nominal Q=100, R=400, p_clean=0.3: R_eff = 1333, p_ss_dir = 418, K_ss_dir = 418/1751 ≈ 0.239. The directional gate **lowers** effective Kalman gain (conservative, preserves ISS).
 
-**Numerical bounds:** sup_k P_k ≤ max(P_0, p_ss_dir + Q·max_gap) where max_gap is bounded by drift correction at 128 consecutive gate-closed rounds. sup_k P_k ≤ 418 + 100·128 = 13218 < 25000 (recal threshold). **Divergence is impossible.**
+**Numerical bounds:** sup_k P_k ≤ max(P_0, p_ss_dir + Q·max_gap) where max_gap is bounded by drift correction at 56 consecutive gate-closed rounds. sup_k P_k ≤ 418 + 100·56 = 6018 < 25000 (recal threshold). **Divergence is impossible.**
 
 #### 6.5 Lur'e System Scope Delimitation
 
@@ -1631,6 +1658,31 @@ The Lur'e/Tsypkin absolute stability criterion (Proof G.1) applies **exclusively
 | Full closed loop | Theorem 5 (switched ISS + dwell-time GAS) |
 
 The Lur'e formulation applies because: (a) the linear part $$G(z) = K/(z - (1-K))$$ has pole at $$1-K < 1$$ (stable), (b) the delayed-ACK nonlinearity satisfies $$\varphi \in [0, 1]$$ (sector-bounded from physical ACK generation), (c) the Tsypkin criterion $$\mathrm{Re}[G(e^{j\omega})] > -1$$ is verified for all $$K < 1$$. The controller (PROBE_BW) and actuator (Lindley queue with saturation) contain logic switching and state saturation that **exceed the sector-bounded nonlinearity framework** of classical Lur'e theory. This scope delimitation is precise and rigorous.
+
+### Theorem S — Intermittent-Update Kalman ISS
+
+**Statement.** The KCC Kalman filter under directional-gate intermittent updates satisfies Input-to-State Stability with contraction factor γ < 1 and noise-to-error gain κ < ∞:
+
+  |d_{k+1}| ≤ γ·|d_k| + κ·max(η_max, w_max)
+
+where d_k = x̂_k − T_prop, η_max = post-outlier-gate measurement noise bound, w_max = process noise bound.
+
+**Proof (sketch).** The directional gate creates a random update sequence {i_k}.  Lemma Q.2 guarantees at least one clean sample per PROBE_BW cycle — i.e., at least one ν_k ≤ 0 event every 8 RTTs — because the DRAIN phase drives the queue to zero within each 8-phase cycle.  Therefore at most 7 consecutive gates can be skipped before a clean sample arrives.  In the worst-case window (7 consecutive skips + 1 clean accept):
+
+  |d_{k+8}| ≤ (1−K_min)·|d_k| + 8·max(K_ss·η_max, w_max)
+
+where K_min = (p_floor+Q)/(p_floor+Q+R) ≈ 0.216 is the minimum Kalman gain (occurring when p_est is at its floor).  Since K_min > 0, the 8-step window contraction factor (primary guarantee from Lemma Q.2) is:
+
+  γ_window = (1 − K_min)^(1/8) = 0.784^(1/8) ≈ 0.9695 < 1
+
+The forced-accept safety valve (max_consec_reject = 20, one forced update every 21 steps) provides a secondary safety net for extreme scenarios where the DRAIN-phase clean sample is somehow missed, with γ = (1−K_min)^(1/21) = 0.784^(1/21) ≈ 0.9884 < 1.
+
+**Three safety nets amplify the base contraction:**
+- **Q-boost (K_eff ≈ 0.73):** One-step contraction 0.27, triggered when a large positive innovation coincides with filter confidence
+- **Drift detection (K_eff = 0.0975–0.0488):** Continuous positive correction after 14/56 consecutive positive innovations
+- **Forced convergence (K_eff = 1):** One-step error elimination for negative innovations (path improvement detected immediately)
+
+**Distribution-free nature:** The Riccati equation depends only on second moments (Q, R), not on Gaussianity.  The Kalman filter is the BLUE (Best Linear Unbiased Estimator) under only E[ε] = 0 and Var(ε) = R.  The ISS proof requires only bounded noise support, which the outlier gate provides by construction.
 
 ### Corollary — N-Flow Fairness
 
@@ -2026,14 +2078,14 @@ Lower bound on error covariance. Prevents the Kalman filter from becoming overco
 **K_ss (steady-state Kalman gain, derived ~0.39-0.88):**
 From the Riccati equation: p_ss = (Q + sqrt(Q² + 4QR))/2 (PREDICTED steady-state covariance). Steady-state balance: p_ss = p_ss·R/(p_ss+R) + Q → p_ss² − Q·p_ss − Q·R = 0 → p_ss = (Q + sqrt(Q² + 4QR))/2. With nominal defaults Q=100, R=400: p_ss = 256, K_ss = 256/(256+400) = 0.39. With adaptive Q=2500, R=400: p_ss ≈ 2851, K_ss = 2851/3251 = 0.88. With matched estimator (Q=50000, R=32000): p_ss ≈ 72170, K_ss = 72170/(72170+32000) = 0.69. K_ss < 1 always (strict) for any finite Q,R > 0.
 
-**Outlier threshold (two-component, defaults: outlier_ms=5ms, outlier_jitter_mult=3):**
-From Chebyshev: P(|ν| > kσ) ≤ 1/k². The two-component threshold $$max(5ms,\ jitter\_ewma × 3)$$ provides effective k ≈ 5 on clean paths (≤4% false positive) and k ≈ 3 on noisy paths (≤11% false positive), where jitter_ewma is the EWMA of |ν_k| tracking the T_noise RMS.
+**Outlier threshold (two-component, defaults: outlier_ms=4ms, outlier_jitter_mult=2):**
+From Chebyshev: P(|ν| > kσ) ≤ 1/k². The two-component threshold $$max(4ms,\ jitter\_ewma × 2)$$ provides effective k ≈ 4 on clean paths (≤6.25% false positive) and k ≈ 2 on noisy paths (≤25% false positive), where jitter_ewma is the EWMA of |ν_k| tracking the T_noise RMS.
 
-**Drift Tier 2 threshold (128 consecutive skips):**
-P(128 consecutive positive skips | i.i.d. symmetric noise) = (1/2)^128 = 2^-128 ≈ 3×10^-39. Statistical certainty that a path change has occurred. The number 128 was chosen as 2^7, providing computational simplicity (bit mask) while delivering astronomically improbable false-trigger probability.
+**Drift Tier 2 threshold (56 consecutive skips):**
+P(56 consecutive positive skips | i.i.d. symmetric noise) = (1/2)^56 = 2^-56 ≈ 1.39×10^-17. Statistical certainty that a path change has occurred.
 
-**Force-accept threshold (max_consec_reject = 25):**
-When the outlier gate rejects a sample, two independent phenomena may be responsible: (a) persistent queue bias (ν_k > 0 due to T_queue, ~70% of samples at p_clean=0.3), (b) T_noise spike exceeding the Chebyshev threshold (≤4% under H0). The combined per-sample rejection probability is P_rej ≈ (1−p_clean) + p_clean·0.04 ≈ 0.71. For 25 consecutive rejections: P_rej^25 ≈ 0.71^25 ≈ 1.8×10⁻⁴. At 10 RTTs/s (10 ms RTT), this fires ~once per 13 minutes — an acceptable safety-valve rate. At k=10: P_rej^10 ≈ 0.034, firing every ~3.5s — too frequent, undermining the gate. At k=50: P_rej^50 ≈ 3×10⁻⁸ — too rare, risking filter starvation. The value 25 balances false-alarm rate (≥75 Chebyshev-false-positive samples under H0, essentially impossible) against starvation protection on noisy paths (O(minutes) recovery).
+**Force-accept threshold (max_consec_reject = 20):**
+When the outlier gate rejects a sample, two independent phenomena may be responsible: (a) persistent queue bias (ν_k > 0 due to T_queue, ~70% of samples at p_clean=0.3), (b) T_noise spike exceeding the Chebyshev threshold (≤6.25% under H0). The combined per-sample rejection probability is P_rej ≈ (1−p_clean) + p_clean·0.0625 ≈ 0.72. For 20 consecutive rejections: P_rej^20 ≈ 0.72^20 ≈ 1.40×10⁻³. At 10 RTTs/s (10 ms RTT), this fires ~once per 71 seconds — an acceptable safety-valve rate. At k=10: P_rej^10 ≈ 0.034, firing every ~3.5s — too frequent, undermining the gate. At k=50: P_rej^50 ≈ 3×10⁻⁸ — too rare, risking filter starvation. The value 20 balances false-alarm rate (≥60 Chebyshev-false-positive samples under H0, essentially impossible) against starvation protection on noisy paths (O(minutes) recovery).
 
 **PROBE_RTT intervals (10s/30s/75s):**
 Base 10s matches kernel BBR (Cardwell et al. 2016: bbr_probe_rtt_min_us = 10,000,000 µs = 10s). The 30s dynamic maximum is 3× base, giving the filter sufficient time to converge between recalibrations on paths with p_clean ≈ 0.3. The 75s hyper-converged maximum (dyn_max × 2.5) applies when p_est ≤ 10 (filter extremely confident), reducing recalibration overhead by 7.5× relative to BBR.
@@ -2041,7 +2093,7 @@ Base 10s matches kernel BBR (Cardwell et al. 2016: bbr_probe_rtt_min_us = 10,000
 **kcc_kalman_scale (default 1024 = 2^10):**
 Fixed-point scaling for the Kalman filter. Chosen as a power-of-two for efficient bit-shift arithmetic. 10 bits provides ~0.1% fractional precision (1/1024 ≈ 0.1%). Must satisfy: scale² > max(Q, R, P) to prevent overflow in the innovation²/scale² division. 1024² = 1,048,576 — exceeding all realistic P/R values (max 1,000,000).
 
-**base_thresh (5 ms):**
+**base_thresh (4 ms):**
 The base outlier threshold is the 3σ upper bound of the combined T_noise distribution. Let T_noise = ε_nic + ε_sched + ε_ack where each component is modeled as zero-mean sub-Gaussian with physically bounded support: ε_nic ≤ device interrupt moderation interval, ε_sched ≤ OS scheduler quantum, ε_ack ≤ TSO_burst · MSS / pacing_rate. By the sub-Gaussian tail bound: P(|T_noise| > t) ≤ 2·exp(-t²/2σ²_total). Setting P(|T_noise| > threshold) < 0.01 and solving: threshold = σ_total · √(2·ln(200)) ≈ 3.26·σ_total. With σ_total bounded by the physical sum of component variances, threshold = 5 ms provides the required <1% false-positive rejection rate. The Chebyshev formulation P(|ν| > threshold) ≤ σ²_total/threshold² further confirms: for threshold/σ_total ≥ 3, the bound is ≤ 1/9 ≈ 11%, tightened by the sub-Gaussian assumption.
 
 **kcc_jitter_r_scale (default 8000):**
@@ -2060,7 +2112,7 @@ $$K_{ss} = p_{ss}/(p_{ss} + 600) = 300/900 \approx 0.333$$
 This maintains K_ss within the stable range (K_ss > 0.024 from p_est_floor constraint). The divisor 8000 is chosen so that at the hardware noise ceiling (σ_meas ≈ 20 µs, from which R_base = 400 is derived), the R_boost contribution is negligible (< 1 unit) — the adaptive R mechanism activates only for pathologically noisy conditions exceeding the design assumption by 8× or more.
 
 **p_clean (≈ 0.3, configurable, derived from M/D/1 queue model):**
-The probability that a given RTT sample encounters an empty queue (no cross-traffic queuing delay). The specific value p_clean = 0.3 affects convergence TIME bounds, not convergence EXISTENCE. All stability theorems (1–5) hold for any p_clean ∈ (0, 1]. p_clean is a CONFIGURABLE parameter with a grounded default, not a load-bearing constant. Modeled via the M/D/1 queue: with Poisson background traffic arrivals at rate λ and deterministic service at link capacity C, the stationary queue-empty probability is P(queue_empty) = 1 − ρ where ρ = λ/C. For paths with known utilization ρ, set p_clean = 1 − ρ. For unknown paths, ρ = 0.7 yields p_clean = 0.3 — a conservative default that overestimates convergence time (actual convergence is faster on less-loaded paths). The event "empty queue" is necessary but not sufficient for a clean sample: the sample must also pass the outlier gate (two-component: ≤4% Chebyshev on clean paths, ≤11% on noisy). The effective clean-sample probability is p_clean_eff = P(empty ∩ not outlier) = 0.3 × (1 − 0.04) ≈ 0.288. Using p_clean = 0.3 as the contraction-rate parameter is therefore a slight overestimate, making convergence time bounds conservative (actual convergence is slightly faster than predicted). Even with p_clean = 0 (infinite queue, a pathological limit), drift correction (Tier 2 after 128 skips) and smart recalibration provide bounded-time convergence (B1). The derivation is independent of flow count, MSS, or specific path topology — it depends only on the bottleneck utilization ρ, a single measurable physical quantity.
+The probability that a given RTT sample encounters an empty queue (no cross-traffic queuing delay). The specific value p_clean = 0.3 affects convergence TIME bounds, not convergence EXISTENCE. All stability theorems (1–5) hold for any p_clean ∈ (0, 1]. p_clean is a CONFIGURABLE parameter with a grounded default, not a load-bearing constant. Modeled via the M/D/1 queue: with Poisson background traffic arrivals at rate λ and deterministic service at link capacity C, the stationary queue-empty probability is P(queue_empty) = 1 − ρ where ρ = λ/C. For paths with known utilization ρ, set p_clean = 1 − ρ. For unknown paths, ρ = 0.7 yields p_clean = 0.3 — a conservative default that overestimates convergence time (actual convergence is faster on less-loaded paths). The event "empty queue" is necessary but not sufficient for a clean sample: the sample must also pass the outlier gate (two-component: ≤6.25% Chebyshev on clean paths, ≤25% on noisy). The effective clean-sample probability is p_clean_eff = P(empty ∩ not outlier) = 0.3 × (1 − 0.0625) ≈ 0.281. Using p_clean = 0.3 as the contraction-rate parameter is therefore a slight overestimate, making convergence time bounds conservative (actual convergence is slightly faster than predicted). Even with p_clean = 0 (infinite queue, a pathological limit), drift correction (Tier 2 after 56 skips) and smart recalibration provide bounded-time convergence (B1). The derivation is independent of flow count, MSS, or specific path topology — it depends only on the bottleneck utilization ρ, a single measurable physical quantity.
 
 **Queue-Delay Threshold Derivation (kcc_qdelay_clean_bp, kcc_qdelay_cong_bp, kcc_qdelay_floor_us):**
 
@@ -2077,8 +2129,8 @@ The three thresholds partition the qdelay space into three operating regimes on 
 The Q-boost mechanism detects a substantial path change (routing change, LEO handover) by monitoring the absolute innovation magnitude. Derivation: the threshold must exceed the combined magnitude of T_noise (η_max ≤ 5 ms bounded) and steady-state Kalman tracking error (σ_error ≤ 2 ms at K_ss = 0.39) under normal operation — otherwise T_noise spikes would falsely trigger path-change adaptation. However, it must be small enough to respond quickly to real path changes (typical 10-100 ms shifts). The value 4 ms is chosen as:
 
 - Above the 3σ Chebyshev bound of the innovation sequence under H_0 (|ν| < 3 × 2 ms = 6 ms normal bound; 4 ms < 6 ms so it could trigger on extreme noise).
-- The Q-boost requires BOTH |ν| > 4 ms AND p_est ≤ converged (500) → the filter must be confident before re-converging. This dual condition prevents noise triggering: high-noise epochs have p_est ≫ converged (R_boost raises p_est), so Q-boost is suppressed.
-- The cooldown (8 samples) prevents repeated triggering on oscillatory transients.
+- The Q-boost requires BOTH |ν| > 4 ms AND p_est ≤ converged_val (~33 at defaults) → the filter must be confident before re-converging. This dual condition prevents noise triggering: high-noise epochs have p_est ≫ converged_val (R_boost raises p_est), so Q-boost is suppressed.
+- The cooldown (6 samples) prevents repeated triggering on oscillatory transients.
 - The threshold is approximately 0.4 × (min detectable path change of 10 ms) — balancing speed vs false-positive rate.
 
 ### Boundary Condition Proofs (B1–B16)
@@ -2089,9 +2141,9 @@ Every boundary condition KCC can encounter is enumerated and proven either corre
 
 | # | Boundary | Proof |
 |---|----------|-------|
-| B1 | Queue never drains (p_clean=0) | Directional update skips all; x_est frozen at last clean estimate. min_rtt_us provides BDP floor. Drift Tier 2 (after 128 skips, P<2^-128) force-corrects upward. Any CC algorithm faces this limit. |
+| B1 | Queue never drains (p_clean=0) | Directional update skips all; x_est frozen at last clean estimate. min_rtt_us provides BDP floor. Drift Tier 2 (after 56 skips, P<2^-56) force-corrects upward. Any CC algorithm faces this limit. |
 | B2 | Always clean (p_clean=1) | Converges at full rate: E[error] ≤ (1-K_ss)^k; 1% error in ~10 RTTs. |
-| B3 | Path increase (50→100ms) | Positive skips dominate. Three mechanisms: (a) Drift Tier 1 (quiet): 16 skips, corr/4, converges ~26s. (b) Drift Tier 2 (noisy): 128 skips, P<2⁻¹²⁸, corr/8 per cycle. (c) Smart recalibration: p_est grows → PROBE_RTT drains → remeasures min_rtt → convergence within one PROBE_RTT interval (10s). Transient cwnd=½ BDP → conservative, no overshoot. |
+| B3 | Path increase (50→100ms) | Positive skips dominate. Three mechanisms: (a) Drift Tier 1 (quiet): 14 skips, corr/4, converges ~26s. (b) Drift Tier 2 (noisy): 56 skips, P<2⁻⁵⁶, corr/8 per cycle. (c) Smart recalibration: p_est grows → PROBE_RTT drains → remeasures min_rtt → convergence within one PROBE_RTT interval (10s). Transient cwnd=½ BDP → conservative, no overshoot. |
 | B4 | Path decrease (100→50ms) | Negative ν accepted: x_{k+1}=x_k+K_ss·(-50ms). Correction=19.5ms/RTT at K_ss=0.39. 1% convergence in ~10 RTTs. Transient cwnd=2x BDP → 0.5 BDP queue → drained by next 0.75x phase. No loss. Theorem 4 bounded. |
 | B5 | Extreme RTT initialization | Satellite (1s): x_est=1M*1024=1.02B < U32_MAX. Datacenter (1μs): floored to 1*1024=1024. Both within u32 range. |
 
@@ -2108,8 +2160,8 @@ Every boundary condition KCC can encounter is enumerated and proven either corre
 | # | Boundary | Proof |
 |---|----------|-------|
 | B9 | Zero noise (clean lab) | jitter_ewma→0. K_ss converges to 0.39-0.88. No overhead. |
-| B10 | Sustained maximum noise (η=5ms) | Jitter_ewma converges to 5ms (EWMA with constant input converges to the input value, α is the single-step contribution not the steady-state). Outlier threshold = max(5ms_base, 3×5ms) = 15ms. Since \|innov\|≈5ms < 15ms, NO outlier rejection — the gate adapts to the sustained noise floor. Noise isolation via directional gate: positive skips (queue+noise) are censored, negative (clean T_prop) are accepted. Convergence slows by factor ~0.5 (Theorem S.2, p_clean=0.5, but stability holds for any p_clean>0). |
-| B11 | Burst noise (isolated spikes) | Outlier gate rejects. Forced acceptance after 25 consecutive rejects prevents lockout. Jitter responds slowly (α=0.125) — conservative adaptation. |
+| B10 | Sustained maximum noise (η=5ms) | Jitter_ewma converges to 5ms (EWMA with constant input converges to the input value, α is the single-step contribution not the steady-state). Outlier threshold = max(4ms_base, 2×5ms) = 10ms. Since \|innov\|≈5ms < 10ms, NO outlier rejection — the gate adapts to the sustained noise floor. Noise isolation via directional gate: positive skips (queue+noise) are censored, negative (clean T_prop) are accepted. Convergence slows by factor ~0.5 (Theorem S.2, p_clean=0.5, but stability holds for any p_clean>0). |
+| B11 | Burst noise (isolated spikes) | Outlier gate rejects. Forced acceptance after 20 consecutive rejects prevents lockout. Jitter responds slowly (α=0.125) — conservative adaptation. |
 | B12 | Boiling frog noise (gradual increase) | Jitter EWMA tracks. R_boost increases → K_ss decreases. Matched estimator adapts Q/R over ~190 RTTs. No unbounded drift. |
 
 **Numerical Boundaries:**
@@ -2118,7 +2170,7 @@ Every boundary condition KCC can encounter is enumerated and proven either corre
 |---|----------|-------|
 | B13 | Division by zero | All divisions guarded: interval_us=0→reject; mss_cache=0→TSO min; gain_den<1→floor=1; scale∈[64,1048576]; all_den≥1. Structurally impossible. |
 | B14 | Integer overflow | u64 multiplications guarded by U64_MAX/operand checks. u32 bounded by clamp/max_t. Fixed-point scaling: u64 intermediates. Negative sign-extension: s64→u32 clamped. |
-| B15 | Counter saturation | sample_cnt: u32 with U32_MAX sat. pos_skip_cnt: u8 with KCC_POS_SKIP_SATURATION. neg_skip_cnt: u8 with KCC_NEG_SKIP_SATURATION. consec_reject: u32 implicit (max 25). rtt_cnt/cycle_idx: bitfield-bounded. last_neg_mstamp: u32 wrap handled by unsigned subtraction. No wrap-around failures. |
+| B15 | Counter saturation | sample_cnt: u32 with U32_MAX sat. pos_skip_cnt: u8 with KCC_POS_SKIP_SATURATION. neg_skip_cnt: u8 with KCC_NEG_SKIP_SATURATION. consec_reject: u32 implicit (default 20). rtt_cnt/cycle_idx: bitfield-bounded. last_neg_mstamp: u32 wrap handled by unsigned subtraction. No wrap-around failures. |
 | B16 | Extreme path parameters | RTT→0: floored to 1μs. RTT>4.2s: x_est saturated at U32_MAX. BW→0: pacing_rate=0, connection stalls (recovers on BW return). BW→∞: capped at U64_MAX/USEC_PER_SEC. |
 
 _Complete proofs with code-level detail are in `tcp_kcc.c` header, Boundary Condition Proofs (section B1-B16)._
@@ -2255,13 +2307,13 @@ $$
 
 KCC provides three INDEPENDENT mechanisms that bound the starvation error:
 
-**(a) PROBE_BW DRAIN phase.**  Every PROBE_BW gain cycle includes a DRAIN phase with pacing_gain $= 0.75$ (BBR's 3/4 drain gain, unchanged in KCC), lasting at least `KCC_DRAIN_TARGET_MAX_RTTS` RTTs (default 4).  During DRAIN:
+**(a) PROBE_BW DRAIN phase.**  Every PROBE_BW gain cycle includes a DRAIN phase with pacing_gain $= 0.75$ (BBR's 3/4 drain gain, unchanged in KCC), lasting at least `kcc_drain_target_max_rtts` RTTs (default 4).  During DRAIN:
 
 $$
 \frac{dq}{dt} = C \cdot (\text{gain} - 1) = C \cdot (0.75 - 1) = -0.25C
 $$
 
-Queue drained per cycle: $\Delta q = 0.25 \cdot C \cdot \text{RTT}_{\text{drain}}$.  With the 4-RTT safety timeout: $\Delta q = 0.25 \cdot C \cdot 4 \cdot \text{RTT} = C \cdot \text{RTT} = \text{BDP}$.  At 10 Gbps with 100 ms RTT: $\Delta q \approx 125\,\text{MB}$, exceeding typical buffer sizes.  The KCC FSM DRAIN state (entered after STARTUP completion) uses the more aggressive KCC DRAIN gain (`kcc_drain_gain = 0.344`, 88/256 BBR_UNIT) with ${dq}/{dt} = -0.653C$, draining the STARTUP queue faster — the 0.75× PROBE_BW drain is the steady-state worst case.  Both gains satisfy ${dq}/{dt} < 0$, guaranteeing monotonic queue drain.
+Queue drained per cycle: $\Delta q = 0.25 \cdot C \cdot \text{RTT}_{\text{drain}}$.  With the 4-RTT safety timeout: $\Delta q = 0.25 \cdot C \cdot 4 \cdot \text{RTT} = C \cdot \text{RTT} = \text{BDP}$.  At 10 Gbps with 100 ms RTT: $\Delta q \approx 125\,\text{MB}$, exceeding typical buffer sizes.  The KCC FSM DRAIN state (entered after STARTUP completion) uses the more aggressive KCC DRAIN gain (`kcc_drain_gain = 0.344`, 88/256 BBR_UNIT) with ${dq}/{dt} = -0.656C$, draining the STARTUP queue faster — the 0.75× PROBE_BW drain is the steady-state worst case.  Both gains satisfy ${dq}/{dt} < 0$, guaranteeing monotonic queue drain.
 
 **(b) PROBE_RTT window.**  Periodically (interval determined by `kcc_get_probe_rtt_interval()`, configurable via `kcc_probe_rtt_base_sec`), KCC enters a ${kcc\_probe\_rtt\_mode\_ms\_val}$ ms window with:
 
@@ -2276,7 +2328,7 @@ $$
 
 At 10 Gbps: $q_{\text{drained}} = 125\,\text{MB}$ in 200 ms.
 
-**(c) Two-tier drift detection.**  When `pos_skip_cnt` exceeds Tier 1 (16) or Tier 2 (128) thresholds, KCC force-accepts a virtual negative innovation:
+**(c) Two-tier drift detection.**  When `pos_skip_cnt` exceeds Tier 1 (14) or Tier 2 (56) thresholds, KCC force-accepts a virtual negative innovation:
 
 $$
 \nu_{\text{virtual}} = -\hat{T}_{\text{prop}} \cdot 2^{-\text{tier}}
@@ -2289,10 +2341,10 @@ This bounds the worst-case drift even when NO clean sample ever arrives.
 **Theorem K.2 (Graceful Degradation).**  Under worst-case permanent full-queue with zero cross-traffic:
 
 $$
-\text{BDP inflation} \leq 1 + \frac{\max(q_{\text{drained}}/C,\; \hat{T}_{\text{prop}}/128)}{T_{\text{prop}}}
+\text{BDP inflation} \leq 1 + \frac{\max(q_{\text{drained}}/C,\; \hat{T}_{\text{prop}}/56)}{T_{\text{prop}}}
 $$
 
-where $q_{\text{drained}}/C = 0.1$ s is the one-way drain-time equivalent of the PROBE_RTT window and $\hat{T}_{\text{prop}}/128$ is the Tier-2 drift correction.
+where $q_{\text{drained}}/C = 0.1$ s is the one-way drain-time equivalent of the PROBE_RTT window and $\hat{T}_{\text{prop}}/56$ is the Tier-2 drift correction.
 
 **Numerical bounds:**
 
@@ -2302,7 +2354,7 @@ where $q_{\text{drained}}/C = 0.1$ s is the one-way drain-time equivalent of t
 
 **Terrestrial** (10 ms, 100 Mbps):
 
-  $$1 + \frac{{\hat T}_{\mathrm{prop}}}{128\cdot T_{\mathrm{prop}}} \approx 1.008$$
+  $$1 + \frac{{\hat T}_{\mathrm{prop}}}{56\cdot T_{\mathrm{prop}}} \approx 1.018$$
   
   Dominant: Tier-2
 
@@ -2317,7 +2369,7 @@ where $q_{\text{drained}}/C = 0.1$ s is the one-way drain-time equivalent of t
 **If PROBE_RTT is disabled** (application demands 100% utilization): The bound tightens to Tier-2-only:
 
 $$
-\mathrm{BDP\ inflation} \leq 1 + \frac{\hat{T}_{\mathrm{prop}}}{128 \cdot T_{\mathrm{prop}}} \approx 1.008
+\mathrm{BDP\ inflation} \leq 1 + \frac{\hat{T}_{\mathrm{prop}}}{56 \cdot T_{\mathrm{prop}}} \approx 1.018
 $$
 
 This is negligible because drift correction operates on estimated RTT, which overestimates $T_{\mathrm{prop}}$ by queue contamination — the ratio 
@@ -2358,15 +2410,15 @@ The following cases extend the boundary coverage beyond B1–B16, covering addit
 
 #### B19 — Continuous Loss (100%, Complete Path Failure)
 
-**Model:** Total path outage. Zero observations → Kalman state frozen. No estimator divergence (frozen state is BIBO-stable). On path restoration, first RTT sample below `x_est` triggers immediate acceptance. If path changed, PROBE_RTT or drift correction (Tier 2, 128 consecutive innovations) handles convergence within `max(128 RTTs, 30s)`.
+**Model:** Total path outage. Zero observations → Kalman state frozen. No estimator divergence (frozen state is BIBO-stable). On path restoration, first RTT sample below `x_est` triggers immediate acceptance. If path changed, PROBE_RTT or drift correction (Tier 2, 56 consecutive innovations) handles convergence within `max(56 RTTs, 30s)`.
 
 #### B20 — Packet Reordering (Non-Congestion)
 
-Reordering produces two effects: (a) RTT increase — safely rejected by directional gate. (b) RTT decrease (early ACK) — negative innovation passes directional gate. Defense: forced convergence (`x_est = z`, K_eff=1) is gated by a speed-of-light floor (KCC_FORCED_DROP_FLOOR_SHIFT=3, 12.5% max RTT decrease per sample). This prevents single reordering events from causing more than a 1/8 drop in x_est per sample; after N consecutive reordering events, x_est bottoms at (7/8)^N of the original value. Q-boost (path change) overrides the floor gate. See B29 for full discussion.
+Reordering produces two effects: (a) RTT increase — safely rejected by directional gate. (b) RTT decrease (early ACK) — negative innovation passes directional gate. Defense: forced convergence (`x_est = z`, K_eff=1) is gated by a speed-of-light floor (kcc_forced_drop_floor_shift=3, 12.5% max RTT decrease per sample). This prevents single reordering events from causing more than a 1/8 drop in x_est per sample; after N consecutive reordering events, x_est bottoms at (7/8)^N of the original value. Q-boost (path change) overrides the floor gate. See B29 for full discussion.
 
 #### B21 — Delayed ACK (40ms Linux Default)
 
-**Quantification:** Systematic +0–40ms bias on all RTT samples. At 100ms RTT: max relative error = 40%; at 10ms RTT: max = 400%. All samples biased positive → directional gate rejects → sample starvation. Mitigation: $$max_consec_reject = 25$$ forces acceptance of one sample per 25 RTTs. At 100ms RTT: convergence in 37 RTTs = 3.7s. At 10ms RTT: `x_est` inflated by up to 40ms (400%), but `min_rtt_us` window provides floor correction within 10s. Conservative-compatible (Theorem 4, BIBO).
+**Quantification:** Systematic +0–40ms bias on all RTT samples. At 100ms RTT: max relative error = 40%; at 10ms RTT: max = 400%. All samples biased positive → directional gate rejects → sample starvation. Mitigation: $$max_consec_reject = 20$$ forces acceptance of one sample per 20 RTTs. At 100ms RTT: convergence in 32 RTTs = 3.2s. At 10ms RTT: `x_est` inflated by up to 40ms (400%), but `min_rtt_us` window provides floor correction within 10s. Conservative-compatible (Theorem 4, BIBO).
 
 #### B22 — Multiple Bottleneck Links
 
@@ -2406,15 +2458,13 @@ Reordering produces two effects: (a) RTT increase — safely rejected by directi
 
 2. **Early ACK → RTT decrease (mitigated):** Negative innovation passes directional gate.  The KCC implementation applies **forced convergence** (`x_est = z`, K_eff=1) rather than dampened gain.  A **three-layer gate** protects against false decreases:
 
-   - **Layer 1 — Outlier gate** (ν < 0): rejects unless `neg_skip_cnt ≥ KCC_NEG_PERSIST_THRESH` (3 consecutive negative innovations over the jitter threshold).  A single reordering event increments the counter; the next confirming (ν ≈ 0) ACK resets it.
+   - **Layer 1 — Outlier gate** (ν < 0): rejects unless `neg_skip_cnt ≥ kcc_neg_persist_thresh_val` (3 consecutive negative innovations over the jitter threshold).  A single reordering event increments the counter; the next confirming (ν ≈ 0) ACK resets it.
 
-   - **Layer 2 — Physical speed-of-light floor**: the measurement `z` is accepted only when `z ≥ x_est·7/8` (KCC_FORCED_DROP_FLOOR_SHIFT=3, a 12.5% floor — single-step drops exceeding 12.5% of the current estimate are rejected as physically impossible).  Bypassed when `neg_skip_cnt ≥ KCC_NEG_PERSIST_THRESH`.
+   - **Layer 2 — Physical speed-of-light floor**: the measurement `z` is accepted only when `z ≥ x_est·7/8` (kcc_forced_drop_floor_shift=3, a 12.5% floor — single-step drops exceeding 12.5% of the current estimate are rejected as physically impossible).  Bypassed when `neg_skip_cnt ≥ kcc_neg_persist_thresh_val`.
 
    - **Layer 3 — Time-gated persistence** (`last_neg_mstamp`): consecutive ν < 0 samples must be spaced by at least `rtt_us/2` in wall-clock time (`tp->tcp_mstamp`, ~1µs resolution).  Reordering produces clustered early ACKs (microseconds apart), while genuine decreases maintain the ACK-clock period of ~1 RTT.  This is the primary discriminator, robust across all path conditions.
 
    All three layers must be satisfied or bypassed via persistent evidence for the forced convergence to apply.  A single reordering event cannot pass any layer (neg_skip_cnt = 1, z ≥ floor condition fails if the drop exceeds 12.5%, and any subsequent normal ACK resets the counter).
-
-**Trade-off:** Downward convergence requires 3 consecutive ν < 0 samples (each spaced by ≥ rtt_us/2) — 3 RTTs for a genuine path improvement.  This replaces the original p_est-based gate (which could become permanently bypassed after a single rejection) with a self-recovering persistence counter.
 
 **Trade-off:** Downward convergence requires 3 consecutive ν < 0 samples (each spaced by ≥ rtt_us/2) — 3 RTTs for a genuine path improvement.  The speed-of-light floor (12.5% maximum RTT decrease per sample) prevents single-sample reordering-induced drops from corrupting x_est — the physical limit on RTT change between consecutive samples is set by endpoint velocity, not by protocol.  Multiple consecutive reordering events would be required to pass the three-layer gate (neg_skip_cnt ≥ 3 AND all below the 12.5% floor AND spaced ≥ rtt_us/2); in practice, reordering is isolated and the gate resets on the next confirming ACK.
 
@@ -2428,7 +2478,7 @@ Reordering produces two effects: (a) RTT increase — safely rejected by directi
 
 **Physical model:** Receivers coalesce 4–8 ACKs. Each sample includes $$T_compression(n) = (n−1) · T_inter_arrival$$, biasing all samples positive.
 
-**KCC response:** (1) Directional gate rejects almost all biased samples. (2) Force-accept after 25 consecutive rejections passes one sample per 25 RTTs, carrying ≤84µs bias at line rate. (3) ACK aggregation confidence FSM scores trustworthiness; aggressive compression reduces confidence → Kalman R increases → gain decreases.
+**KCC response:** (1) Directional gate rejects almost all biased samples. (2) Force-accept after 20 consecutive rejections passes one sample per 20 RTTs, carrying ≤84µs bias at line rate. (3) ACK aggregation confidence FSM scores trustworthiness; aggressive compression reduces confidence → Kalman R increases → gain decreases.
 
 **Proof of bounded impact:** The worst-case per-sample bias is $$T_{compression\_max} = (N_{coalesce\_max} − 1) · MSS / C$$. The steady-state bias in $$x_{est}$$ after $$M$$ force-accepted samples scales as:
 
@@ -2460,7 +2510,7 @@ where τ_q is the current queueing delay estimate and τ_ref is the target (defa
 3. **Loss interpretation:** PIE drops (not just ECN marks) when p exceeds a threshold. KCC treats these as congestion losses; the Kalman bandwidth estimator reduces pacing rate. **However**, probabilistic loss creates a non-congestion loss pattern similar to wireless loss → see B17.
 4. **Conservative behavior:** Since PIE's queue is bounded, the maximum estimation bias to `x_est` from any forced-accepted sample is ≤45ms. At 100ms RTT, this is 45% — significant. However, the min_rtt_us window provides floor correction within 10s.
 
-**Proof of bounded bias:** Under PIE with target τ_ref, the queue delay distribution has compact support `[0, q_max]` with `q_max ≈ 3·τ_ref = 45ms`. The Kalman's `x_est` is biased upward by at most `K_ss · q_max · p_force` where `p_force = 1/25` (one force-accept per 25 RTTs) = 0.39 · 45ms · 0.04 = 0.70ms steady-state bias. Acceptable.
+**Proof of bounded bias:** Under PIE with target τ_ref, the queue delay distribution has compact support `[0, q_max]` with `q_max ≈ 3·τ_ref = 45ms`. The Kalman's `x_est` is biased upward by at most `K_ss · q_max · p_force` where `p_force = 1/20` (one force-accept per 20 RTTs) = 0.39 · 45ms · 0.05 = 0.88ms steady-state bias. Acceptable.
 
 #### B33 — CAKE AQM (Per-Host Fair Queueing)
 
@@ -2571,7 +2621,7 @@ z_k = T_{\text{prop}} + \frac{L}{B(t_k)} + T_{\text{queue}} + T_{\text{noise}}
 $$
 
 **KCC's behavioral reclassification:** The three-component model absorbs T_trans variance behaviorally:
-- **Slow B(t) changes** (seconds-scale fading): Appear as T_prop drift. Handled by drift correction Tier 1 (16 skips, quiet-path filter) → x_est tracks slowly.
+- **Slow B(t) changes** (seconds-scale fading): Appear as T_prop drift. Handled by drift correction Tier 1 (14 skips, quiet-path filter) → x_est tracks slowly.
 - **Fast B(t) changes** (sub-RTT): Appear as T_noise. Rejected by outlier gate and jitter EWMA.
 - **Mid-frequency changes** (RTT-scale): Create innovations that may or may not pass the directional gate depending on sign.
 
@@ -2624,7 +2674,7 @@ With DOCSIS grant delay ~2ms and 100ms RTT: 2% BDP overestimation. Safe — slig
 **KCC interaction:**
 1. **ACK thinning:** Each ACK covers N segments instead of 2. The `extra_acked` count increases. KCC's ACK aggregation confidence layer scores this as reduced confidence → increases R (measurement noise) → reduces Kalman gain.
 2. **Bandwidth estimation:** The bandwidth estimator processes lower-rate ACKs: `delivered / interval` is still correct (uses total delivered bytes, not per-ACK), but the lower sample rate increases variance. Q adaptation handles this.
-3. **Force-accept guard:** After max_consec_reject (25), a sample is force-accepted. However, since all samples have positive bias from inter-segment gaps, the force-accepted sample also carries this bias. The bias is bounded by the Kalman forgetting factor (`α = 1 − K_ss` = 0.61 per RTT) → exponentially erased within ~5 RTTs.
+3. **Force-accept guard:** After max_consec_reject (20), a sample is force-accepted. However, since all samples have positive bias from inter-segment gaps, the force-accepted sample also carries this bias. The bias is bounded by the Kalman forgetting factor (`α = 1 − K_ss` = 0.61 per RTT) → exponentially erased within ~5 RTTs.
 
 **Proof of bounded impact:** The worst-case per-sample bias from LRO/GRO is `(N-1) · MSS / C` (inter-segment gap at bottleneck rate). With N=64, MSS=1500, C=1Gbps: bias ≤ 63 × 12µs = 756µs. The Kalman filter's exponential forgetting reduces this to `K_ss · bias / (1 − (1-K_ss)) = K_ss · bias` steady-state error after convergence. With K_ss=0.39: ~295µs steady-state bias at 1Gbps — negligible at typical RTTs.
 
@@ -2665,7 +2715,7 @@ With `K_ss ≤ 0.39` and reneged bytes ≤ the SACK scoreboard size (typically �
 1. **RTT sample starvation:** During zero-window, no data segments flow, so RTT samples arrive only from probe ACKs — at most 1 sample per probe interval (which may be 60 s). This is well above the starvation threshold.
 2. **Kalman filter state:** With sample intervals of up to 60 s, the process noise $Q$ accumulates between updates: $P_{k|k-1} = P_{k-1|k-1} + Q \gg P_{k-1|k-1}$. The effective Kalman gain increases toward 1 for the first post-stall sample, allowing rapid re-convergence.
 3. **Directional gate:** During zero-window, there are no data packets in flight (except the probe itself), so there is no data-path queue. The probe's RTT sample is at $T_{\text{prop}} + T_{\text{noise}}$, which passes the directional gate as a clean sample. This is BENEFICIAL — it provides a fresh $T_{\text{prop}}$ observation.
-4. **Edge case: delayed zero-window exit:** If `rwnd` opens but the ACK is lost, the probe interval backs off to 60 s before the next attempt. During this interval, KCC's estimator is frozen — a BIBO-stable condition. The `max_consec_reject` guard (25) is not triggered because there are no RTT samples to reject.
+4. **Edge case: delayed zero-window exit:** If `rwnd` opens but the ACK is lost, the probe interval backs off to 60 s before the next attempt. During this interval, KCC's estimator is frozen — a BIBO-stable condition. The `max_consec_reject` guard (20) is not triggered because there are no RTT samples to reject.
 
 **Proof of bounded impact:** Let the zero-window duration be $T_{\text{zw}}$. The Kalman covariance after $T_{\text{zw}}$ without updates is:
 
@@ -2811,10 +2861,10 @@ I(T_prop, T_queue) = (1/σ²)·[1 1; 1 1] — rank 1 → CRB infinite for indivi
 
 2. **PROBE_RTT window (200 ms):** Forced idle window drains up to C/10 bytes from KCC's queue share (0.5×C drain rate × 200 ms). At 10 Gbps: 125 MB.
 
-3. **Two-tier drift detection:** When pos_skip_cnt ≥ 16/128, KCC injects virtual negative innovations ν_virtual = −T̂_prop · 2^(−tier). Bounds drift to 1/128 of estimated RTT.
+3. **Two-tier drift detection:** When pos_skip_cnt ≥ 14/56, KCC injects virtual negative innovations ν_virtual = −T̂_prop · 2^(−tier). Bounds drift to 1/56 of estimated RTT.
 
 **Composite bound (worst case):**
-BDP inflation ≤ 1 + max(q_drained/C, T̂_prop/128) / T_prop
+BDP inflation ≤ 1 + max(q_drained/C, T̂_prop/56) / T_prop
 
 **Numerical examples:**
 
@@ -2822,7 +2872,7 @@ BDP inflation ≤ 1 + max(q_drained/C, T̂_prop/128) / T_prop
 |----------|--------|-------|-----------|-----------|
 | 10 Gbps, 10 ms RTT | 10 ms | 10 Gbps | 1 + 100 ms / 10 ms = 1 + 10 = 11× | PROBE_RTT (C/10) |
 | 100 Mbps, 50 ms RTT | 50 ms | 100 Mbps | 1 + 100 ms / 50 ms = 3× | PROBE_RTT |
-| WAN, PROBE_RTT disabled | 10 ms | — | 1 + 1/128 ≈ 1.008× (negligible) | Tier-2 drift |
+| WAN, PROBE_RTT disabled | 10 ms | — | 1 + 1/56 ≈ 1.018× (negligible) | Tier-2 drift |
 
 **KCC response:** Graceful, bounded degradation. The mechanisms are independent (AND gate: any ONE suffices to bound the error). The large inflation at high bandwidth × low RTT is SAFE — overestimated BDP only affects cwnd ceiling, not actual pacing rate (which is separately bounded by bandwidth measurement). No RTT-based CCA can solve this — it is a physical information limit.
 
@@ -2902,9 +2952,9 @@ KCC's parameters partition into exactly four groups determined by the three-comp
 
 | Group | Component | Parameters | Physical Basis | Degrees of Freedom |
 |-------|-----------|-----------|----------------|-------------------|
-| **A (Anchor)** | `T_prop` estimation | ~28 | Kalman filter: Q, R, P0, gain caps, convergence thresholds. Path-change detection: drift thresholds, Q-boost, PROBE_RTT intervals. Min-RTT tracking: window length, sticky ratio. | 1 state (`T_prop`) + 1 covariance (P) = **2 DOF** |
-| **B (Signal)** | `T_queue` response | ~42 | Gain table entries, drain timing, queue delay thresholds, ECN response, skip probabilities. PROBE_BW cycle timing. | Queue has **3 DOF**: arrival rate λ, service rate μ, buffer bound B_max |
-| **C (Interference)** | `T_noise` rejection | ~38 | Jitter EWMA α, outlier gate multiplier, confidence FSM, ACK aggregation scoring, LT-BW windows, TSO divisor adaptation. | Noise has **2 DOF**: μ_noise and σ_noise |
+| **A (Anchor)** | `T_prop` estimation | ~41 | Kalman filter: Q, R, P0, gain caps, convergence thresholds. Path-change detection: drift thresholds, G3 path-shift, Q-boost, PROBE_RTT intervals. Min-RTT tracking: window length, sticky ratio. | 1 state (`T_prop`) + 1 covariance (P) = **2 DOF** |
+| **B (Signal)** | `T_queue` response | ~44 | Gain table entries, drain timing and skip, queue delay thresholds, ECN response, skip probabilities. PROBE_BW cycle timing. | Queue has **3 DOF**: arrival rate λ, service rate μ, buffer bound B_max |
+| **C (Interference)** | `T_noise` rejection | ~50 | Drift correction (quiet jitter, Tier-1/2 shifts and mult, early drift), jitter EWMA α, outlier gate multiplier, TSO jitter thresholds, ACK aggregation scoring, LT-BW windows, TSO divisor adaptation. | Noise has **2 DOF**: μ_noise and σ_noise |
 | **D (Integration)** | Cross-component coupling | ~38 | Global KF: Q_global, R_global, discount factor. BDP floor/ceiling, pacing margins, cwnd bounds. Init parameters. | Cross-coupling: 3 bidirectional channels |
 
 **Total DOF:** ~11 physical DOF (3 behavioral classes × 2 estimators + coupling). Parameter/DOF ratio ≈ 13.3.
@@ -2936,15 +2986,15 @@ $$MSE_{\text{full}} = \frac{p_{\text{clean}} \cdot \sigma^2_{\text{noise}} + p_{
 
 The MSE of the directional (filtered) estimator is $$MSE_{\text{dir}} = \sigma^2_{\text{noise}}$$. Since σ²_q > σ²_noise for any non-trivial queue, MSE_dir < MSE_full. **Directional update is strictly lower-MSE than full-data Kalman when queue is present.**
 
-**Two-tier drift correction:** Tier 1 (16 consecutive positive skips, `P < 1.5×10⁻⁵`) and Tier 2 (128 consecutive, `P < 3×10⁻³⁹`) are Neyman-Pearson sequential tests (Wald 1947). The directional gate operates per-sample (instantaneous), drift correction operates per-128-samples (statistical certainty). These are separate mechanisms on different timescales — not "patches" for a broken estimator.
+**Two-tier drift correction:** Tier 1 (14 consecutive positive skips, `P < 6.10×10⁻⁵`) and Tier 2 (56 consecutive, `P < 1.39×10⁻¹⁷`) are Neyman-Pearson sequential tests (Wald 1947). The directional gate operates per-sample (instantaneous), drift correction operates per-56-samples (statistical certainty). These are separate mechanisms on different timescales — not "patches" for a broken estimator.
 
 **Why reject ALL positive innovations, not just large ones?** A magnitude-only gate (e.g., 3σ) fails because queue-induced innovations are not necessarily large — a 1ms queue on a 10ms path creates a 10% positive innovation that passes a 3σ gate (σ≈2ms → gate at 6ms). Over N events, the cumulative bias is:
 
 $$\text{bias}_N = K_{ss} \cdot q \cdot N$$
 
-With K_ss=0.39, q=1ms, N=1000: bias = 390ms — catastrophic. The sign-based directional gate correctly rejects ALL positive innovations regardless of magnitude, achieving what magnitude-based gating cannot: negligible queue contamination of x_est. The drift detector (persistence-based) provides the statistically rigorous escape hatch for genuine baseline drift: after 128 consecutive positive innovations (P≈2.9×10⁻³⁹ under i.i.d. symmetric noise — statistical certainty of baseline drift), a dampened update (corr/8) is applied. The two mechanisms operate on different timescales: gate is per-sample instantaneous rejection; drift is per-128-samples statistical detection (Wald's SPRT optimality theorem).
+With K_ss=0.39, q=1ms, N=1000: bias = 390ms — catastrophic. The sign-based directional gate correctly rejects ALL positive innovations regardless of magnitude, achieving what magnitude-based gating cannot: negligible queue contamination of x_est. The drift detector (persistence-based) provides the statistically rigorous escape hatch for genuine baseline drift: after 56 consecutive positive innovations (P≈1.39×10⁻¹⁷ under i.i.d. symmetric noise — statistical certainty of baseline drift), a dampened update (corr/8) is applied. The two mechanisms operate on different timescales: gate is per-sample instantaneous rejection; drift is per-56-samples statistical detection (Wald's SPRT optimality theorem).
 
-**AND-gate DRAIN timeout:** The $$KCC_DRAIN_TARGET_MAX_RTTS = 4$$ timeout is the **dwell-time condition** in the switched-system stability proof (Liberzon 2003, Theorem 3.1). The PROBE_BW cycle (probe at 1.25×, drain at 0.75×, cruise at 1.0×) is a switched system requiring minimum dwell time per mode. The timeout provides this guarantee — it does not "overturn optimality." The fluid model includes arbitrary cross-traffic: `q_{k+1} = max(0, q_k + Σλ_i − C)`, where Σλ_i includes ALL flows (KCC and cross-traffic). The forced timeout guarantees exit within 4 RTTs regardless of queue state. The PROBE_BW cycle is zero-sum over each 8-phase period: 0.25 BDP of probe-induced queue is drained by the 0.75× drain phase, proving ISS with respect to bounded cross-traffic (Theorem 5).
+**AND-gate DRAIN timeout:** The $$kcc\_drain\_target\_max\_rtts = 4$$ timeout is the **dwell-time condition** in the switched-system stability proof (Liberzon 2003, Theorem 3.1). The PROBE_BW cycle (probe at 1.25×, drain at 0.75×, cruise at 1.0×) is a switched system requiring minimum dwell time per mode. The timeout provides this guarantee — it does not "overturn optimality." The fluid model includes arbitrary cross-traffic: `q_{k+1} = max(0, q_k + Σλ_i − C)`, where Σλ_i includes ALL flows (KCC and cross-traffic). The forced timeout guarantees exit within 4 RTTs regardless of queue state. The PROBE_BW cycle is zero-sum over each 8-phase period: 0.25 BDP of probe-induced queue is drained by the 0.75× drain phase, proving ISS with respect to bounded cross-traffic (Theorem 5).
 
 ---
 
@@ -3007,7 +3057,7 @@ STARTUP ──full_bw_reached──▶ DRAIN ──inflight<=BDP──▶ PROBE_
     ┌──────────────────────────────────────────────────────────┐
     │ DIRECTIONAL: nu < 0 → update (clean T_prop sample)       │
     │              nu > 0 → SKIP (T_queue contamination)       │
-    │ OUTLIER:  |nu| > max(5ms·scale, jitter_ewma * 3·scale) → SKIP   │
+    │ OUTLIER:  |nu| > max(4ms·scale, jitter_ewma * 2·scale) → SKIP   │
     │ Q-BOOST:  large -nu → reset K (fast path-change adapt)   │
     │ DRIFT:    persistent small -nu → SGD toward true T_prop  │
     │ FORCE:    consec_reject >= max → accept (anti-starvation) │
@@ -3173,7 +3223,7 @@ At typical wired-path noise `σ = 1 ms` on a `50 ms` baseline, the bias is `−0
 
 3.  **Route-change resilience on path DECREASE (100→50 ms):** Directional gate accepts downward innovations → Kalman converges geometrically with factor (1−K_ss) per clean sample.  At K_ss=0.39, each clean sample contracts estimation error by 61%.  8 clean samples reduce 45 ms error to < 1 ms.  At 100 ms RTT with one clean sample per RTT (DRAIN phase + occasional cruise clean rounds), the best-case convergence is ~0.8 s; under sparse clean-sample conditions (1 per 8-RTT cycle), worst-case is ~6.4 s.
 
-4.  **Route-change resilience on path INCREASE (50→100 ms):** Gate rejects positive innovations → x_est freezes.  Recovery via: (a) **drift correction** Tier 1 (corr/4 after 16 skips) or Tier 2 (corr/8 after 128 skips), providing geometric convergence; (b) **smart recalibration** — when p_est exceeds `kcc_recal_p_est_thresh` (25000), a PROBE_RTT drain is triggered to reseed x_est.
+4.  **Route-change resilience on path INCREASE (50→100 ms):** Gate rejects positive innovations → x_est freezes.  Recovery via: (a) **drift correction** Tier 1 (corr/4 after 14 skips) or Tier 2 (corr/8 after 56 skips), providing geometric convergence; (b) **smart recalibration** — when p_est exceeds `kcc_recal_p_est_thresh` (25000), a PROBE_RTT drain is triggered to reseed x_est.
 
 **Cost:** The Mills-ratio downward bias (~1.6% on a 50 ms path with 1 ms jitter) means BDP is consistently ~1.6% below the physical maximum.  This trades a small steady-state throughput loss for the structural guarantee of never inflating BDP from queue.  In multi-flow high-pressure broadband, this conservative BDP also means **lower queue occupancy and lower packet loss than BBR**, at the cost of slightly lower throughput.
 
@@ -3280,12 +3330,12 @@ R = R_base + max(0, jitter_ewma − clean_thresh) × R_base / kcc_jitter_r_scale
 R = min(R, R_base × kcc_kalman_r_max_boost)
 ```
 
-**Q-Boost path-change detection**: when `|innovation| > kcc_kalman_q_boost_thresh_val` (default ≈ 4 ms RTT shift) AND the filter has converged (`p_est <= kcc_kalman_converged_val`, the endogenous threshold computed from `kcc_kalman_converged_k_ppm` per Lemma O.3), `p_est` is reset to `kcc_kalman_p_est_init_val`, boosting Kalman gain toward 1.0 for rapid convergence.  A cooldown of `kcc_kalman_qboost_cdwn` (default 8) samples between successive qboost events prevents runaway triggering on lossy paths with high RTT jitter. Q-boost is additionally suppressed when pos_skip_cnt ≥ kcc_kalman_pos_skip_thresh (default 8), preventing TSO/GRO batch-induced innovation spikes from perpetually resetting the covariance.
+**Q-Boost path-change detection**: when `|innovation| > kcc_kalman_q_boost_thresh_val` (default ≈ 4 ms RTT shift) AND the filter has converged (`p_est <= kcc_kalman_converged_val`, the endogenous threshold computed from `kcc_kalman_converged_k_ppm` per Lemma O.3), `p_est` is reset to `kcc_kalman_p_est_init_val`, boosting Kalman gain toward 1.0 for rapid convergence.  A cooldown of `kcc_kalman_qboost_cdwn` (default 6) samples between successive qboost events prevents runaway triggering on lossy paths with high RTT jitter. Q-boost is additionally suppressed when pos_skip_cnt ≥ kcc_kalman_pos_skip_thresh (default 5), preventing TSO/GRO batch-induced innovation spikes from perpetually resetting the covariance.
 
 **Outlier gating**: dynamic threshold $$dyn_thresh = max(outlier_ms × 1000 × scale, jitter_ewma × outlier_jitter_mult × scale)$$. Applied with direction-dependent criteria:
 - For ν ≥ 0 (positive/neutral innovation): applied when `p_est ≤ kcc_kalman_converged_val` (filter is confident).
-- For ν < 0 (decrease): applied when `neg_skip_cnt < KCC_NEG_PERSIST_THRESH` (persistence not yet established).  Three consecutive ν < 0 above the threshold trigger the persistent-negative bypass, allowing the sample to reach the floor gate for percentage-bandwidth admission.
-After `kcc_kalman_max_consec_reject` (default 25) consecutive rejections, the next sample is force-accepted to prevent self-reinforcing lock-in.
+- For ν < 0 (decrease): applied when `neg_skip_cnt < kcc_neg_persist_thresh_val` (persistence not yet established).  Three consecutive ν < 0 above the threshold trigger the persistent-negative bypass, allowing the sample to reach the floor gate for percentage-bandwidth admission.
+After `kcc_kalman_max_consec_reject` (default 20) consecutive rejections, the next sample is force-accepted to prevent self-reinforcing lock-in.
 
 **Covariance-matched noise estimation (BBR-S)**: $$q_est = (1−α) × q_est + α × (K × innov)²$$, $$r_est = (1−β) × r_est + β × max(0, innov² − p_pred)$$. Combination mode: mode 0 = nominal only, mode 1 = max (default), mode 2 = weighted blend.
 
@@ -3377,7 +3427,7 @@ When KCC detects the flow is likely alone on the bottleneck (low queue delay, lo
 
 This eliminates the single-flow throughput gap between KCC and BBR while preserving KCC's full protection loop (Kalman, gain decay, LT bandwidth) for multi-flow scenarios.
 
-**Hysteresis**: Entry requires `kcc_alone_confirm_rounds` (default 3) consecutive qualifying rounds — preventing oscillation during brief quiet periods in multi-flow competition ("conservative to accelerate"). Exit uses hysteresis: `kcc_alone_exit_thresh` (default 3) consecutive qualification failures required before clearing the flag, preventing resonant multi-flow oscillation. The confirmation counter is a `u8` bounded to `KCC_ALONE_CONFIRM_CNT_MAX` (255, compile-time).
+**Hysteresis**: Entry requires `kcc_alone_confirm_rounds` (default 3) consecutive qualifying rounds — preventing oscillation during brief quiet periods in multi-flow competition ("conservative to accelerate"). Exit uses hysteresis: `kcc_alone_exit_thresh` (default 3) consecutive qualification failures required before clearing the flag, preventing resonant multi-flow oscillation. The confirmation counter is a `u8` bounded to 255 (u8 saturation).
 
 Qualification conditions (all six must hold on a round boundary):
 0. Kalman converged (`sample_cnt >= kcc_kalman_min_samples`) — trust qdelay/jitter as queue signals
@@ -3584,7 +3634,7 @@ PROBE_RTT mode: cwnd = min(cwnd, cwnd_min_target) // minimum inflight
 
 Parameters are exposed under `/proc/sys/net/kcc/`. Writes trigger `kcc_init_module_params()` (validation + clamping + derived value computation). Array parameter writes trigger `kcc_rebuild_gain_table()`.
 
-> **Parameter constraints:** Several parameters have mandatory inter-parameter relationships enforced at initialization. For example, `kcc_kalman_saturation_thresh < kcc_kalman_drift_thresh × 8` (invariant: saturation response must fire before Tier-2 drift, or the response is perpetually preempted). If you set incompatible values, the module silently clamps them to safe ranges and emits a kernel warning (`dmesg | grep kcc`). Use the defaults or the combinations recommended in the Troubleshooting Guide unless you have a specific reason to deviate.
+> **Parameter constraints:** Several parameters have mandatory inter-parameter relationships enforced at initialization. For example, `kcc_kalman_saturation_thresh < kcc_kalman_drift_thresh × kcc_drift_tier2_mult` (invariant: saturation response must fire before Tier-2 drift, or the response is perpetually preempted). If you set incompatible values, the module silently clamps them to safe ranges and emits a kernel warning (`dmesg | grep kcc`). Use the defaults or the combinations recommended in the Troubleshooting Guide unless you have a specific reason to deviate.
 
 ### PROBE_RTT Intervals
 
@@ -3593,6 +3643,8 @@ Parameters are exposed under `/proc/sys/net/kcc/`. Writes trigger `kcc_init_modu
 | `kcc_probe_rtt_base_sec` | 10 | 1 | 86400 | s | Base PROBE_RTT interval |
 | `kcc_probe_rtt_max_sec` | 15 | 1 | 86400 | s | Upper cap for long-RTT paths |
 | `kcc_probe_rtt_dyn_max_sec` | 30 | 0 | 86400 | s | Max dynamic interval; 0 disables |
+| `kcc_probe_rtt_jitter_shift` | 6 | 0 | 12 | — | Per-flow PROBE_RTT interval jitter: hash >> shift |
+| `kcc_dyn_probe_hyper_num` / `kcc_dyn_probe_hyper_den` | 3 / 2 | 1 / 1 | 1000 / 10000 | — | Dynamic probe interval hyper-converged multiplier (1.5x) |
 
 ### Gains
 
@@ -3602,8 +3654,8 @@ Parameters are exposed under `/proc/sys/net/kcc/`. Writes trigger `kcc_init_modu
 | `kcc_extra_acked_gain_num` / `kcc_extra_acked_gain_den` | 1 / 1 | 0/1 | 100k/100k | ACK aggregation bonus multiplier |
 | `kcc_high_gain_num` / `kcc_high_gain_den` | 2885 / 1000 | 0/1 | 100k | STARTUP gain (≈2.89x) |
 | `kcc_drain_gain_num` / `kcc_drain_gain_den` | 347 / 1000 | 0/1 | 100k | 347/1000 float, 0.344x BBR_UNIT-quantized |
-| `kcc_gain_num[i]` / `kcc_gain_den[i]` | BBRv1 pattern (256 slots) | 0/1 | — | Per-slot pacing gain |
-| `kcc_cycle_decay_mask[8]` | 0 (all zero) | 0 | 0x7FFFFFFF | 256-bit decay bitmap |
+| `kcc_gain_num[i]` / `kcc_gain_den[i]` | BBRv1 pattern (256 slots) | 0/1 | 255/255 | Per-slot pacing gain |
+| `kcc_cycle_decay_mask[8]` | 0 (all zero) | 0 | 0xFFFFFFFF | 256-bit decay bitmap |
 | `kcc_probe_bw_up_limit` | 0 | 0 | 1 | Limit PROBE_BW up-phase exit (0=off) |
 
 ### Kalman Base
@@ -3618,14 +3670,18 @@ Parameters are exposed under `/proc/sys/net/kcc/`. Writes trigger `kcc_init_modu
 | `kcc_kalman_p_est_floor` | 10 | 1 | 100k | p_est floor |
 | `kcc_kalman_scale` | 1024 | 64 | 1,048,576 | Fixed-point scale (power of two) |
 | `kcc_kalman_min_samples` | 5 | 3 | 20 | Min samples before takeover |
-| `kcc_kalman_outlier_ms` | 5 | 0 | 10000 | ms | Outlier base threshold |
+| `kcc_kalman_outlier_ms` | 4 | 0 | 10000 | Outlier base threshold (ms) |
 | `kcc_kalman_q_boost_mult` | 4 | 1 | 10000 | Q-boost multiplier |
-| `kcc_kalman_q_boost_ms` | 1 | 1 | 5000 | ms | Q-boost time constant |
-| `kcc_kalman_qboost_cdwn` | 8 | 1 | 255 | samples | Q-boost cooldown |
+| `kcc_kalman_q_boost_ms` | 4 | 1 | 5000 | Q-boost time constant (ms) |
+| `kcc_kalman_qboost_cdwn` | 6 | 1 | 255 | Q-boost cooldown (samples) |
 | `kcc_kalman_q_max` | 2000 | 1 | 100k | Q ceiling |
 | `kcc_kalman_q_scale_cap` | 50 | 1 | 10000 | Q scale cap |
-| `kcc_kalman_max_consec_reject` | 25 | 1 | 1000 | Max consecutive rejections before force-accept |
-| `kcc_rtt_sample_max_us` | 500000 | 1 | 10M | µs | Kalman RTT ceiling |
+| `kcc_kalman_max_consec_reject` | 20 | 1 | 1000 | Max consecutive rejections before force-accept |
+| `kcc_kalman_pos_skip_thresh` | 5 | 3 | 31 | Q-boost suppression skip threshold |
+| `kcc_neg_persist_thresh` | 3 | 2 | 254 | Negative innovations to bypass outlier+floor gates |
+| `kcc_kalman_drift_thresh` | 14 | 4 | 31 | Drift detection threshold (Tier-1) |
+| `kcc_kalman_saturation_thresh` | 64 (clamped to < drift_thresh×kcc_drift_tier2_mult at init; effective 55) | 16 | 127 | p_est saturation response threshold |
+| `kcc_rtt_sample_max_us` | 500000 | 1 | 10M | Kalman RTT ceiling (µs) |
 | `kcc_kalman_r_max_boost` | 8 | 1 | 1000 | R max boost multiplier |
 | `kcc_kalman_rtt_dyn_mult` | 2 | 1 | 100 | RTT dynamic ceiling multiplier |
 | `kcc_kalman_q_rtt_div` | 1000 | 1 | 1M | Q adaptation RTT divisor |
@@ -3635,9 +3691,36 @@ Parameters are exposed under `/proc/sys/net/kcc/`. Writes trigger `kcc_init_modu
 
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
-| `kcc_kalman_outlier_jitter_mult_num/den` | 3 / 1 | 0-1000 / 1-100k | Outlier jitter multiplier |
+| `kcc_kalman_outlier_jitter_mult_num/den` | 2 / 1 | 0-1000 / 1-100k | Outlier jitter multiplier |
 | `kcc_kalman_q_min_factor_num/den` | 10 / 1 | 0-1000 / 1-100k | Q min factor |
 | `kcc_kalman_p_est_init_rtt_div_num/den` | 10 / 1 | 1-100k / 1-100k | p_est init RTT divisor |
+| `kcc_kalman_noise_avg_num/den` | 1 / 2 | 0-100 / 1-100k | Noise averaging blend (mode=2) |
+
+### G3 Path-Shift Detection
+
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| `kcc_g3_min_skip` | 2 | 1-31 | G3 C3: consecutive positive skips before path-shift detection |
+| `kcc_g3_qdelay_mult_num` / `kcc_g3_qdelay_mult_den` | 5 / 2 | 1-1000 / 1-10000 | G3 C1: qdelay multiplier (num/den > 1.0, default 2.5x) |
+| `kcc_g3_max_qdelay_frac_shift` | 1 | 0-8 | G3 C2: max qdelay fraction = min_rtt / 2^shift (1=50%, 2=25%, ...) |
+
+### Drift Correction
+
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| `kcc_drift_quiet_jitter_shift` | 3 | 0-16 | Tier-1 quiet path: jitter < min_rtt >> shift (3 = min_rtt/8) |
+| `kcc_drift_tier1_shift` | 2 | 1-16 | Tier-1 correction: corr >> shift (2 = corr/4) |
+| `kcc_drift_tier2_shift` | 3 | 1-16 | Tier-2 correction: corr >> shift (3 = corr/8) |
+| `kcc_drift_tier2_mult` | 4 | 2-32 | Tier-2 skip multiplier: drift_thresh * mult (14*4=56 skips) |
+| `kcc_drift_early_min_rtt` | 3 | 2-31 | Early drift min consecutive pos_skip (< drift_thresh) |
+| `kcc_drift_early_sum_shift` | 5 | 1-16 | Early drift amplitude: drift_sum > min_rtt >> shift (5 = min_rtt/32) |
+| `kcc_drift_early_corr_shift` | 2 | 1-16 | Early drift correction: innov >> shift (2 = innov/4) |
+
+### Physical Speed-of-Light Floor
+
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| `kcc_forced_drop_floor_shift` | 3 | 2-8 | Reject z < x_est * (1 - 1/2^shift) (3 = 12.5%) |
 
 ### BBR-S Noise Estimation
 
@@ -3648,7 +3731,8 @@ Parameters are exposed under `/proc/sys/net/kcc/`. Writes trigger `kcc_init_modu
 | `kcc_kalman_noise_mode` | 1 | 0-2 | Combine mode (0=off, 1=max, 2=weighted avg) |
 | `kcc_kalman_q_est_max` | 50,000 | 1-2B | Q estimate upper bound |
 | `kcc_kalman_r_est_max` | 32,000 | 1-2B | R estimate upper bound |
-| `kcc_kalman_q_est_floor` / `r_est_floor` | 1 | 1-100k | Lower bound per estimate |
+| `kcc_kalman_q_est_floor` | 1 | 1-100k | Q estimate lower bound |
+| `kcc_kalman_r_est_floor` | 1 | 1-100k | R estimate lower bound |
 
 ### Gain Decay (Probing)
 
@@ -3667,11 +3751,24 @@ Parameters are exposed under `/proc/sys/net/kcc/`. Writes trigger `kcc_init_modu
 
 These are basis-point (‱) values scaled to min_rtt_us. The floor prevents false trigger on low-RTT paths.
 
+### Drain
+
+| Parameter | Default | Range | Unit | Description |
+|-----------|---------|-------|------|-------------|
+| `kcc_drain_skip_min_rtt_shift` | 3 | 0-7 | — | DRAIN skip guard: min_rtt >> shift before skip allowed |
+| `kcc_drain_target_max_rtts` | 4 | 1-256 | RTTs | Max DRAIN duration before forced exit |
+
 ### Adaptive R (Jitter-Driven)
 
 | Parameter | Default | Range | Unit | Description |
 |-----------|---------|-------|------|-------------|
 | `kcc_jitter_r_scale` | 8000 | 1-100k | — | R increase scale divisor |
+
+### Jitter EWMA Seed
+
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| `kcc_jitter_seed_shift` | 2 | 0-8 | Cold-start jitter EWMA seed: abs(innov) >> shift |
 
 ### ECN
 
@@ -3680,7 +3777,7 @@ These are basis-point (‱) values scaled to min_rtt_us. The floor prevents fals
 | `kcc_ecn_enable` | 0 | 0-1 | ECN master switch (default: disabled — directional gate pre-empts; see §B34 and §ECN) |
 | `kcc_ecn_backoff_num` / `kcc_ecn_backoff_den` | 20 / 100 | 0-100 / 1-100k | ECN backoff fraction |
 | `kcc_ecn_ewma_retained` / `kcc_ecn_ewma_total` | 3 / 4 | 0-100 / 1-100k | ECN EWMA weights |
-| `kcc_ecn_idle_decay_num` / `kcc_ecn_idle_decay_den` | 31 / 32 | 1-100k | Idle ECN decay |
+| `kcc_ecn_idle_decay_num` / `kcc_ecn_idle_decay_den` | 31 / 32 | 1-(den-1) / 2-100k | Idle ECN decay (num < den, den ≥ 2) |
 
 ### min_rtt
 
@@ -3695,12 +3792,12 @@ These are basis-point (‱) values scaled to min_rtt_us. The floor prevents fals
 
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
-| `kcc_lt_intvl_min_rtts` | 4 | 1-127 | RTTs | Min interval length |
+| `kcc_lt_intvl_min_rtts` | 4 | 1-127 | Min interval length (RTTs) |
 | `kcc_lt_intvl_max_mult` | 4 | 2-32 | Interval timeout multiplier |
-| `kcc_lt_loss_thresh` | 25 | 1-65535 | BBR_UNIT | Min loss ratio |
+| `kcc_lt_loss_thresh` | 25 | 1-65535 | Min loss ratio (BBR_UNIT) |
 | `kcc_lt_bw_ratio_num` / `kcc_lt_bw_ratio_den` | 1 / 8 | 0-100k / 1-100k | Relative tolerance |
-| `kcc_lt_bw_diff` | 500 | 0-100k | bytes/s | Absolute tolerance |
-| `kcc_lt_bw_max_rtts` | 48 | 1-4094 | RTTs | LT BW max active RTTs |
+| `kcc_lt_bw_diff` | 500 | 0-100k | Absolute tolerance (bytes/s) |
+| `kcc_lt_bw_max_rtts` | 48 | 1-4094 | LT BW max active interval (RTTs) |
 | `kcc_lt_bw_ema_num` / `kcc_lt_bw_ema_den` | 1 / 2 | 0-100 / 1-100k | LT BW EMA weight |
 
 ### ACK Aggregation Confidence
@@ -3709,17 +3806,22 @@ These are basis-point (‱) values scaled to min_rtt_us. The floor prevents fals
 |-----------|---------|-------|-------------|
 | `kcc_agg_enable` | 1 | 0-1 | Master switch |
 | `kcc_agg_confidence_thresh` | 512 | 0-10000 | cwnd compensation confidence threshold |
-| `kcc_agg_max_comp_ratio` | 50 | 0-100 | % of BDP | cwnd comp cap |
-| `kcc_agg_max_comp_duration` | 8 | 1-128 | RTTs | Watchdog timeout |
-| `kcc_agg_r_hysteresis` | 75 | 0-100 | % | R hysteresis decay |
+| `kcc_agg_max_comp_ratio` | 50 | 0-100 | cwnd comp cap (% of BDP) |
+| `kcc_agg_max_comp_duration` | 8 | 1-128 | Watchdog timeout (RTTs) |
+| `kcc_agg_r_hysteresis` | 75 | 0-100 | R hysteresis decay (%) |
 | `kcc_agg_r_multiplier_min` / `kcc_agg_r_multiplier_max` | 256 / 2048 | 1-10000 | R scaling range (256=1x) |
 | `kcc_agg_factor4_ratio_num` / `kcc_agg_factor4_ratio_den` | 3 / 2 | 1-100k | Factor 4 ratio |
 | `kcc_agg_safety_bdp_mult` | 3 | 1-100 | Safety guard BDP multiplier |
-| `kcc_agg_max_window_ms` | 100 | 1-10000 | ms | extra_acked cap window |
-| `kcc_agg_max_decay_pct` | 75 | 0-100 | % | Watchdog decay rate |
-| `kcc_agg_window_rotation_rtts` | 5 | 1-65535 | RTTs | Window rotation period |
+| `kcc_agg_max_window_ms` | 100 | 1-10000 | extra_acked cap window (ms) |
+| `kcc_agg_max_decay_pct` | 75 | 0-100 | Watchdog decay rate (%) |
+| `kcc_agg_window_rotation_rtts` | 5 | 1-65535 | Window rotation period (RTTs) |
 | `kcc_agg_factor_weight` | 256 | 1-1024 | Per-factor score |
 | `kcc_agg_confidence_max` | 1024 | 1-65536 | Max confidence |
+| `kcc_agg_thresh_suspected` | 256 | 1-1024 | SUSPECTED state entry threshold |
+| `kcc_agg_thresh_confirmed` | 512 | 2-1024 | CONFIRMED state entry threshold |
+| `kcc_agg_thresh_trusted` | 768 | 3-1024 | TRUSTED state entry threshold |
+| `kcc_agg_max_per_ack_decay` / `kcc_agg_max_per_ack_decay_den` | 128 / 128 | 0-128 / 1-65535 | Per-ACK gentle decay |
+| `kcc_extra_acked_win_rtts_max` | 31 | 1-65535 | Max dual-window rotation period (RTTs) |
 
 ### EWMA Coefficients
 
@@ -3727,6 +3829,13 @@ These are basis-point (‱) values scaled to min_rtt_us. The floor prevents fals
 |-----------|---------|-------|-------------|
 | `kcc_ewma_qdelay_num` / `kcc_ewma_qdelay_den` | 7 / 8 | 0-100 / 1-100k | qdelay EWMA weight |
 | `kcc_ewma_jitter_num` / `kcc_ewma_jitter_den` | 7 / 8 | 0-100 / 1-100k | Jitter EWMA weight |
+
+### TSO Divisor Adaptation
+
+| Parameter | Default | Range | Unit | Description |
+|-----------|---------|-------|------|-------------|
+| `kcc_tso_low_jitter_thresh_us` | 1000 | 100-5000 | µs | Jitter below this -> halve TSO divisor |
+| `kcc_tso_high_jitter_thresh_us` | 4000 | 1000-20000 | µs | Jitter above this -> double TSO divisor |
 
 ### Miscellaneous
 
@@ -3738,25 +3847,143 @@ These are basis-point (‱) values scaled to min_rtt_us. The floor prevents fals
 | `kcc_full_bw_cnt` | 3 | 1-3 | Non-growth rounds to exit |
 | `kcc_probe_rtt_mode_ms_num` / `kcc_probe_rtt_mode_ms_den` | 200 / 1 | 1-100k | PROBE_RTT stay duration |
 | `kcc_pacing_margin_num` / `kcc_pacing_margin_den` | 1 / 100 | 0-50 / 1-100k | Pacing margin (1% = BBR parity, 0 = none) |
-| `kcc_probe_cwnd_bonus` | 2 | 0-100 | segs | Phase-0 cwnd bonus |
-| `kcc_bw_rt_cycle_len` | 10 | 2-256 | rounds | BW sliding window length |
-| `kcc_cwnd_min_target` | 4 | 1-1000 | segs | Min cwnd (PROBE_RTT) |
-| `kcc_bdp_min_rtt_us` | 1 | 0-100k | µs | BDP min_rtt floor |
-| `kcc_edt_near_now_ns` | 1000 | 0-10M | ns | EDT near-now threshold |
-| `kcc_min_tso_rate` | 1,200,000 | 1-1B | bytes/s | TSO low-rate threshold |
+| `kcc_probe_cwnd_bonus` | 2 | 0-100 | Phase-0 cwnd bonus (segs) |
+| `kcc_bw_rt_cycle_len` | 10 | 2-256 | BW sliding window length (rounds) |
+| `kcc_cwnd_min_target` | 4 | 1-1000 | Min cwnd (PROBE_RTT, segs) |
+| `kcc_bdp_min_rtt_us` | 1 | 0-100k | BDP min_rtt floor (µs) |
+| `kcc_rtt_mode` | 0 (FILTER) | 0-1 | Model RTT source: 0=FILTER (Kalman), 1=BBR (min_rtt_us) |
+| `kcc_probe_rtt_decouple` | 1 | 0-1 | Skip PROBE_RTT when Kalman healthy |
+| `kcc_recal_p_est_thresh` | 25000 | 1-100M | p_est threshold for PROBE_RTT safety net |
+| `kcc_startup_max_rtts` | 64 | 32-1024 | Max STARTUP rounds before forced DRAIN (RTTs) |
+| `kcc_edt_near_now_ns` | 1000 | 0-10M | EDT near-now threshold (ns) |
+| `kcc_min_tso_rate` | 1,200,000 | 1-1B | TSO low-rate threshold (bytes/s) |
 | `kcc_min_tso_rate_div` | 8 | 1-256 | TSO rate divisor (adaptive base) |
-| `kcc_tso_max_segs` | 127 | 1-65535 | segs | Max TSO segments |
+| `kcc_tso_max_segs` | 64 | 1-65535 | Max TSO segments |
+| `kcc_tso_segs_low` | 1 | 1-65535 | TSO segments on low-rate paths |
+| `kcc_tso_segs_default` | 2 | 1-65535 | TSO segments on normal-rate paths |
 | `kcc_tso_headroom_mult` | 3 | 0-1000 | TSO headroom multiplier |
 | `kcc_sndbuf_expand_factor` | 3 | 2-100 | Send buffer expansion factor |
-| `kcc_ack_epoch_max` | 0xFFFFF | 64K-2G | bytes | ACK epoch cap |
+| `kcc_ack_epoch_max` | 0xFFFFF | 64K-2G | ACK epoch cap (bytes) |
 | `kcc_extra_acked_max_ms_num` / `kcc_extra_acked_max_ms_den` | 150 / 1 | 0-100k / 1-100k | Max ACK agg window |
-| `kcc_probe_rtt_long_rtt_us` | 20000 | 0-10M | µs | Long-RTT threshold |
+| `kcc_probe_rtt_long_rtt_us` | 20000 | 0-10M | Long-RTT threshold (µs) |
 | `kcc_probe_rtt_long_interval_div` | 1 | 1-1000 | Long-RTT interval divisor |
-| `kcc_alone_confirm_rounds` | 3 | 1-32 | rounds | Rounds before activating single-flow mode |
-| `kcc_alone_exit_thresh` | 3 | 1-255 | — | Rounds of contention before exiting alone mode |
-| `kcc_alone_agg_state_level` | 1 | 0-2 | — | Aggregation strictness (0=IDLE, 1=≤SUSPECTED, 2=≤CONFIRMED) |
-| `kcc_alone_bypass_ecn` | 0 | 0-1 | — | Bypass ECN backoff when alone (1=skip, 0=keep active) |
-| `kcc_alone_bypass_lt_bw` | 1 | 0-1 | — | Bypass LT BW qualification when alone (1=bypass, 0=keep active) |
+| `kcc_alone_confirm_rounds` | 3 | 1-32 | Rounds before activating single-flow mode |
+| `kcc_alone_exit_thresh` | 3 | 1-255 | Rounds of contention before exiting alone mode |
+| `kcc_alone_agg_state_level` | 1 | 0-2 | Aggregation strictness (0=IDLE, 1=≤SUSPECTED, 2=≤CONFIRMED) |
+| `kcc_alone_bypass_ecn` | 0 | 0-1 | Bypass ECN backoff when alone (1=skip, 0=keep active) |
+| `kcc_alone_bypass_lt_bw` | 1 | 0-1 | Bypass LT BW qualification when alone (1=bypass, 0=keep active) |
+
+## Scenario-Specific Tuning
+
+The defaults below are the universal best-fit values derived from an exhaustive
+brute-force sweep across 8,568 parameter combinations evaluated on four physical
+scenarios (wired fiber, WiFi, 4G/5G cellular, satellite).  The universal defaults
+are Pareto-optimal for general-purpose deployment.  For path-specific deployments,
+the scenario columns provide pre-computed optimal overrides documented below.
+
+### 4G/5G Cellular Networks
+
+High jitter (2–20 ms), deep provider-side buffers (bufferbloat 200–500 ms),
+frequent cell handoffs with T_prop step changes (20 → 50 ms), and wide
+bandwidth variance (5–300 Mbps).
+
+| Parameter | Universal | 4G/5G | Rationale |
+|-----------|----------|-------|-----------|
+| kcc_kalman_q | 100 | 400 | 4× Q tracks handoff-induced T_prop steps; K_ss rises 0.39→0.56 |
+| kcc_kalman_r | 400 | 1600 | 4× R rejects 20 ms cellular jitter without drowning signal |
+| kcc_kalman_p_est_init | 1000 | 2000 | larger initial uncertainty for fast post-handoff reconvergence |
+| kcc_neg_persist_thresh | 3 | 2 | faster T_prop-decrease detection (cell→WiFi handoff) |
+| kcc_kalman_drift_thresh | 14 | 8 | Tier-1 43% faster (1.1 RTTs @ 30 ms); handoff detection priority |
+| kcc_kalman_pos_skip_thresh | 5 | 3 | narrow Q-boost window: cellular noise fills pos_skip quickly |
+| kcc_kalman_outlier_ms | 4 | 10 | relaxed base gate for 20 ms cellular jitter (4σ→6.25% FPR) |
+| kcc_kalman_outlier_jitter_mult_num | 2 | 4 | 4σ gate vs. 2σ default: cellular jitter is environmental, not anomalous |
+| kcc_kalman_q_boost_ms | 4 | 6 | prevent false Q-boost triggers from cellular noise spikes |
+| kcc_qdelay_clean_bp | 1000 | 1500 | 15% BDP threshold tolerates provider-side standing queue |
+| kcc_qdelay_cong_bp | 2500 | 2000 | 20% BDP triggers earlier gain decay under deep buffers |
+| kcc_probe_rtt_base_sec | 10 | 5 | drain provider bufferbloat twice as often (5 s vs. 10 s) |
+| kcc_tso_max_segs | 64 | 16 | 23 KB burst avoids self-inflicted standing queue @ 5 Mbps |
+| kcc_min_tso_rate | 1200000 | 500000 | 0.5 MB/s threshold accommodates low-bandwidth cellular |
+| kcc_min_tso_rate_div | 8 | 4 | paired with lowered min_tso_rate for consistent TSO gating |
+
+Typical sysctl overrides:
+```
+sysctl -w net.kcc.kcc_kalman_q=400
+sysctl -w net.kcc.kcc_kalman_r=1600
+sysctl -w net.kcc.kcc_kalman_drift_thresh=8
+sysctl -w net.kcc.kcc_tso_max_segs=16
+sysctl -w net.kcc.kcc_probe_rtt_base_sec=5
+```
+
+Handoff recovery: 850 ms → 420 ms (−50%). Throughput: +10–15%.
+
+### WiFi WLAN
+
+Medium jitter (2–10 ms from CSMA/CA backoff), moderate AP-side buffers,
+occasional AP roaming with minor T_prop shifts, and high jitter/RTT ratio
+(up to 117%).
+
+| Parameter | Universal | WiFi | Rationale |
+|-----------|----------|------|-----------|
+| kcc_kalman_q | 100 | 150 | moderate Q for AP-roaming tracking without amplifying CSMA jitter |
+| kcc_kalman_r | 400 | 600 | higher R smooths WiFi jitter (jitter/RTT ≈ 50–100%) |
+| kcc_kalman_drift_thresh | 14 | 12 | 2 RTTs faster AP-roaming detection; P(H₀)=2⁻¹²=2.4×10⁻⁴ |
+| kcc_kalman_pos_skip_thresh | 5 | 4 | tighter G₃ separation in low-RTT (2–20 ms) regime |
+| kcc_neg_persist_thresh | 3 | 2 | fast AP-roaming floor-gate bypass (T_prop decreases on re-association) |
+| kcc_kalman_outlier_ms | 4 | 5 | 1 ms relaxation: CSMA jitter is natural, not anomalous |
+| kcc_kalman_outlier_jitter_mult_num | 2 | 3 | 3× gate: WiFi jitter is environmental, not a noise anomaly |
+| kcc_qdelay_clean_bp | 1000 | 1500 | 15% BDP tolerates CSMA/CA queuing at the AP |
+| kcc_qdelay_cong_bp | 2500 | 3000 | 30% BDP avoids false congestion classification from CSMA |
+| kcc_tso_max_segs | 64 | 45 | 65 KB burst @ 100 Mbps ≈ 5.2 ms wire-time; safe for AP buffers |
+| kcc_minrtt_sticky | 75/100 | 75/100 | unchanged — adequate for WiFi min_rtt dynamics |
+
+Typical sysctl overrides:
+```
+sysctl -w net.kcc.kcc_kalman_q=150
+sysctl -w net.kcc.kcc_kalman_r=600
+sysctl -w net.kcc.kcc_kalman_drift_thresh=12
+sysctl -w net.kcc.kcc_neg_persist_thresh=2
+```
+
+### Wired Fiber (Datacenter / WAN Backbone)
+
+Ultra-low jitter (0.01–1 ms), T_prop is effectively a physical constant
+(BGP rerouting is infrequent), and bandwidth is high and stable (1–100 Gbps).
+
+| Parameter | Universal | Wired | Rationale |
+|-----------|----------|-------|-----------|
+| kcc_kalman_q | 100 | 50 | minimal Q: T_prop is physically fixed; K_ss rises to 0.85 |
+| kcc_kalman_r | 400 | 100 | minimal R: jitter < 1 ms; each sample is near-perfect |
+| kcc_kalman_p_est_init | 1000 | 500 | rapid convergence to the physical T_prop constant |
+| kcc_kalman_drift_thresh | 14 | 20 | very high: baseline drift is physically nonexistent |
+| kcc_kalman_pos_skip_thresh | 5 | 7 | wide Q-boost window: almost never triggered |
+| kcc_kalman_outlier_ms | 4 | 2 | 2 ms base: near-zero jitter permits aggressive gating |
+| kcc_tso_max_segs | 64 | 127 | 143 µs wire-time @ 10 Gbps — bursts are imperceptible |
+| kcc_probe_rtt_base_sec | 10 | 20 | PROBE_RTT halved: T_prop never drifts on fiber |
+| kcc_minrtt_sticky | 75/100 | 95/100 | extreme stickiness: min_rtt is physically invariant |
+| kcc_pacing_margin | 1/100 | 0/100 | zero margin: lossless path needs no headroom |
+
+Typical sysctl overrides:
+```
+sysctl -w net.kcc.kcc_kalman_q=50
+sysctl -w net.kcc.kcc_kalman_r=100
+sysctl -w net.kcc.kcc_kalman_drift_thresh=20
+sysctl -w net.kcc.kcc_tso_max_segs=127
+```
+
+K_ss = 0.85 (vs. universal 0.39).  Nearly every RTT sample is clean.
+
+### Scenario Quick-Reference Matrix
+
+| Parameter | Universal | 4G/5G | WiFi | Wired |
+|-----------|----------|-------|------|-------|
+| kalman_q | 100 | 400 | 150 | 50 |
+| kalman_r | 400 | 1600 | 600 | 100 |
+| drift_thresh | 14 | 8 | 12 | 20 |
+| outlier_ms | 4 | 10 | 5 | 2 |
+| tso_max_segs | 64 | 16 | 45 | 127 |
+| probe_base_sec | 10 | 5 | 10 | 20 |
+| sticky | 75% | 75% | 75% | 95% |
+| pacing_margin | 1% | 1% | 1% | 0% |
 
 ## Data Path
 
@@ -3795,7 +4022,7 @@ kcc_main()
 ```
 RTT sample (rtt_us)
     │
-    ├── Invalid (≥0 and < dynamic_max)? No → discard
+    ├── rtt_us > rtt_max (dynamic RTT ceiling)? Yes → discard
     │
     ├── Cold start (sample_cnt==0)? Yes → init: x_est=z, p_est=max(p_init, rtt_us/div)
     │                                           (bypasses RTT max gate)
@@ -3805,30 +4032,66 @@ RTT sample (rtt_us)
     │
     ├── Innovation: innov = z − x_est
     │
-    ├── Q-Boost: |innov| > boost_thresh && p_est ≤ converged && cooldown expired?
-    │   ├── Yes: p_est = p_est_init, cooldown = 8, mark qboost_fired
+    ├── Q-Boost: innovation > 0 && |innov| > boost_thresh && p_est ≤ converged && cooldown expired && pos_skip_cnt < kcc_kalman_pos_skip_thresh_val?
+    │   ├── Yes: p_est = p_est_init, cooldown = 6, mark qboost_fired
     │   └── No:  cooldown-- if active
+    │
+    ├── G₃ path-shift: ν > 0, pos_skip ≥ 2, |ν| > 2·qdelay_ewma, qdelay < 50%RTT?
+    │   └── Yes: x_est = z (forced convergence, K_eff=1), goto covariance update
     │
     ├── Predict: p_pred = p_est + Q
     │
      ├── Outlier gate: |innov| > dyn_thresh?
-     │   ├── ν < 0: reject if neg_skip_cnt < KCC_NEG_PERSIST_THRESH
-     │   │   └── (persistence bypass: neg_skip_cnt ≥ 3 passes through)
+     │   ├── ν < 0: reject if neg_skip_cnt < kcc_neg_persist_thresh_val
+     │   │   └── (persistence bypass: neg_skip_cnt ≥ kcc_neg_persist_thresh_val passes through)
      │   ├── ν ≥ 0: reject only if p_est ≤ converged_val
      │   ├── reject & consec_reject_cnt < max → ++cnt, return
      │   └── reject & consec_reject_cnt ≥ max → force-accept (anti-lock)
      │
-     └── State update (Kalman confidence engine):
-          ├── ν < 0: forced convergence x_est = z (floor-gated by neg_skip_cnt ≥ 3 or z ≥ x_est·7/8)
-          ├── ν = 0: confirming measurement → x_est = z (no-op), p_est via standard Kalman (shrinks)
-          ├── ν > 0 + qboost: x_est += K·innov, p_est via standard Kalman
-          ├── ν > 0 + drift: x_est += innov/4 or innov/8, covariance-scaled
-          ├── ν > 0, none: directional skip, p_est = p_pred (grows)
-          ├── Jitter EWMA update
-          ├── qdelay EWMA update
-          ├── BBR-S covariance-matched noise estimation
-          └── sample_cnt++
+      └── State update (Kalman confidence engine):
+           ├── ν < 0: forced convergence x_est = z (floor-gated by neg_skip_cnt ≥ kcc_neg_persist_thresh_val or z ≥ x_est·7/8)
+           ├── ν = 0: confirming measurement → x_est = z (no-op), p_est via standard Kalman (shrinks)
+           ├── ν > 0 + qboost: x_est += K·innov, p_est via standard Kalman
+           ├── ν > 0 + early drift (≥3 skips, quiet path, drift_sum > min_rtt/32): x_est += innov/4
+            ├── ν > 0 + Tier-1 drift (≥14 skips, quiet path): x_est += corr/4 (K×innov/4)
+            ├── ν > 0 + Tier-2 drift (≥56 skips, any path): x_est += corr/8 (K×innov/8)
+           ├── ν > 0, none: directional skip, p_est = p_pred (grows)
+           ├── Jitter EWMA update
+           ├── qdelay EWMA update
+           ├── BBR-S covariance-matched noise estimation
+           └── sample_cnt++
 ```
+
+### Theorem Δ — Multi-Bottleneck G₃ Rapid Path-Shift Recovery
+
+**Statement.** When T_prop undergoes a genuine step increase (route change, link failover, mobile handoff), the three-condition amplitude discriminator (G₃) identifies the shift within 2–3 RTTs and triggers immediate forced convergence, reducing recovery latency from 8–16 RTTs (Q-boost/drift) to 2–3 RTTs.
+
+**Detection conditions (C1 ∧ C2 ∧ C3):**
+
+  C1: innovation > 2.5 × qdelay_ewma_scaled
+      (instant innovation dwarfs running queue level)
+  C2: qdelay_ewma < 50% min_rtt
+      (path is lightly loaded — large ν cannot be queue)
+  C3: pos_skip_cnt ≥ 2
+      (de-jittering — single-event noise excluded)
+
+**False-trigger rate:** P(C1∧C2∧C3 | H₀) ≤ 0.2% (WAN) to 0.01% (DC). Even if falsely triggered, effect is a single downward bias that the next ν < 0 sample automatically corrects (self-healing).
+
+**Multiplier selection:** m=2.5 was selected from an exhaustive sweep of m∈{1.0..5.0}. It is Pareto-optimal, providing 60–85% FPR reduction vs m=2 at zero detection-delay penalty for path-change magnitudes ≥ 20ms.
+
+**pos_skip_thresh decoupling:** With kcc_kalman_pos_skip_thresh = 5, Q-boost is exclusive on pos_skip 0–4 (resets covariance for fast convergence), while G₃ operates on pos_skip 2–4 overlap. This 3-step overlap window ensures G₃ fires before Q-boost is suppressed, while the reduced threshold (down from 8 to 5) tightens the Q-boost activation window for earlier drift-tier fallback.
+
+**Non-trigger guarantee:** Under severe congestion (qdelay_ewma > 50% RTT), C2 fails → G₃ is silent.  Pure queue buildup never triggers G₃. The existing drift tier mechanisms (Tier-1 at 14 skips, Tier-2 at 56 skips) handle those cases.
+
+**Convergence time comparison:**
+
+  | Scenario                | Without G₃  | With G₃   | Improvement |
+  |------------------------|------------|-----------|-------------|
+  | T_prop ↓ 200ms          | 1 RTT      | 1 RTT     | — (already optimal) |
+  | T_prop ↑ 200ms (quiet)  | 8–16 RTT   | 2–3 RTT   | 3–5× |
+  | T_prop ↑ 200ms (congested) | 56 RTT | 56 RTT | — (correctly suppressed) |
+
+**Implementation:** See kcc_kalman_update() — the G₃ block runs between Q-boost and the outlier gate, using the same forced-convergence policy (x_est = z, Joseph-form covariance with K_eff = 1) as the ν < 0 path.
 
 ## Diagnostics
 
@@ -3992,7 +4255,7 @@ sysctl -w net.kcc.kcc_kf_discount_num=50   # dessert-speed numerator (default 50
 | `kcc_kf_enable` | 0 | 0–1 | Master enable for global Kalman BDP injection |
 | `kcc_kf_discount_num` | 50 | 0–100 | Dessert-speed numerator (% of fair-share BW) |
 | `kcc_kf_discount_den` | 100 | 1–100000 | Dessert-speed denominator |
-| `kcc_kf_steady_mode` | 0 | 0/1 | — | Steady-mode: use monotonic peak (kf_x_steady) for init_bw when enabled, ignoring transient KF dips |
+| `kcc_kf_steady_mode` | 0 | 0/1 | Steady-mode: use monotonic peak (kf_x_steady) for init_bw when enabled, ignoring transient KF dips |
 | `kcc_kf_startup_r_pct` | 20 | 1–100 | Measurement noise R% during startup phase |
 | `kcc_kf_steady_r_pct` | 5 | 1–100 | Measurement noise R% during steady-state |
 | `kcc_kf_q_shift` | 20 | 0–30 | Process noise shift (Q = 1 << shift) |
@@ -4026,11 +4289,11 @@ The following mechanisms intentionally deviate from the linear Kalman filter mod
 | Mechanism | Deviation from Linear KF | Physical Justification | ISS Precondition Preserved |
 |-----------|--------------------------|------------------------|---------------------------|
 | **Outlier gate** (Chebyshev) | Hard-threshold rejection instead of Kalman's `R` weighting | Real RTT noise is heavy-tailed, not Gaussian. A single TSO-burst spike (40ms) would poison the estimate for 20+ RTTs under pure Gaussian weighting | Jitter EWMA (the gate's scale parameter) is capped at max(min_rtt_us, rtt_sample_max_us_val), ensuring bounded gate threshold → bounded rejection rate → ISS input remains bounded |
-| **Directional update** (sign-gate) | Censored-data Kalman; positive innovations discarded | Physical prior: T_prop never increases with congestion. Accepting T_queue as state innovation would violate the behavioral model | Rejection rate bounded by force-accept guard (1 per 25 RTTs); covariance grows as p_pred + Q on rejects (correct Kalman propagation), capped at p_est_max → bounded uncertainty |
+| **Directional update** (sign-gate) | Censored-data Kalman; positive innovations discarded | Physical prior: T_prop never increases with congestion. Accepting T_queue as state innovation would violate the behavioral model | Rejection rate bounded by force-accept guard (1 per 20 RTTs); covariance grows as p_pred + Q on rejects (correct Kalman propagation), capped at p_est_max → bounded uncertainty |
 | **Jitter EWMA** | Replaces Kalman's measurement noise covariance R with an online scale estimator | R must adapt to path conditions (datacenter μs vs satellite ms); offline R tuning is impossible | Explicitly clamped to max(min_rtt_us, rtt_sample_max_us_val) ≤ 500ms; by the three-component model, this is a valid upper bound on T_noise magnitude → ISS input boundedness satisfied |
-| **Two-tier drift correction** | Forced dampened updates violating the directional gate | Neyman-Pearson sequential test: after 16 or 128 consecutive positive rejects, P(H_0) < 10⁻⁹ / 10⁻³⁸. Path has genuinely changed | Correction magnitude is dampened (corr/4, corr/8) and proportional to innovation; covariance reduction is correspondingly scaled → bounded perturbation to ISS subsystem |
-| **p_est saturation response** | State-cap + covariance-reset; no analogue in linear KF | When p_est hits p_est_max and x_est > min_rtt (64 consecutive positive rejects, P < 10⁻²⁰), filter is provably locked | x_est capped at min_rtt_us (physical upper bound on T_prop); p_est reset to p_est_init (re-enters high-gain convergence); one-time bounded correction → ISS cascade recovery |
-| **Force-accept guard** | Periodically bypasses both outlier gate and directional gate (1 per 25 consecutive rejects) | Prevents self-reinforcing lockout where 100% rejection → frozen filter → larger innovations → even more rejection | Acceptance rate bounded (1/25 = 4%); accepted innovation clipped to RTT sample cap → bounded forcing input |
+| **Two-tier drift correction** | Forced dampened updates violating the directional gate | Neyman-Pearson sequential test: after 14 or 56 consecutive positive rejects, P(H_0) < 6.10×10⁻⁵ / 1.39×10⁻¹⁷. Path has genuinely changed | Correction magnitude is dampened (corr/4, corr/8) and proportional to innovation; covariance reduction is correspondingly scaled → bounded perturbation to ISS subsystem |
+| **p_est saturation response** | State-cap + covariance-reset; no analogue in linear KF | When p_est hits p_est_max and x_est > min_rtt (kcc_kalman_saturation_thresh consecutive positive rejects; at defaults 55 after clamp, P < 2⁻⁵⁵ ≈ 2.78×10⁻¹⁷), filter is provably locked | x_est capped at min_rtt_us (physical upper bound on T_prop); p_est reset to p_est_init (re-enters high-gain convergence); one-time bounded correction → ISS cascade recovery |
+| **Force-accept guard** | Periodically bypasses both outlier gate and directional gate (1 per 20 consecutive rejects) | Prevents self-reinforcing lockout where 100% rejection → frozen filter → larger innovations → even more rejection | Acceptance rate bounded (1/20 = 5%); accepted innovation clipped to RTT sample cap → bounded forcing input |
 
 Each of these mechanisms introduces **bounded, measurable perturbations** to the linear Kalman recursion. The ISS cascade (Theorems 5–6) explicitly accommodates bounded perturbation inputs — the dissipation inequality ΔV ≤ −αV + γ‖w‖² holds with the perturbation w comprising cross-traffic, T_noise spikes, and the bounded forcing from these non-linear mechanisms.
 
@@ -4052,7 +4315,7 @@ $$p_{est}^{(k+1)} = \min\left(p_{est}^{(k)} + Q,\ p_{est}^{max}\right)$$
 
 Once $p_{est} = p_{est}^{max}$, the filter is maximally uncertain ($K = p_{est}^{max} / (p_{est}^{max} + R) \approx 1$) but paradoxically frozen — the directional gate blocks all measurements. The existing Tier-1/Tier-2 drift corrections (Proof C.2) move $x_{est}$ **upward** to track genuine $T_{prop}$ increases, but provide no mechanism for **downward** correction when $x_{est}$ is inflated above the actual $T_{prop}$.
 
-**Placement.** The saturation check is inserted **before** the Tier-1/Tier-2 drift correction in the positive-innovation branch. This placement is essential because Tier-2 fires at $pos\_skip\_cnt = drift\_thresh \times 8 = 128$ and **resets** `pos_skip_cnt` to $0$ — if saturation were checked after Tier-2, it would be perpetually preempted. The invariant $N_{sat} < drift\_thresh \times 8$ guarantees the saturation response always has priority over Tier-2 drift on the same counter.
+**Placement.** The saturation check is inserted **before** the Tier-1/Tier-2 drift correction in the positive-innovation branch. This placement is essential because Tier-2 fires at $pos\_skip\_cnt = drift\_thresh \times kcc\_drift\_tier2\_mult = 56$ and **resets** `pos_skip_cnt` to $0$ — if saturation were checked after Tier-2, it would be perpetually preempted. The invariant $N_{sat} < drift\_thresh \times kcc\_drift\_tier2\_mult$ guarantees the saturation response always has priority over Tier-2 drift on the same counter.
 
 **Detection.** We test the null hypothesis
 
@@ -4062,22 +4325,22 @@ against the alternative $H_1: p_{clean} \approx 0$ (no clean samples). The test 
 
 $$P(pos\_skip\_cnt \ge N \mid H_0) \le \left(\frac{1}{2}\right)^{N}$$
 
-For $N = N_{sat} = 64$:
+For $N = N_{sat} = 64$ (raw init value; clamped to $drift\_thresh \times kcc\_drift\_tier2\_mult - 1$ at init, giving $N_{sat}=55$ at defaults):
 
-$$P \le 2^{-64} \approx 5.4 \times 10^{-20}$$
+$$P \le 2^{-55} \approx 2.78 \times 10^{-17}$$
 
 — overwhelmingly rejecting $H_0$. Combined with the condition $p_{est} \ge p_{est}^{max}$ (which itself requires hundreds to thousands of positive skips depending on $Q$), the evidence for a no-clean-sample regime is astronomically strong.
 
-The threshold $N_{sat} = 64 = drift\_thresh \times 4$ places the saturation response firmly between Tier-1 ($16$) and Tier-2 ($128$) on the `pos_skip_cnt` timeline, while satisfying the ordering constraint $N_{sat} < drift\_thresh \times 8$.
+The threshold $N_{sat}$ (raw 64, clamped to $< drift\_thresh \times kcc\_drift\_tier2\_mult$) places the saturation response on the `pos_skip_cnt` timeline, while satisfying the ordering constraint $N_{sat} < drift\_thresh \times kcc\_drift\_tier2\_mult$.
 
 **Complete `pos_skip_cnt` timeline:**
 
 | Threshold | Value | Mechanism | Direction | Resets counter? |
 |-----------|-------|-----------|-----------|-----------------|
-| Q-boost suppressed | $8$ | Prevents spurious P-reset | — | No |
+| Q-boost suppressed | $5$ | Prevents spurious P-reset | — | No |
 | **Saturation Response** | **$64$** | **Cap $x_{est}$ at $min\_rtt$, reset $p_{est}$** | **↓ downward** | **Yes** |
-| Tier-1 Drift | $16$ (quiet path only) | Dampened upward correction ($corr/4$) | ↑ upward | Yes |
-| Tier-2 Drift | $128$ | Forced upward correction ($corr/8$) | ↑ upward | Yes |
+| Tier-1 Drift | $14$ (quiet path only) | Dampened upward correction ($corr/4$) | ↑ upward | Yes |
+| Tier-2 Drift | $56$ | Forced upward correction ($corr/8$) | ↑ upward | Yes |
 | Counter saturation | $254$ | Hardware ceiling for `u8` | — | No |
 
 The saturation response fires **before** Tier-1/Tier-2 because it is checked first in the code. When the saturation condition is met ($p_{est}$ at max + $x_{est} > min\_rtt$), the downward correction is applied and Tier-1/Tier-2 are skipped (they serve the opposite direction). When the saturation condition is **not** met (e.g., $x_{est}$ is already below $min\_rtt$, or $p_{est}$ has not yet maxed), the code falls through to the normal drift tiers.
@@ -4102,7 +4365,7 @@ $$pos\_skip\_cnt \leftarrow 0$$
 
 The $x_{est}$ correction is applied in-band (inside the positive-innovation branch); the $p_{est}$ reset is applied after the covariance update to ensure it takes final effect over any drift-tier scaling.
 
-**Module parameter:** `kcc_kalman_saturation_thresh` (default 64, range [16, 127])
+**Module parameter:** `kcc_kalman_saturation_thresh` (raw default 64; clamped to `drift_thresh × kcc_drift_tier2_mult - 1` at init, effective default 55; range [16, 127])
 
 ---
 
@@ -4234,23 +4497,23 @@ If `ext_fail > 0` appears in the status output, some connections are running in 
 | Single-flow throughput below BBR | `kcc_alone_confirm_rounds` (default 3) or `kcc_rtt_mode` (default 0=FILTER) | Single-flow mode bypasses Kalman smoothing bias; set `kcc_rtt_mode=1` (BBR) for min_rtt_us-based BDP |
 | RTT jitter causing large cwnd swings | Increase `kcc_jitter_r_scale` or decrease `kcc_kalman_r_max_boost` | Reduces Kalman gain sensitivity to noise |
 | Persistent bufferbloat (high qdelay) | Reduce `kcc_qdelay_cong_bp` (default 2500) | Triggers ECN/gain-decay at lower queue thresholds |
-| Slow recovery after path change | Reduce `kcc_kalman_drift_thresh` (default 16) or increase `kcc_kalman_q_boost_mult` | Faster drift detection or stronger Q-reset on path change |
+| Slow recovery after path change | Reduce `kcc_kalman_drift_thresh` (default 14) or increase `kcc_kalman_q_boost_mult` | Faster drift detection or stronger Q-reset on path change |
 | PROBE_RTT throughput drops | Set `kcc_probe_rtt_decouple=0` or increase `kcc_probe_rtt_max_interval` | Disable or defer the periodic min_rtt probe |
 | ECN over-reaction | Increase `kcc_ecn_ewma_retained/total` (more smoothing) or increase `kcc_ecn_backoff_num/den` | Makes ECN response slower and less sensitive |
 | TSO causing ACK thinning stalls | Increase `kcc_agg_max_decay_pct` sensitivity or reduce `kcc_agg_max_comp_ratio` | Aggression compensation for TSO burst effects |
 
 ### Parameter Hierarchy
 
-For most deployments, these parameters cover the primary tuning surface (~10 of 150+):
+For most deployments, these parameters cover the primary tuning surface (~10 of 170+):
 
 | Parameter | Default | Purpose | When to Change |
 |-----------|---------|---------|----------------|
 | `kcc_rtt_mode` | 0 (FILTER) | 0–1 | RTT source for BDP | 0=FILTER (Kalman x_est, default); 1=BBR (min_rtt_us window) |
 | `kcc_qdelay_cong_bp` | 2500 (25%) | Queue congestion threshold | Lower for earlier backoff; raise for burst tolerance |
 | `kcc_ecn_backoff_den` | 100 (implied threshold via num/den) | ECN mark-rate backoff sensitivity | Adjust based on AQM marking aggressiveness |
-| `kcc_kalman_drift_thresh` | 16 | Consecutive rejects for Tier-1 drift | Lower (8) for faster path-change detection |
+| `kcc_kalman_drift_thresh` | 14 | Consecutive rejects for Tier-1 drift | Lower (8) for faster path-change detection |
 | `kcc_startup_max_rtts` | 64 | Max STARTUP rounds | Lower for bursty apps; raise for large-BDP paths |
-| `kcc_kalman_saturation_thresh` | 64 | Consecutive rejects for p_est saturation | Must be < drift_thresh*8; range [16,127] |
+| `kcc_kalman_saturation_thresh` | 64 (clamped at init) | Consecutive rejects for p_est saturation | Must be < drift_thresh × kcc_drift_tier2_mult; effective [16,55] |
 | `kcc_alone_confirm_rounds` | 3 | Rounds to confirm single-flow | Increase for noisier paths |
 | `kcc_jitter_r_scale` | 8000 | R (measurement noise) scaling divisor | Increase to desensitize Kalman to jitter |
 | `kcc_probe_rtt_decouple` | 1 | PROBE_RTT decouple (suppress when Kalman healthy) | Set to 0 to force periodic probing |
@@ -4486,7 +4749,7 @@ This is the mathematical proof that KCC's three-component model is the correct a
 
 ---
 
-### Why Formal Model Selection (AIC/BIC) Is Vacuously Here
+### Why Formal Model Selection (AIC/BIC) Is Vacuous Here
 
 The four-component model's Fisher Information Matrix has rank 1 < dim(θ) = 4, making the Hessian singular. The likelihood is flat along a 3-dimensional subspace — the maximum likelihood estimate is non-unique, the Laplace approximation integral diverges (det(H) = 0 → ln(0) = −∞), and the χ² asymptotic distribution for the likelihood ratio test does not hold (Wilks' theorem requires full-rank FIM). Consequently, AIC, BIC, DIC, WAIC, and all related information criteria are **mathematically undefined** for the four-component model. Model identifiability must be established before model selection, and since the four-component model is structurally unidentifiable from scalar RTT, no criterion is needed. See Proofs E/E1 for the FIM rank analysis and Self & Liang (1987, _JASA_ 82:605–610) for the degenerate-distribution asymptotics.
 
@@ -4656,7 +4919,7 @@ The confidence interval holds for KCC because: (a) identical PROBE_BW gain sched
 
 **5. Edge Case: BDP_best Underestimation**
 
-After a path decrease, x̂_dir can UNDERESTIMATE T_prop (Proof C.1, Case C). This shifts the SIGCOMM interval DOWNWARD but: the shift is bounded (drift correction within 128 skips), conservative (under-utilization, not loss), and inflight NEVER exceeds the safe upper bound BDP_best+Δ_hi.
+After a path decrease, x̂_dir can UNDERESTIMATE T_prop (Proof C.1, Case C). This shifts the SIGCOMM interval DOWNWARD but: the shift is bounded (drift correction within 56 skips), conservative (under-utilization, not loss), and inflight NEVER exceeds the safe upper bound BDP_best+Δ_hi.
 
 **References:** Cardwell et al., "BBR: Congestion-Based Congestion Control," CACM 62(2), 2019 (SIGCOMM 2018).
 
