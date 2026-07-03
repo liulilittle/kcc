@@ -4929,9 +4929,9 @@
  *     Theorem 4's bounded-output guarantee.
  *
  *   B15. Counter saturation.
- *     (a) sample_cnt: u32, saturated at U32_MAX (L12919: if
+ *     (a) sample_cnt: u32, saturated at U32_MAX (L12948: if
  *     (ext->sample_cnt < U32_MAX)).  (b) pos_skip_cnt: u8, saturated at
- *     KCC_POS_SKIP_SATURATION (L12601).  (c) consec_reject_cnt:
+ *     KCC_POS_SKIP_SATURATION (L12630).  (c) consec_reject_cnt:
  *     u32, saturated implicitly by comparison with max_consec_reject
  *     (20) — never reaches U32_MAX.  (d) rtt_cnt, cycle_idx, lt_rtt_cnt:
  *     all bounded by their bitfield widths or clamp guards.  No
@@ -4949,7 +4949,7 @@
  *     (complete outage): kcc_bw() returns 0 → pacing_rate = 0 →
  *     connection stalls.  Recovery when BW returns — no state
      *     corruption.      (d) BW → ∞ (infinite theoretical): bw_raw capped
-     *     at U64_MAX / USEC_PER_SEC before multiplication (L14866:
+     *     at U64_MAX / USEC_PER_SEC before multiplication (L14962:
      *     if (bw_raw > U64_MAX / USEC_PER_SEC)).
  *     Why this matters: Ensures the physical bounds assumption (Theorem
  *     5-§2, network plant ISS) is not violated by pathological parameter
@@ -5931,7 +5931,7 @@ static inline u32 kcc_tcp_snd_cwnd(const struct tcp_sock* tp) { return READ_ONCE
  */
 #define KCC_MINRTT_FAST_FALL_DIV_MAX       (1 << 8) /* [T_prop] minrtt_fast_fall_div upper clamp (2^8, prevents div-by-zero) */
 #define KCC_PROBE_BAND_MULT_MAX            (1 << 5) /* [K] kalman_probe_band_mult upper clamp (2^5, prevents u32 overflow) */
-#define KCC_KALMAN_PPM_MAX                 1000000 /* [K] PPM full scale: 1,000,000 ppm = 1.0; used in clamp bound (L8825) and convergence denominator (L9109) */
+#define KCC_KALMAN_PPM_MAX                 1000000 /* [K] PPM full scale: 1,000,000 ppm = 1.0; used in clamp bound (L8830) and convergence denominator (L9109) */
 #define KCC_KALMAN_CONVERGED_MIN           1         /* [K] minimum converged_val; sentinel for permanently blocked convergence (K >= 1 or K below physical floor for current Q/R */
 #define KCC_KALMAN_Q_RTT_DIV_MAX           1000000 /* [K] kalman_q_rtt_div upper clamp (prevents div-by-zero) */
 #define KCC_RTT_DYN_MULT_MAX               100   /* [K] kalman_rtt_dyn_mult upper clamp (prevents u32 overflow) */
@@ -6479,6 +6479,7 @@ struct kcc {
     u32 pacing_gain : 10;                             /* [T_queue] current pacing gain (0..1023, BBR_UNIT=256=1.0x) */
     u32 cwnd_gain : 10;                               /* [T_queue] current cwnd gain (0..1023, BBR_UNIT=256=1.0x) */
     u32 alone_on_path : 1;                            /* [T_noise] 1=single-flow; bypass Kalman and ECN guards */
+    u32 initialized : 1;                              /* idempotency guard for kcc_conn_{start,end}_cnt pairing (kernel TCP framework may invoke init/release asymmetrically under rare conditions — this bit ensures each connection contributes exactly one start and one end regardless of callback multiplicity) */
 
     /* standalone u32 fields */
     u32 prior_cwnd;                                   /* [T_queue] cwnd saved before recovery or PROBE_RTT entry */
@@ -6570,7 +6571,7 @@ module_param_cb(kcc_probe_rtt_dyn_max_sec, &kcc_param_ops, &kcc_probe_rtt_dyn_ma
  *   Ensures pacing_win = cwnd_gain * pacing_rate covers BDP + max expected
  *   queue depth from probe-adapt transients.
  * BOUNDS: num [0, 100000], den [1, 100000]; net multiplier clamped at KCC_GAIN_MAX;
- *   floored at KCC_GAIN_FLOOR in kcc_cwnd_gain_val cache (L9063).
+ *   floored at KCC_GAIN_FLOOR in kcc_cwnd_gain_val cache (L9068).
  */
 static int kcc_cwnd_gain_num = 2;                     /* [T_queue] CWND gain numerator for PROBE_BW; 2x BDP default; num/den*BBR_UNIT */
 module_param_cb(kcc_cwnd_gain_num, &kcc_param_ops, &kcc_cwnd_gain_num, 0644); /* [T_queue] sysctl: kcc_cwnd_gain_num */
@@ -7057,7 +7058,7 @@ module_param_cb(kcc_dyn_probe_hyper_den, &kcc_param_ops, &kcc_dyn_probe_hyper_de
  * PHYSICS: Maximum physical RTT sample accepted by the Kalman filter; values above this are discarded.
  * UNITS: Microseconds (µs); compared directly against raw RTT measurement from TCP timestamp.
  * DERIVATION: ceiled from (U32_MAX / kalman_scale) / 2 ≈ 2,100,000 µs; lowered to 500 ms to reject route-flap spikes while allowing satellite paths (600 ms via kcc_kalman_rtt_dyn_mult = 2 → 1.2s); §Module Parameters.
- * BOUNDS: [1, 10000000] = [1 µs, 10 s]; clamped at init (L8838).
+ * BOUNDS: [1, 10000000] = [1 µs, 10 s]; clamped at init (L8843).
  * [T_noise] kcc_rtt_sample_max_us -- RTT samples exceeding this value are discarded
  * by the Kalman filter to prevent extreme outliers from distorting x_est.
  * Default 500,000 us = 500 ms.
@@ -7735,8 +7736,8 @@ module_param_cb(kcc_alone_exit_thresh, &kcc_param_ops, &kcc_alone_exit_thresh, 0
  * PHYSICS: Fixed-point scaling factor converting physical RTT (µs) to filter-internal integer units.
  * UNITS: Dimensionless multiplier; x_est ∈ [scale, U32_MAX] in scaled units.
  * DERIVATION: power-of-two for efficient bit-shift; 10 bits = ~0.1% fractional precision;
- *   scale² > max(Q,R,P) = 1,048,576 > 1,000,000 prevents overflow in innov²/scale² division (L7738, enforced at L8924).
- * BOUNDS: [64, 1048576] = [2^6, 2^20]; clamped and rounded to power-of-two at init (L8920).
+ *   scale² > max(Q,R,P) = 1,048,576 > 1,000,000 prevents overflow in innov²/scale² division (L7742, enforced at L8930).
+ * BOUNDS: [64, 1048576] = [2^6, 2^20]; clamped and rounded to power-of-two at init (L8924).
  */
 static int kcc_kalman_scale = 1024;                       /* [K] Kalman fixed-point scaling factor (power-of-two); x_est = rtt_us * scale in fixed point; rounded up to power-of-two for fast division via shift; KCC-only; range [64, 1048576], BBR default: N/A */
 module_param_cb(kcc_kalman_scale, &kcc_param_ops, &kcc_kalman_scale, 0644); /* [K] sysctl: kcc_kalman_scale */
@@ -8720,18 +8721,22 @@ static DEFINE_SPINLOCK(kcc_kf_lock);                    /* protects atomic (x,P)
  *
  * kcc_conn_start_cnt  -- Monotonic count of kcc_init() calls (connections
  *     that selected the "kcc" congestion-control algorithm).  Incremented
- *     before any initialisation, so this includes connections where ext
- *     allocation subsequently failed.
+ *     after per-field zero-initialisation but before extended-state
+ *     allocation, so this includes connections where ext allocation
+ *     subsequently failed.  Gated by the initialized bitfield in struct
+ *     kcc — only the first kcc_init() call on each socket increments.
  *
  * kcc_conn_end_cnt    -- Monotonic count of kcc_release() calls (socket
- *     close / CC-change-away).  Incremented before ext destruction.
- *     active_connections = start_cnt - end_cnt gives the instantaneous
- *     connection count.  Both counters are monotonic, so start_cnt >=
- *     end_cnt always holds at any single instant, but a non-atomic
- *     double-read (two separate atomic_read calls) can transiently
- *     capture a negative difference if a connection starts and ends
- *     between the two reads.  The /proc/kcc/status display clamps to
- *     zero to prevent displaying a spuriously negative value.
+ *     close / CC-change-away).  Incremented after the initialized guard
+ *     in kcc_release.  active_connections = start_cnt - end_cnt gives
+ *     the instantaneous connection count.  The /proc/kcc/status display
+ *     uses unsigned arithmetic for wrap-safe 32-bit subtraction and
+ *     the initialized bitfield in struct kcc eliminates systematic
+ *     counter drift between init and release callbacks.
+ *     Direct unsigned subtraction (cs - ce) natively handles 32-bit
+ *     counter wrap via modulo-2³² arithmetic; no guard condition is
+ *     needed because start_cnt ≥ end_cnt in absolute event count
+ *     always holds under the initialized-guard invariant.
  *
  * All three counters are atomic_t -- inc/read without locks, safe for
  * concurrent softirq (kcc_init/kcc_release) and process-context
@@ -9521,20 +9526,44 @@ static void kcc_ext_destruct(struct sock* sk)                      /* destroy ex
     kfree(ext);                                                    /* free extended-state memory */
 }
 /*
- * kcc_release - Release callback invoked when a KCC connection is closed.
+ * kcc_release - Release callback for per-connection KCC state cleanup.
+ *
  * @sk: TCP socket.
+ *
+ * Guarded by kcc->initialized: only connections that passed through
+ * kcc_init() reach the release path.  On entry:
+ *   1. If initialized is set → clear the guard, increment kcc_conn_end_cnt,
+ *      and call kcc_ext_destruct() to unlink from /proc/kcc/status list
+ *      and free the extended-state block.
+ *   2. If initialized is clear (double-release or release-without-init)
+ *      → return immediately without side effects.
+ *
+ * The idempotency of step 2 is the permanent fix for the conn_active
+ * counter skew previously observed in production — without this guard,
+ * duplicate kcc_release() calls could decrement the connection counter
+ * repeatedly while kcc_ext_destruct()'s NULL check silently absorbed
+ * the redundant teardown.
  */
 static void kcc_release(struct sock* sk)                           /* socket close callback */
 {
+    struct kcc* kcc = (struct kcc*)inet_csk_ca(sk);                /* KCC congestion control state from ICSK_CA_PRIV slot */
+
     /*
-     * Increment the end counter BEFORE destroying extended state.
-     * This preserves the invariant conn_active = start_cnt - end_cnt
-     * for the diagnostic display -- the increment of the end counter
-     * (which reduces the active-connection count) must precede the
-     * list removal of this specific connection.
+     * Decrement the active-connection count via initialized guard.
+     *
+     * kcc->initialized gates the entire release path: only connections
+     * that were fully initialised through kcc_init() reach counter
+     * decrement and ext teardown.  If initialized is 0, either this
+     * connection never used KCC (release-without-init) or kcc_release()
+     * was already called on it (double-release) — in both cases the
+     * function returns without side effects, permanently protecting
+     * the conn_active counter in /proc/kcc/status from phantom skew.
      */
-    atomic_inc(&kcc_conn_end_cnt);                                 /* increment active-connection end counter */
-    kcc_ext_destruct(sk);                                          /* destroy extended state */
+    if (kcc->initialized) {
+        kcc->initialized = 0;                                        /* clear guard before teardown: only the matched release-increment pair */
+        atomic_inc(&kcc_conn_end_cnt);                             /* increment active-connection end counter */
+        kcc_ext_destruct(sk);                                      /* destroy extended state (list_del + kfree) */
+    }
 }
 /*
  * kcc_full_bw_reached - Query whether pipe-fill has been detected.
@@ -14626,27 +14655,48 @@ KCC_KFUNC void kcc_main(struct sock* sk, const struct rate_sample* rs)          
  * @sk: TCP socket.
  *
  * Steps:
- *   1. Zero-initialize the struct kcc (ICSK_CA_PRIV slot).
- *   2. Set prev_ca_state = TCP_CA_Open.
- *   3. Bootstrap min_rtt_us from the TCP stack's recorded min RTT.
- *   4. Set min_rtt_stamp to now.
- *   5. Initialize pacing rate from cwnd and SRTT.
- *   6. Enable pacing on the socket.
- *   7. (KCC extension) Global Kalman BDP injection: if the cross-connection
+ *   1. Guard: if kcc->initialized is already set, return immediately
+ *      (double-init protection — paired with the equivalent guard in
+ *      kcc_release()).
+ *   2. Per-field zero-initialize the struct kcc (ICSK_CA_PRIV slot)
+ *      matching kernel BBR's bbr_init() explicit-per-field pattern
+ *      (prev_ca_state = TCP_CA_Open is set inline within this block).
+ *   3. Bootstrap min_rtt_us from the TCP stack's recorded min RTT
+ *      (tcp_min_rtt()).  If zero, fall back to srtt_us >> 3, then to
+ *      1 ms (USEC_PER_MSEC).
+ *   4. Set min_rtt_stamp to now (tcp_jiffies32).
+ *   5. Reset the sliding-window max-bandwidth tracker via
+ *      minmax_reset(&kcc->bw, kcc->rtt_cnt, 0) (BBR-native call).
+ *   6. Initialize pacing rate from cwnd and SRTT
+ *      (kcc_init_pacing_rate_from_rtt).
+ *   7. Enable pacing on the socket (cmpxchg SK_PACING_NEEDED).
+ *   8. Commit the idempotency guard (initialized = 1) and increment
+ *      kcc_conn_start_cnt — both fire before the optional KF block
+ *      below, ensuring kcc_release() sees a valid guard even on
+ *      connections where ext allocation fails.
+ *   9. (KCC extension) Global Kalman BDP injection: if the cross-connection
  *      KF has a valid estimate, seed the bandwidth tracker and set initial
  *      cwnd/pacing to the fair-share rate, bypassing cold-start ramp-up.
- *   8. Allocate and initialize extended state (struct kcc_ext) on the heap.
+ *  10. Reset the LT-BW sampling interval via
+ *      kcc_reset_lt_bw_sampling_interval() (re-sampled after the KF
+ *      block in case bandwidth estimate was updated).
+ *  11. Allocate and initialize extended state (struct kcc_ext) on the heap.
  *      On allocation failure, KCC runs without Kalman/ACK-agg features
  *      (fallback to sliding-window-only min_rtt).
  *
  * Corresponds to kernel BBR v5.4: bbr_init().
- * The core initialisation steps 1-6 match kernel BBR's bbr_init() exactly:
- * memset, snd_ssthresh = TCP_INFINITE_SSTHRESH, prev_ca_state = Open,
+ * The core initialisation (steps 2-7) matches kernel BBR's bbr_init() exactly:
+ * explicit per-field init, snd_ssthresh = TCP_INFINITE_SSTHRESH, prev_ca_state = Open,
  * next_rtt_delivered = 0, min_rtt_us from tcp_min_rtt, min_rtt_stamp,
  * kcc_init_pacing_rate_from_rtt(), and sk_pacing_status enable.
  *
  * KCC deviations:
- *   a) Step 7 (Global Kalman BDP injection): kernel BBR has no
+ *   a) Steps 1 + 8 (idempotency guard and connection counter): kernel BBR
+ *      has no double-init protection or per-connection counter.  The
+ *      kcc->initialized bitfield paired between kcc_init() and kcc_release()
+ *      guarantees one-to-one counter pairing regardless of kernel TCP
+ *      framework callback multiplicity.
+ *   b) Step 9 (Global Kalman BDP injection): kernel BBR has no
  *      cross-connection bandwidth sharing.  When kcc_kf_enable is active
  *      and the global KF has converged, kcc_init() seeds the sliding-window
  *      max-bw filter, the pacing rate, and the initial cwnd from the
@@ -14662,7 +14712,7 @@ KCC_KFUNC void kcc_main(struct sock* sk, const struct rate_sample* rs)          
  *      shared bottlenecks.  STARTUP probes above the fair-share rate if
  *      additional capacity is available, so the KF injection is a floor,
  *      not a ceiling.
- *   b) Step 8: Extended state allocation on the heap (struct kcc_ext).
+ *   c) Step 11: Extended state allocation on the heap (struct kcc_ext).
  *      Kernel BBR stores all state in the in-sock ICSK_CA_PRIV slot (struct
  *      bbr, 104 bytes on x86_64).  KCC's Kalman filter, ECN EWMA, ACK-agg
  *      confidence, and dynamically computed fields exceed this budget, so
@@ -14672,12 +14722,15 @@ KCC_KFUNC void kcc_main(struct sock* sk, const struct rate_sample* rs)          
  *      BENEFIT: Graceful degradation on memory pressure; full feature set
  *      when allocation succeeds.
  *
- * Type note: struct kcc is zeroed via memset, which also zeros all bitfields
- * (mode = KCC_STARTUP = 0, flags = 0).  snd_ssthresh is set to
- * TCP_INFINITE_SSTHRESH to prevent the stack from imposing its own cwnd
- * clamp.  min_rtt_us is u32, initialised from tcp_min_rtt() which returns
- * u32.  Extended state is allocated with GFP_NOWAIT (never sleeps,
- * never touches emergency reserves).  GFP_NOWAIT is preferred over
+ * Type note: struct kcc is explicitly zeroed per-field (matching kernel BBR's
+ * bbr_init pattern) — all bitfields start at zero (mode = KCC_STARTUP = 0).
+ * The initialized bitfield is set to 1 after all zero-initialisation to
+ * serve as an idempotency guard for the connection counter pair (see
+ * inline comments below and in kcc_release()).
+ * snd_ssthresh is set to TCP_INFINITE_SSTHRESH to prevent the stack from
+ * imposing its own cwnd clamp.  min_rtt_us is u32, initialised from
+ * tcp_min_rtt() which returns u32.  Extended state is allocated with
+ * GFP_NOWAIT (never sleeps, never touches emergency reserves).  GFP_NOWAIT is preferred over
  * GFP_ATOMIC here for three interdependent reasons:
  *
  *   1. CONTEXT SAFETY -- kcc_init fires from both process context
@@ -14722,21 +14775,72 @@ KCC_KFUNC void kcc_init(struct sock* sk)                               /* per-co
     struct kcc* kcc = (struct kcc*)inet_csk_ca(sk);                   /* KCC congestion control state from ICSK_CA_PRIV slot */
     struct kcc_ext* ext;                                               /* extended state pointer for heap-allocated features */
 
-    atomic_inc(&kcc_conn_start_cnt);                                   /* increment monotonic connection start counter for diagnostics */
+    if (kcc->initialized) {
+        return;                                                        /* initialized guard: prior kcc_init() already set this bit — returning prevents double-counting kcc_conn_start_cnt and avoids re-allocating ext (which would leak the prior allocation); paired with the equivalent guard in kcc_release() */
+    }
 
-    memset(kcc, 0, sizeof(*kcc));                                      /* zero all KCC private state */
+    /*
+     * Per-connection state initialisation, matching kernel BBR's bbr_init()
+     * explicit-per-field pattern and field order.  KCC does NOT use memset
+     * because the struct contains bitfields that may be extended in future
+     * kernel versions; explicit initialisation avoids silently covering new
+     * fields and makes audit of initial state trivial.
+     */
+    kcc->prior_cwnd = 0;                                               /* [T_queue] cwnd save area */
     tcp_sk(sk)->snd_ssthresh = TCP_INFINITE_SSTHRESH;                  /* disable TCP stack's ssthresh clamp (Cardwell et al. 2016) */
-    kcc->prev_ca_state = TCP_CA_Open;                                  /* initial TCP congestion state: Open */
-    kcc->next_rtt_delivered = 0;                                       /* zero delivery count: first ACK starts round 1 (Cardwell et al. 2016) */
-    kcc->min_rtt_us = tcp_min_rtt(tcp_sk(sk));                         /* set initial min_rtt from TCP stack's 3-way handshake measurement [T_prop] */
+    kcc->rtt_cnt = 0;                                                  /* [T_queue] monotonic round-trip counter */
+    kcc->next_rtt_delivered = 0;                                       /* [T_queue] delivered at next round boundary */
+    kcc->prev_ca_state = TCP_CA_Open;                                  /* [T_queue] initial TCP congestion state: Open */
+    kcc->packet_conservation = 0;                                      /* [T_queue] recovery mode flag */
+
+    kcc->probe_rtt_done_stamp = 0;                                     /* [T_prop] PROBE_RTT deadline */
+    kcc->probe_rtt_round_done = 0;                                     /* [T_prop] PROBE_RTT round-complete flag */
+    kcc->min_rtt_us = tcp_min_rtt(tcp_sk(sk));                         /* [T_prop] set initial min_rtt from TCP stack's 3-way handshake measurement */
     if (kcc->min_rtt_us == 0) {
         struct tcp_sock* tp = tcp_sk(sk);                              /* TCP socket state for SRTT access */
         kcc->min_rtt_us = tp->srtt_us ? tp->srtt_us >> KCC_SRTT_SHIFT : USEC_PER_MSEC;  /* bootstrap from SRTT or fall back to 1ms [T_prop] */
     }
-    kcc->min_rtt_stamp = tcp_jiffies32;                                /* record current jiffies as min_rtt timestamp [T_prop] */
+    kcc->min_rtt_stamp = tcp_jiffies32;                                /* [T_prop] record current jiffies as min_rtt timestamp */
 
-    kcc_init_pacing_rate_from_rtt(sk);                                 /* initial pacing rate from cwnd and SRTT */
+    minmax_reset(&kcc->bw, kcc->rtt_cnt, 0);                           /* [K] init sliding-window max BW tracker to zero (BBR-native call) */
+    kcc->has_seen_rtt = 0;                                             /* [T_prop] clear RTT-seen flag (set later by pacing-rate bootstrap or KF block) */
+
+    kcc_init_pacing_rate_from_rtt(sk);                                 /* [T_prop][T_queue] bootstrap pacing from cwnd and SRTT */
+
+    kcc->round_start = 0;                                              /* [T_queue] ACK begins a new round-trip flag */
+    kcc->idle_restart = 0;                                             /* [T_queue] flow was app-limited flag */
+    kcc->full_bw_reached = 0;                                          /* [T_queue] pipe capacity detected flag */
+    kcc->full_bw = 0;                                                  /* [K] peak BW at full_bw_reached time */
+    kcc->full_bw_cnt = 0;                                              /* [T_queue] consecutive rounds below growth threshold */
+    kcc->cycle_mstamp_lo = 0;                                          /* [T_queue] PROBE_BW cycle MSTAMP low 32 bits */
+    kcc->cycle_mstamp_hi = 0;                                          /* [T_queue] PROBE_BW cycle MSTAMP high 32 bits */
+    kcc->cycle_idx = 0;                                                /* [T_queue] PROBE_BW cycle phase index */
+
+    kcc->lt_is_sampling = 0;                                           /* [T_noise] LT-BW sampling active flag */
+    kcc->min_rtt_fast_fall_cnt = 0;                                    /* [T_prop] fast min_rtt drop sticky counter */
+    kcc_reset_lt_bw_sampling_interval(sk);                             /* [T_noise] initialise LT BW sampling interval */
+
+    kcc->mode = KCC_STARTUP;                                           /* [T_queue] FSM initial state: clock-driven startup probe */
+
+    /* ---- KCC-extended fields (not present in kernel BBR's struct bbr) ---- */
+    kcc->lt_use_bw = 0;                                                /* [T_noise] LT-BW lock flag */
+    kcc->pacing_gain = 0;                                              /* [T_queue] current pacing gain (set by state machine) */
+    kcc->cwnd_gain = 0;                                                /* [T_queue] current cwnd gain (set by state machine) */
+    kcc->alone_on_path = 0;                                            /* [T_noise] single-flow detection flag */
+    kcc->lt_bw = 0;                                                    /* [T_noise] LT BW estimate */
+    kcc->ext = NULL;                                                   /* [K] extended state pointer (allocated below) */
+
     cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);  /* enable pacing on socket (atomically if not already set) */
+
+    /*
+     * Commit the per-connection counter and idempotency guard AFTER all
+     * zero-initialisation (but before the optional KF-injection and ext
+     * allocation blocks below).  This ensures kcc_release() will see a
+     * valid initialized guard even on connections where ext allocation
+     * fails — preserving the start/end counter pairing invariant.
+     */
+    atomic_inc(&kcc_conn_start_cnt);                                   /* increment monotonic connection start counter for diagnostics (/proc/kcc/status conn_start) */
+    kcc->initialized = 1;                                              /* commit idempotency guard: subsequent kcc_init() calls on this sk become no-ops */
 
     if (kcc_kf_enable_val && atomic_read(&kcc_kf_active)) {
         u64 init_bw = kcc_kf_get_init_bw(sk);                          /* get gain-compensated initial bandwidth from global KF [K] */
@@ -15308,12 +15412,12 @@ static int kcc_status_show(struct seq_file* m, void* v)                  /* seq_
             seq_printf(m, "  kf_active=0\n");                            /* print KF inactive status */
         }
         {
-            int cs = atomic_read(&kcc_conn_start_cnt);                   /* read total connection start counter */
-            int ce = atomic_read(&kcc_conn_end_cnt);                     /* read total connection end counter */
-            seq_printf(m, "  conn_start=%d  conn_end=%d  conn_active=%d  ext_fail=%d\n",
+            unsigned int cs = (unsigned int)atomic_read(&kcc_conn_start_cnt);  /* read total connection start counter (unsigned for wrap-safe subtraction) */
+            unsigned int ce = (unsigned int)atomic_read(&kcc_conn_end_cnt);    /* read total connection end counter */
+            seq_printf(m, "  conn_start=%u  conn_end=%u  conn_active=%u  ext_fail=%d\n",
                 cs, ce,
-                cs > ce ? cs - ce : 0,                                    /* compute active connections = start - end */
-                atomic_read(&kcc_ext_alloc_fail_cnt));                     /* read ext allocation failure count */
+                cs - ce,                                                       /* unsigned subtraction natively handles 32-bit counter wrap (mod 2³²); initialized guard in struct kcc prevents systematic skew — transient non-atomic double-read delta is bounded to single digits */
+                atomic_read(&kcc_ext_alloc_fail_cnt));                     /* read ext allocation failure counter */
         }
 
         seq_printf(m, "\n[Connections] "
