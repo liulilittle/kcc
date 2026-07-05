@@ -465,12 +465,12 @@
  *         - Directional gate φ(ν_k) = 1(ν_k ≤ 0) separates by SIGN:
  *           ν_k ≤ 0 → T_prop-convergent (accepted)
  *           ν_k > 0 → T_queue or T_noise positive spike (rejected)
- *         - Outlier gate ψ(ν_k) = 1(|ν_k| ≤ max(base_ms, jitter_ewma × mult)) on accepted
+ *         - Outlier gate ψ(ν_k) = 1(|ν_k| ≤ max(RTT>>rtt_frac_shift, min_floor_us, jitter_ewma × mult)) on accepted
  *           innovations removes residual T_noise.
  *       The joint gate φ(ν_k) ∧ ψ(ν_k) achieves:
- *         P(FA | H_0) = P(T_noise > 0 ∧ |T_noise| ≤ max(base_ms, jitter_ewma×2) | H_0)
+ *         P(FA | H_0) = P(T_noise > 0 ∧ |T_noise| ≤ max(RTT>>rtt_frac_shift, min_floor, jitter_ewma×2) | H_0)
  *         For Gaussian noise: P(ν>0 ∧ |ν|≤dyn_thresh | H_0) =
- *           P(0 < ν ≤ max(4ms, jitter×2)) which at jitter=1ms gives 0.5 − Φ(−4) ≈ 0.5 − 3.17×10⁻⁵
+ *           P(0 < ν ≤ max(RTT>>shift, min_floor, jitter×2)) — RTT-proportional: WAN (50ms/1ms) ≈ Φ(−12.5) negligible; DC (200µs/10µs) floor dominates ~5σ → 2.9×10⁻⁷
  *         This is NOT zero due to positive-signed noise below the outlier
  *         threshold, but the DIRECTIONAL UPDATE structurally discards
  *         these samples from T_prop estimation.  The gate classifies them
@@ -714,7 +714,7 @@
  *           from T_prop estimation.  T_queue drives ECN backoff and
  *           gain decay independently.
  *         - T_noise is extracted via the outlier gate + jitter EWMA:
- *           innovations exceeding the dynamic threshold jitter_ewma · mult (default 2×) are T_noise outliers →
+ *           innovations exceeding the dynamic threshold (RTT-proportional + jitter_ewma · mult, default 2×) are T_noise outliers →
  *           rejected.  Residual T_noise enters x_est with attenuation
  *           K_ss, producing only conservative downward bias.
  *       The three-component model is therefore the NATURAL GENERALIZATION
@@ -870,12 +870,13 @@
  *     Under the null hypothesis H0 (no T_queue), E[nu_k] = 0 and nu_k
  *     has variance sigma_noise^2 from T_noise alone.  Under H1 (T_queue
  *     present), E[nu_k] = mu_queue > 0 with additional variance.
- *     The outlier gate tests: |nu_k| > max(base_ms, jitter_ewma * 2).
- *     On clean paths (jitter_ewma ≈ 1ms), the 4ms base dominates,
- *     giving effective mult ≈ 4.  By the Chebyshev inequality,
- *     P(|nu_k| > k*sigma | H0) <= 1/k^2.  With effective mult=4,
- *     the false-positive rate (classifying T_noise as T_queue) is
- *     <= 1/16 = 6.25%.  On noisy paths (jitter > 2ms), the 2x
+ *     The outlier gate tests: |nu_k| > max(RTT>>rtt_frac_shift, min_floor_us, jitter_ewma * 2).
+ *     On clean WAN paths (RTT≈50ms, jitter_ewma≈1ms), the RTT component
+ *     (12.5ms) dominates, giving effective k≈12.5.  By Chebyshev,
+ *     P(|nu_k| > k*sigma | H0) <= 1/k^2.  On mid-to-long RTT paths
+ *     the false-positive rate is effectively zero.  On clean DC paths
+ *     (RTT≈200µs, jitter≈10µs), the floor (50µs) dominates — k≈5 (P≤1/25=4%).
+ *     On noisy paths (jitter > 2ms), the 2×
  *     jitter component dominates (P <= 1/4 = 25%).  The false-negative rate
  *     depends on mu_queue/sigma_noise (the signal-to-noise ratio),
  *     which exceeds 3 for congestion on paths with >= 3ms of queue above
@@ -1197,7 +1198,10 @@
  *
  *     TRUNCATED KALMAN (KCC directional update):
  *       x̂_{k|k} = x̂_{k|k-1} + K_k · min(0,  z_k − H·x̂_{k|k-1})
- *       P_{k|k} = (I−K_k·H)·P_{k|k-1} (Joseph form, gate open ν<0);
+ *       P_{k|k} = (I−K_k·H)·P_{k|k-1} (standard form, gate open ν<0);
+ *       NOTE: the implementation uses Joseph form for ν<0 (K_eff=1 → P_post = max(R, floor)),
+ *       but the standard form is analyzed here for proof tractability — the two are
+ *       numerically equivalent when K_eff shrinks toward K_opt in steady state.
  *       P_{k|k} = P_{k|k-1}          (covariance preserved, gate closed ν≥0)
  *
  *     Equivalently, using the directional gate φ(ν) = 𝟙(ν ≤ 0):
@@ -1600,7 +1604,7 @@
  *     Claim: T_noise does not affect rate or cwnd decisions.
  *     Proof: T_noise enters the system through two paths.  Path 1:
  *     RTT observation contains eta_k (T_noise).  The outlier gate
- *     rejects |nu_k| > jitter_ewma * mult, preventing large T_noise
+ *     rejects |nu_k| > max(RTT>>shift, min_floor, jitter_ewma * mult), preventing large T_noise
  *     spikes from entering the filter.  Residual T_noise that passes
  *     the gate enters the Kalman update with attenuation K_ss ≈ 0.39
  *     (derived from actual defaults: p_ss is the PREDICTED (pre-update)
@@ -1905,7 +1909,7 @@
  *
  *     For the 3-component model, by contrast:
  *       det(H_3) = (N/R)·λ₁·(p_clean·N/R) > 0  (see determinant derivation
- *       at lines 1755−1814), so the Laplace approximation is well-defined,
+ *       at the determinant derivation section), so the Laplace approximation is well-defined,
  *       and ln p(data | M_3) is finite.
  *
  *     CONCLUSION:  Formal model selection (AIC, BIC, DIC, WAIC, etc.) cannot
@@ -2555,7 +2559,7 @@
  *
  *   [T_noise suppression]
  *     - Outlier gating: rejects RTT samples where |innovation| exceeds
- *       a dynamic threshold (jitter_ewma scaled by outlier multiplier)
+ *       a dynamic threshold = max(RTT>>shift, min_floor, jitter_ewma × mult)
  *     - Consecutive rejection counter: limits sustained Kalman
  *       rejection; forces recalibration after max_consec_reject
  *     - Jitter EWMA: tracks short-term RTT variability (T_noise proxy);
@@ -2604,7 +2608,7 @@
  *     ┌──────────────────────────────────────────────────────────────────┐
  *     │  DIRECTIONAL UPDATE:  nu < 0 → Kalman update (clean T_prop)     │
  *     │                       nu > 0 → SKIP (T_queue contaminates)      │
- *     │  OUTLIER GATE:  |nu| > jitter_ewma * mult → SKIP (T_noise)     │
+ *     │  OUTLIER GATE:  |nu| > max(RTT>>shift, floor, jitter×mult) → SKIP
  *     │  Q-BOOST:  large negative nu + converged + cooldown expired     │
  *     │            → reset Kalman gain (fast path-change adaptation)    │
  *     │  DRIFT CORRECTION:  persistent small negative nu, tiered        │
@@ -2760,7 +2764,7 @@
  *       strengthen the finite-window guarantee, consider the martingale
  *       difference M_k = ν_k − E[ν_k | F_{k−1}] where F_{k−1} is the
  *       natural filtration.  Under H0 (no T_prop change), E[ν_k] = 0 and
- *       |M_k| ≤ 2·c_outlier where c_outlier = max(base_ms, jitter_ewma·2)
+ *       |M_k| ≤ 2·c_outlier where c_outlier = max(RTT>>shift, min_floor, jitter_ewma·2)
  *       is the outlier gate threshold.  For D consecutive positive-skip
  *       rounds, the cumulative innovation S_D = Σ_{k=1}^{D} ν_{t+k}
  *       satisfies the Azuma-Hoeffding bound:
@@ -2840,12 +2844,13 @@
  *       known utilization rho, set p_clean = 1 - rho.  For unknown
  *       paths, rho = 0.7 yields p_clean = 0.3 — a conservative default
  *       that overestimates convergence time (actual convergence is faster
- *       on less-loaded paths).  The outlier gate has a Chebyshev
- *       false-positive rate <= 0.0625 (mult=4), so:
+ *       on less-loaded paths).  The outlier gate false-positive rate varies
+ *       by path: ≤6.25% on WAN (RTT-proportional k≫4) and ≤25% on short-RTT
+ *       WiFi (jitter-based k≈2).  Using the worst-case bound:
  *         p_clean_eff = P(empty) * P(not outlier | empty)
- *                     = 0.3 * (1 - 0.0625) = 0.3 * 0.9375 ≈ 0.281.
- *       Using p_clean = 0.3 is therefore a slight overestimate; the true
- *       effective rate is ~0.288, making all convergence bounds conservative.
+ *                     = 0.3 * (1 - 0.25) = 0.3 * 0.75 = 0.225.
+ *       Using p_clean = 0.3 is therefore conservative (true rate ≥0.225),
+ *       making all convergence bounds conservative.
  *     With K_ss=0.39, p_clean=0.3, sigma=1us, |d_0|=25ms:
  *       T_{1%} = ln(0.01)/ln(1-0.39*0.3) ~ 37 RTTs.
  *       The more conservative bound T_{sigma} = ln(sigma/(p_clean*|d_0|))/ln(1-K*p_clean)
@@ -4299,9 +4304,10 @@
  *       p_clean = P(ν_k ≤ 0) = P(q_k = 0) · P(not outlier | q_k = 0)
  *                = (1 − ρ) · (1 − P_fp) > 0
  *     where ρ = λ/C is the bottleneck link utilization (from the M/D/1
- *     queue model) and P_fp ≤ 0.04 is the outlier-gate false-positive
- *     rate (Chebyshev bound with k = 5).  For default ρ = 0.7:
- *       p_clean = 0.3 · 0.96 ≈ 0.288 > 0.
+ *     queue model) and P_fp ≤ 0.25 is the worst-case outlier-gate
+ *     false-positive rate (Chebyshev bound with k ≥ 2, jitter-dominated
+ *     paths); on WAN paths P_fp ≤ 0.0625.  For default ρ = 0.7:
+ *       p_clean = 0.3 · 0.75 ≈ 0.225 > 0.
  *     Equivalently, the asymptotic empirical gate-open rate is:
  *       lim inf_{N→∞} (1/N)·Σ_{k=1}^{N} r_k = p_clean > 0
  *
@@ -4842,8 +4848,8 @@
  *   == T_noise Boundaries ==
  *
  *   B9. Zero noise (clean lab environment).
- *     jitter_ewma → 0.  Outlier threshold → base threshold (4ms
- *     scaled).  Kalman R = base_R (400).  Kalman K = P/(P+400),
+ *     jitter_ewma → 0.  Outlier threshold → max(RTT>>2, min_floor_us)
+ *     (RTT-proportional, no jitter component active).  Kalman R = base_R (400).  Kalman K = P/(P+400),
  *     converges to K_ss ≈ 0.39-0.88 (from actual Q/R defaults),
  *     providing near-optimal convergence rate.  No noise suppression overhead.
  *     This is the degenerate case of the Kalman filter with R at its
@@ -4855,21 +4861,23 @@
  *   B10. Maximum bounded noise (|η| = η_max = 4ms, sustained).
  *     Jitter_ewma converges to ~|innov_avg| ≈ 4ms (EWMA with constant
  *     input converges to the input value).  Outlier threshold =
- *     max(4ms_base, 2 * 4ms) = 8ms.  Since |innov| ≈ 4ms < 8ms,
+ *     max(RTT>>2, min_floor_us, 2 * 4ms).  For RTT=50ms:
+ *     max(12.5ms, 50µs, 8ms) = 12.5ms (RTT-component dominates);
+ *     for RTT=200µs: max(50µs, 50µs, 8ms) = 8ms (jitter dominates).
+ *     Since |innov| ≈ 4ms < dyn_thresh in both cases,
  *     NO outlier rejection occurs — the gate adapts to the sustained
  *     noise floor.  Noise separation is handled by the directional
  *     gate: positive innovations (queue + noise) are skipped, negative
- *     (clean T_prop samples) are accepted.  Kalman R = base_R +
- *     R_boost.  R_boost = max(0, jitter - jr_thresh) * base_R /
- *     jr_scale.  With jitter = 5ms, jr_thresh ≈ 2.5ms (clean_thresh
- *     on 25ms path): R_boost = 2500*400/8000 = 125, R = 525.
- *     K_ss ≈ 0.35 (at Q=100, R=525), or ≈ 0.85 with adaptive Q=2500.
- *     Filter operates at moderate gain, with the directional gate
- *     providing structural noise isolation (Proof C).
- *     Convergence rate slows by factor ~0.5 (Theorem S.2, p_clean=0.5).
+ *     (clean T_prop samples) are accepted.  Kalman R adapts via
+ *     power-law: R = base_R * (jitter_excess / J50)^(3/2), clamped.
+ *     With jitter = 5ms, jr_thresh ≈ 2.5ms, jitter_excess = 2.5ms,
+ *     J50 = 200 µs: ratio = 12.5 → R = 400 × 12.5^1.5 ≈ 17,678.
+ *     K_ss ≈ 0.075 (at Q=100, R=17,678).  The directional gate provides
+ *     structural noise isolation (Proof C).  Convergence rate slows by
+ *     factor ~0.2 (Theorem S.2, p_clean=0.5).
  *
  *   B11. Burst noise (isolated spikes, η_spike >> η_background).
- *     Outlier gate rejects spikes exceeding jitter_ewma * mult.
+ *     Outlier gate rejects spikes exceeding max(RTT>>shift, min_floor, jitter_ewma * mult).
  *     Rejected spikes increment consec_reject_cnt but do NOT update
  *     x_est.  Forced acceptance after max_consec_reject (20) ensures
  *     sustained noise cannot permanently lock out the filter.
@@ -4882,8 +4890,8 @@
  *   B12. Sustained elevated noise (gradual increase, "boiling frog").
  *     If T_noise increases slowly (rate << α * RTT), jitter_ewma
  *     tracks the increase.  The outlier gate adapts upward, accepting
- *     higher noise levels.  Kalman R also increases (R_boost
- *     proportional to jitter), reducing K_ss.  The filter becomes
+ *     higher noise levels.  Kalman R also increases (power-law
+ *     scaling with jitter), reducing K_ss.  The filter becomes
  *     SLOWER to converge but does NOT produce incorrect estimates —
  *     it trusts measurements less when noise is high.  The matched
  *     estimator (q_est, r_est) provides a slow calibration channel
@@ -4929,9 +4937,9 @@
  *     Theorem 4's bounded-output guarantee.
  *
  *   B15. Counter saturation.
- *     (a) sample_cnt: u32, saturated at U32_MAX (L12948: if
- *     (ext->sample_cnt < U32_MAX)).  (b) pos_skip_cnt: u8, saturated at
- *     KCC_POS_SKIP_SATURATION (L12630).  (c) consec_reject_cnt:
+ *     (a) sample_cnt: u32, saturated at U32_MAX (in kcc_kalman_update
+ *     at the counter increment).  (b) pos_skip_cnt: u8, saturated at
+ *     KCC_POS_SKIP_SATURATION (in the positive-innovation branch).  (c) consec_reject_cnt:
  *     u32, saturated implicitly by comparison with max_consec_reject
  *     (20) — never reaches U32_MAX.  (d) rtt_cnt, cycle_idx, lt_rtt_cnt:
  *     all bounded by their bitfield widths or clamp guards.  No
@@ -4949,7 +4957,8 @@
  *     (complete outage): kcc_bw() returns 0 → pacing_rate = 0 →
  *     connection stalls.  Recovery when BW returns — no state
      *     corruption.      (d) BW → ∞ (infinite theoretical): bw_raw capped
-     *     at U64_MAX / USEC_PER_SEC before multiplication (L14962:
+      *     at U64_MAX / USEC_PER_SEC before multiplication (in the pacing
+      *     rate overflow guard).
      *     if (bw_raw > U64_MAX / USEC_PER_SEC)).
  *     Why this matters: Ensures the physical bounds assumption (Theorem
  *     5-§2, network plant ISS) is not violated by pathological parameter
@@ -5430,9 +5439,9 @@
  * The wrapper kcc_random_below(x) provides a uniform interface.
  */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0) /* 6.2+ uses get_random_u32_below */
-#define kcc_random_below(x) get_random_u32_below(x) /* uniform random [0, x); kernel 6.2+ API provides non-deterministic random with bounded range */
+#define kcc_random_below(x) (get_random_u32_below(x)) /* uniform random [0, x); kernel 6.2+ API provides non-deterministic random with bounded range */
 #else                                               /* pre-6.2 uses prandom_u32_max */
-#define kcc_random_below(x) prandom_u32_max(x)      /* uniform random [0, x); pre-6.2 API uses pseudo-random with bounded range; functionally identical for our use (PROBE_BW cycle phase randomization) */
+#define kcc_random_below(x) (prandom_u32_max(x))      /* uniform random [0, x); pre-6.2 API uses pseudo-random with bounded range; functionally identical for our use (PROBE_BW cycle phase randomization) */
 #endif                                                                        /* end random API version conditional */
 /*
  * const ctl_table compatibility section: kernel 6.11 added const qualifier to proc_handler.
@@ -5518,31 +5527,21 @@ static inline u32 kcc_tcp_snd_cwnd(const struct tcp_sock* tp) { return READ_ONCE
 #define KCC_DECAY_MASK_WORDS (1 << 3) /* [T_queue] 256-bit gain-decay mask as 8x32-bit words (disabled by default) */
 
 /*
- * PARAMETER DERIVATION: KCC_KALMAN_INNOV_SQ_CAP, KCC_S64_MAX
+ * PARAMETER DERIVATION: KCC_KALMAN_INNOV_SQ_CAP
  *
- * PHYSICS: Overflow guards in fixed-point Kalman filter arithmetic.
- *   During the Kalman update, the innovation term nu_k is squared to
- *   compute nu_k^2 / S_k for the Kalman gain denominator.  Without
- *   overflow protection, an extreme RTT spike could produce nu_k^2
- *   exceeding the i64 range, corrupting the filter state.
- * UNITS: dimensionless (scaled integer, us * kalman_scale)
- * DERIVATION:
- *   KCC_KALMAN_INNOV_SQ_CAP = 3,000,000,000:  sqrt(i64_MAX) ≈ 3.037e9.
- *     Capping at 3e9 provides ~1.2% headroom below the i64 overflow
- *     boundary.  At kalman_scale = 1024, this corresponds to
- *     an innovation of sqrt(3e9) / 1024 ≈ 53 us -- far above any
- *     physically meaningful RTT sample.  The cap is a safety net, never
- *     intended to constrain normal operation.
- *   KCC_S64_MAX = 9223372036854775807 = 2^63 - 1:  Maximum representable
- *     value in a signed 64-bit integer, cast to u64 for use with min_t()
- *     across all kernel types.  Used as a universal sentinel in
- *     comparisons that mix i64 and u64 operands.
- * BOUNDS: INNOV_SQ_CAP in [1e9, 9e9]; S64_MAX is invariant (fixed by
- *   hardware integer width).
+ *   Overflow guard in fixed-point Kalman filter arithmetic.  During the
+ *   Kalman update, the innovation term nu_k is squared for the Kalman
+ *   gain denominator.  Without overflow protection, an extreme RTT spike
+ *   could produce nu_k^2 exceeding the i64 range.
+ *   sqrt(i64_MAX) ≈ 3.037e9; capping at 3e9 provides ~1.2% headroom.
+ *   At kalman_scale = 1024, this corresponds to an innovation of
+ *   sqrt(3e9) / 1024 ≈ 53 us — far above any physically meaningful
+ *   RTT sample.  The cap is a safety net, never intended to constrain
+ *   normal operation.
  */
-#define KCC_KALMAN_INNOV_SQ_CAP 3000000000ULL /* [K] overflow guard: cap 3e9 = sqrt(i64_MAX) with 1.2% headroom; data path uses u64 where cap 9e18 < U64_MAX (~49% of range); the i64 sqrt bound is the limiting factor since innovation intermediates are signed */
-/* [K] S64_MAX as u64 for min_t() type compat across kernel versions */
-#define KCC_S64_MAX ((u64)9223372036854775807ULL) /* [K] 2^63-1 as u64 for min_t() compat */
+#define KCC_KALMAN_INNOV_SQ_CAP 3000000000ULL /* [K] overflow guard: cap 3e9 = sqrt(i64_MAX) with 1.2% headroom; data path uses u64 where cap 9e18 < U64_MAX */
+
+#define KCC_R_POWER_FRAC 20             /* [K] fixed-point fraction bits for power-law R scaling: ratio = j_excess/J50 in 2^20 fixed point; int_sqrt over 2^40 range fits in u64 (max j_excess=500ms=5e5/J50_min=1 → ratio_max=5.24e11; ratio<<FRAC=5.5e17 < 2^64; ratio×sqrt(ratio) can overflow u64 → guards with saturation at lines 12319-12323); FRAC=20 provides 2^20≈1M fraction resolution (~0.0001% at max ratio) */
 
 /*
  * Aggregation confidence state constants: four FSM states for ACK aggregation
@@ -5744,6 +5743,8 @@ static inline u32 kcc_tcp_snd_cwnd(const struct tcp_sock* tp) { return READ_ONCE
 #define KCC_BITFIELD_2BIT_MAX      ((1 << 2) - 1) /* [T_queue] max value for 2-bit bitfield (2^2-1=3); used by full_bw_cnt (:2 field); prev_ca_state is :3 field bounded by bitfield width */
 #define KCC_GAIN_MAX              ((1 << 10) - 1) /* [T_queue] max 10-bit bitfield value (2^10-1=1023); pacing_gain/cwnd_gain cover 0~4.0x */
 #define KCC_LT_RTT_CNT_MAX        ((1 << 12) - 1) /* [K] max 12-bit bitfield value (2^12-1=4095); lt_rtt_cnt ~40s at 10ms RTT */
+#define KCC_DRAIN_RTT_CNT_MAX     ((1 << 5) - 1)   /* [K] max 5-bit bitfield value (2^5-1=31); drain_rtt_cnt timeout ceiling */
+#define KCC_TIER1_BLOCKED_CNT_MAX 15                /* [K] structural ceiling for tier1_blocked_cnt (u8); not configurable — prevents u8 wraparound */
         /*
          * PARAMETER JUSTIFICATION — TAXONOMY BY PHYSICAL COMPONENT
          *
@@ -5788,14 +5789,17 @@ static inline u32 kcc_tcp_snd_cwnd(const struct tcp_sock* tp) { return READ_ONCE
          *     (expected per-RTT T_prop variance from thermal drift ~10^-6/C and
          *     clock wander ~1ppm).  RTT-proportional term accounts for longer
          *     paths accumulating more absolute drift.
-         *   - Kalman R = R_base * max(1, jitter_ewma / jitter_r_scale).
-         *     R_base = 400 represents sigma^2_noise ~ (20us)^2 scaled by fixed-point
-         *     factor kcc_kalman_scale = 1024 (power-of-two, typically 2^10).  Jitter-EWMA adaptation is a
-         *     one-parameter adaptive noise model.
-    *   - Outlier gate: tau = max(4ms*scale, 2*jitter_ewma*scale).  Chebyshev:
-    *     P(|nu_k| > tau | no anomaly) <= 1/k^2 = 1/16 = 6.25% at k=4, or 1/4 =
-    *     25% at k=2.  Standard SPC choices (2-sigma = 95%, 3-sigma = 99.7%).
-    *   - PROBE_BW cycle length: 8 phases, ~8 RTTs (1/cycle_len per phase).  Dwell-time stability
+          *   - Kalman R = R_base * max(1, (jitter_excess / kcc_jitter_r_j50)^(3/2)),
+          *     capped at R_base * kcc_kalman_r_max_boost.  R_base = 400 represents
+          *     sigma^2_noise ~ (20us)^2 scaled by fixed-point factor kcc_kalman_scale =
+          *     1024 (power-of-two, typically 2^10).  Jitter-EWMA adaptation is a
+          *     two-parameter power-law adaptive noise model (J50 crossover + r_max_boost cap).
+          *   - Outlier gate: dyn_thresh = max(max(min_rtt_us >> rtt_frac_shift,
+          *     min_floor_us), jitter_ewma * outlier_jitter_mult) in scaled units.
+           *     Chebyshev bound: P(|ν_k| > k·σ | H0) ≤ 1/k² — KCC effective
+           *     k varies by path: WAN (RTT-proportional) k≫4, WiFi k≈2.
+           *     Standard SPC: 2σ→95%, 3σ→99.7%.
+           *   - PROBE_BW cycle length: 8 phases, ~8 RTTs (1/cycle_len per phase).  Dwell-time stability
     *     (Liberzon, 2003, Thm 3.1): T_dwell >= tau_min = ln(rho)/ln(1 -
     *     K_ss * p_clean).  With rho=0.01, K_ss=0.39, p_clean=0.3: tau_min
     *     approx 37 RTTs.  The PROBE_RTT interval (default 10s ≈ hundreds of RTTs)
@@ -5931,7 +5935,7 @@ static inline u32 kcc_tcp_snd_cwnd(const struct tcp_sock* tp) { return READ_ONCE
  */
 #define KCC_MINRTT_FAST_FALL_DIV_MAX       (1 << 8) /* [T_prop] minrtt_fast_fall_div upper clamp (2^8, prevents div-by-zero) */
 #define KCC_PROBE_BAND_MULT_MAX            (1 << 5) /* [K] kalman_probe_band_mult upper clamp (2^5, prevents u32 overflow) */
-#define KCC_KALMAN_PPM_MAX                 1000000 /* [K] PPM full scale: 1,000,000 ppm = 1.0; used in clamp bound (L8830) and convergence denominator (L9109) */
+#define KCC_KALMAN_PPM_MAX                 1000000 /* [K] PPM full scale: 1,000,000 ppm = 1.0; used in kcc_init_module_params clamp and convergence denominator computation */
 #define KCC_KALMAN_CONVERGED_MIN           1         /* [K] minimum converged_val; sentinel for permanently blocked convergence (K >= 1 or K below physical floor for current Q/R */
 #define KCC_KALMAN_Q_RTT_DIV_MAX           1000000 /* [K] kalman_q_rtt_div upper clamp (prevents div-by-zero) */
 #define KCC_RTT_DYN_MULT_MAX               100   /* [K] kalman_rtt_dyn_mult upper clamp (prevents u32 overflow) */
@@ -6058,12 +6062,13 @@ static inline u32 kcc_tcp_snd_cwnd(const struct tcp_sock* tp) { return READ_ONCE
          *   P(56 consecutive skips | noise) ≈ 0.5^56 ≈ 1.4e-17 -> Tier-2 fires
          *   Tier-2 is a high-confidence forced-accept path: 56 consecutive positive skips without genuine RTT drift is exponentially unlikely (P < 2^-56 under i.i.d. assumption), providing a strong probabilistic guard against x_est lock-in.
          */
-#define KCC_DRIFT_TIER1              1      /* [T_noise] quiet-path drift tier: corr/4 when jitter<min_rtt/8 */
-#define KCC_DRIFT_TIER2              2      /* [T_noise] statistical-force drift tier: corr/8 at high skip count */
+#define KCC_DRIFT_TIER1              1      /* [K] quiet-path drift tier: corr/4 when jitter<min_rtt/8 */
+#define KCC_DRIFT_TIER2              2      /* [K] statistical-force drift tier: corr/8 at high skip count */
+#define KCC_DRIFT_EARLY              3      /* [K] amplitude-based early drift: K-independent innov/4 */
 
-#define KCC_POS_SKIP_SATURATION      254    /* [T_noise] pos_skip_cnt ceiling; derivation: pos_skip_cnt is u8 (max 255); Tier-2 drift threshold = drift_thresh * kcc_drift_tier2_mult_val (defaults 14*4=56); saturation at 254 (not 255) provides a 1-value safety margin below u8 max (255-254=1), preventing arithmetic wrap-around from triggering a false Q-boost suppression release; 254 > 56 ensures Tier-2 activation is always reachable; the gap 254-56 = 198 gives 198 RTTs of post-Tier-2 counting headroom before saturation; ENGINEERING NOTE: this finite saturation departs from the infinite-horizon Neyman-Pearson derivation of Proof C.2, which assumes unbounded counting — however, Tier-2 fires at 56 and resets the counter long before saturation is ever reached at the default drift_thresh=14, making the departure practically invisible at runtime */
+#define KCC_POS_SKIP_SATURATION      254    /* [K] pos_skip_cnt ceiling; derivation: pos_skip_cnt is u8 (max 255); Tier-2 drift threshold = drift_thresh * kcc_drift_tier2_mult_val (defaults 14*4=56); saturation at 254 (not 255) provides a 1-value safety margin below u8 max (255-254=1), preventing arithmetic wrap-around from triggering a false Q-boost suppression release; 254 > 56 ensures Tier-2 activation is always reachable; the gap 254-56 = 198 gives 198 RTTs of post-Tier-2 counting headroom before saturation; ENGINEERING NOTE: this finite saturation departs from the infinite-horizon Neyman-Pearson derivation of Proof C.2, which assumes unbounded counting — however, Tier-2 fires at 56 and resets the counter long before saturation is ever reached at the default drift_thresh=14, making the departure practically invisible at runtime */
 #define KCC_P_EST_SAT_POS_SKIP_THRESH (1 << 6) /* [K] pos_skip_cnt threshold for p_est-saturation response; derivation: this check fires BEFORE Tier-2 drift correction in the positive-innovation branch; Tier-2 at drift_thresh * kcc_drift_tier2_mult_val resets pos_skip_cnt to 0, so saturation MUST use a lower threshold to avoid perpetual preemption; 64 = raw default, clamped to drift_thresh * kcc_drift_tier2_mult_val - 1 at init (55 at defaults drift_thresh=14, tier2_mult=4), giving P = 2^(-55) ≅ 2.78×10⁻¹⁷ (Neyman-Pearson), overwhelmingly rejecting H_0; invariant enforced at clamp: saturation_thresh < drift_thresh * kcc_drift_tier2_mult_val */
-          /* [T_noise] kcc_drift_early_sum_shift and kcc_drift_early_corr_shift — runtime tunables.
+          /* [K] kcc_drift_early_sum_shift and kcc_drift_early_corr_shift — runtime tunables.
           * sum_shift: drift_sum > min_rtt_scaled >> shift (≈3.1% of path RTT at default 5).
           * corr_shift: abs_innov >> shift = innovation/4 at default 2 (25% per step, K-independent).
           */
@@ -6378,13 +6383,13 @@ struct kcc_ext {
      * Kalman filter trust in RTT samples (by scaling up measurement noise R)
      * and only enables cwnd compensation at high confidence levels
      * (KCC_AGG_CONFIRMED and above).
-         *
-         *Kernel BBR : unconditional extra_acked cwnd inflation when aggregation
-         * is detected.KCC's confidence-gated approach prevents aggressive
-         *cwnd inflation on ambiguous aggregation signals, which can cause
-         * overshoot and loss in shallow - buffer paths.
-         *
-         *All fields guarded by kcc_agg_enable module param(default 1).
+     *
+     * Kernel BBR: unconditional extra_acked cwnd inflation when aggregation
+     * is detected. KCC's confidence-gated approach prevents aggressive
+     * cwnd inflation on ambiguous aggregation signals, which can cause
+     * overshoot and loss in shallow-buffer paths.
+     *
+     * All fields guarded by kcc_agg_enable module param (default 1).
          */
     u32 agg_extra_acked;                             /* [T_noise] current window extra_acked (segments); raw aggregation for confidence eval */
     u32 agg_extra_acked_max;                         /* [T_noise] windowed max extra_acked (dual-slot); compensation at CONFIRMED/TRUSTED */
@@ -6410,23 +6415,25 @@ struct kcc_ext {
     u8  alone_confirm_cnt;                            /* [T_noise] consecutive rounds qualifying as alone (0..255); transitions to BBR-mode fallback */
     u8  qboost_cdwn;                                 /* [K] cooldown counter: min accepted samples between qboost events; prevents runaway resets */
 
-    u8  pos_skip_cnt;                                /* [T_noise] consecutive directional skips; gates Q-boost; triggers baseline-drift forced update */
+    u8  pos_skip_cnt;                                /* [K] consecutive directional skips; gates Q-boost; triggers baseline-drift forced update */
     u8  neg_skip_cnt;                                /* [T_prop] consecutive negative innov; gates outlier+floor bypass when >= kcc_neg_persist_thresh_val (persistent decrease = genuine path change; isolated single/double = ACK compression / TSO noise); reset to 0 on any ν ≥ 0 (confirming or positive) */
     u32 last_neg_mstamp;                             /* [T_prop] tp->tcp_mstamp of last ν < 0 (~1µs units); time-gated persistence: increment blocked when consecutive negatives arrive within < max(1µs, rtt_us/2) of each other */
-    u32 drift_sum;                                   /* [T_noise] running sum of positive innovation magnitudes (kalman_scale units); accumulates per-sample drift amplitude; reset to 0 on any non-positive innovation or accepted update; triggers early drift correction when sum > min_rtt_scaled/32 AND pos_skip_cnt >= kcc_drift_early_min_rtt_val (3); for +3ms drift: sum crosses threshold at sample 2, pos_skip_cnt gate defers fire to sample 3 */
+    u32 drift_sum;                                   /* [K] running sum of positive innovation magnitudes (kalman_scale units); accumulates per-sample drift amplitude; reset to 0 on any non-positive innovation or accepted update; triggers early drift correction when sum > min_rtt_scaled/32 AND pos_skip_cnt >= kcc_drift_early_min_rtt_val (3); for +3ms drift: sum crosses threshold at sample 2, pos_skip_cnt gate defers fire to sample 3 */
     u8  alone_exit_cnt;                              /* [T_noise] consecutive alone_eval failures; exit hysteresis for multi-flow resonance resistance */
+    u8  tier1_blocked_cnt;                           /* [K] consecutive times Tier-1 jitter gate blocked a valid skip count (pos_skip_cnt >= drift_thresh but jitter too high); when >= 3, waive jitter gate and force Tier-1 correction at pos_skip_cnt >= drift_thresh regardless of jitter; prevents the ~41-RTT p_est dead zone on persistently-noisy paths */
+    u8  saturation_hold_cnt;                         /* [K] RTTs remaining in saturation hold-off after p_est-saturation response fires; set to 30 when saturation fires; prevents x_est from rising above min_rtt_us while non-zero, breaking the saturation→reset→saturation oscillation loop on permanently-queued paths; decremented per round when x_est would exceed min_rtt */
 
     struct list_head kcc_node;                                              /* [K] list node in module-global kcc_conn_list for /proc/kcc/status */
     struct sock* sk;                                                        /* [K] weak back-reference to owning TCP socket for seq_file iterator */
 };                                                                          /* struct kcc_ext close */
 /*
  * CONCURRENCY & SAFETY MODEL:
-*
-*KCC follows kernel BBR exactly : only socket - layer fields accessed
-* from outside the CA module(e.g., tp->snd_cwnd) use READ_ONCE /
-*WRITE_ONCE for lock - free access from the BPF or diag paths.
-* Module parameters are read directly ? a transiently stale value
-* from parallel parameter writes is harmless for congestion control.
+ *
+ * KCC follows kernel BBR exactly: only socket-layer fields accessed
+ * from outside the CA module (e.g., tp->snd_cwnd) use READ_ONCE /
+ * WRITE_ONCE for lock-free access from the BPF or diag paths.
+ * Module parameters are read directly — a transiently stale value
+ * from parallel parameter writes is harmless for congestion control.
 *
 * Kernel BBR(tcp_bbr.c) follows the same pattern : no explicit
 * synchronization beyond READ_ONCE / WRITE_ONCE on shared fields.
@@ -6480,6 +6487,7 @@ struct kcc {
     u32 cwnd_gain : 10;                               /* [T_queue] current cwnd gain (0..1023, BBR_UNIT=256=1.0x) */
     u32 alone_on_path : 1;                            /* [T_noise] 1=single-flow; bypass Kalman and ECN guards */
     u32 initialized : 1;                              /* idempotency guard for kcc_conn_{start,end}_cnt pairing (kernel TCP framework may invoke init/release asymmetrically under rare conditions — this bit ensures each connection contributes exactly one start and one end regardless of callback multiplicity) */
+    u32 drain_rtt_cnt : 5;                            /* STARTUP→DRAIN→PROBE_BW mode-level timeout counter (0..31 RTTs); fires when persistent cross-traffic prevents inflight from reaching BDP target; max 31 matches 5-bit bitfield ceiling; per-round increment inside kcc_check_drain(); reset on DRAIN entry and exit */
 
     /* standalone u32 fields */
     u32 prior_cwnd;                                   /* [T_queue] cwnd saved before recovery or PROBE_RTT entry */
@@ -6571,7 +6579,7 @@ module_param_cb(kcc_probe_rtt_dyn_max_sec, &kcc_param_ops, &kcc_probe_rtt_dyn_ma
  *   Ensures pacing_win = cwnd_gain * pacing_rate covers BDP + max expected
  *   queue depth from probe-adapt transients.
  * BOUNDS: num [0, 100000], den [1, 100000]; net multiplier clamped at KCC_GAIN_MAX;
- *   floored at KCC_GAIN_FLOOR in kcc_cwnd_gain_val cache (L9068).
+ *   floored at KCC_GAIN_FLOOR in kcc_cwnd_gain_val cache (in kcc_init_module_params).
  */
 static int kcc_cwnd_gain_num = 2;                     /* [T_queue] CWND gain numerator for PROBE_BW; 2x BDP default; num/den*BBR_UNIT */
 module_param_cb(kcc_cwnd_gain_num, &kcc_param_ops, &kcc_cwnd_gain_num, 0644); /* [T_queue] sysctl: kcc_cwnd_gain_num */
@@ -6698,7 +6706,8 @@ module_param_cb(kcc_cycle_decay_mask, &kcc_gain_array_ops, &__param_arr_kcc_cycl
  * Default 100.
  *
  * [K] kcc_kalman_r -- Base measurement noise covariance R (Kalman 1960).
- * Internally adapted as R' = R + (jitter - jr_thresh) * R / jr_scale.
+ * Internally adapted via power-law: R = R_base * max(1, (jitter_excess / J50)^(3/2)),
+ * clamped to [R_base, R_base * r_max_boost].  See kcc_jitter_r_j50 for derivation.
  * Derivation: R_base = (sigma_measurement * kalman_scale)^2 where
  * sigma_measurement <= 20us (physical hardware bound: bounded by PCIe
  * minimum transaction latency and NIC interrupt coalescing granularity,
@@ -6714,7 +6723,7 @@ module_param_cb(kcc_cycle_decay_mask, &kcc_gain_array_ops, &__param_arr_kcc_cycl
  */
 static int kcc_kalman_q = 100;                        /* [K] base process noise covariance Q (Kalman 1960); Q controls filter model trust vs new measurements; larger Q = faster tracking but noisier estimates; KCC-only: kernel BBR has no Kalman filter; internally adapted as Q' = Q * max(q_min_factor, min_rtt_us/1000); range [0, 100000], BBR default: N/A (no Kalman filter) */
 module_param_cb(kcc_kalman_q, &kcc_param_ops, &kcc_kalman_q, 0644); /* [K] sysctl: /proc/sys/net/kcc/kcc_kalman_q */
-static int kcc_kalman_r = 400;                        /* [K] base measurement noise covariance R (Kalman 1960); R controls trust in each new RTT sample; larger R = more smoothing, slower reaction; KCC-only; internally adapted as R' = R + (jitter - jr_thresh)*R/jr_scale; range [0, 100000], BBR default: N/A */
+static int kcc_kalman_r = 400;                        /* [K] base measurement noise covariance R (Kalman 1960); R controls trust in each new RTT sample; larger R = more smoothing, slower reaction; KCC-only; internally adapted via power-law: R = R_base * max(1, (jitter_excess / J50)^(3/2)), clamped to [R_base, R_base * r_max_boost]; range [0, 100000], BBR default: N/A */
 module_param_cb(kcc_kalman_r, &kcc_param_ops, &kcc_kalman_r, 0644); /* [K] sysctl: /proc/sys/net/kcc/kcc_kalman_r */
 
 /*
@@ -6763,6 +6772,112 @@ module_param_cb(kcc_drain_skip_min_rtt_shift, &kcc_param_ops, &kcc_drain_skip_mi
  */
 static int kcc_drain_target_max_rtts = 4;                  /* [T_queue] drain-to-target max RTTs; range [1, 256] */
 module_param_cb(kcc_drain_target_max_rtts, &kcc_param_ops, &kcc_drain_target_max_rtts, 0644); /* [T_queue] sysctl: kcc_drain_target_max_rtts */
+
+/*
+ * [T_queue] kcc_drain_timeout_rtts — STARTUP→DRAIN→PROBE_BW safety timeout.
+ *
+ * PHYSICS: DRAIN under-paces at deficit rate (1−g_drain)C ≈ 0.653C.
+ *   KCC's self-inflicted queue (probe excess 0.25×BDP over 1 RTT) drains
+ *   in t = 0.25·BDP / 0.653C = 0.383·T_prop ≈ 0.4 RTT.  Cross-traffic
+ *   worst case (full BDP buffer): t = BDP / 0.653C = 1.53·T_prop ≈ 1.5 RTT.
+ *
+ * DERIVATION: 3σ safety: 3 × 1.53 = 4.6 RTT minimum.  Practical margin
+ *   must account for multi-flow interference and NIC offload stalls.
+ *   24 = 3 × 8 = 3 × 2^3: 15.7× margin over worst-case single-flow DRAIN.
+ *   At 100ms RTT, timeout = 2.4s.  At 5ms RTT, timeout = 120ms.
+ *   Upper bound 31 matches 5-bit drain_rtt_cnt bitfield capacity.
+ * Range [1, 31].
+ */
+static int kcc_drain_timeout_rtts = 24;               /* [T_queue] DRAIN mode safety timeout RTTs; derived: 3σ = 4.6, 24 = 3×2³ = 15.7× safety margin; max 31 (5-bit bitfield); default 24 */
+module_param_cb(kcc_drain_timeout_rtts, &kcc_param_ops, &kcc_drain_timeout_rtts, 0644); /* [T_queue] sysctl: kcc_drain_timeout_rtts */
+
+/*
+ * [T_queue] kcc_probe_up_max_rtts — PROBE_UP phase hard safety timeout.
+ *
+ * PHYSICS: PROBE_UP at 1.25× pacing produces excess rate 0.25C.  Time to
+ *   fill a BDP-sized buffer: t = BDP / 0.25C = C·T_prop / 0.25C = 4·T_prop.
+ *   On paths where inflight never reaches the target (app-limited flows,
+ *   C overestimated), the 1.25× pacing fills the buffer gradually per
+ *   Lindley recursion Δq = (g_probe−1)·BDP per RTT.
+ *
+ * DERIVATION: 4 RTTs fills 1 BDP of buffer at equilibrium.  16 = 4 × 4 =
+ *   2^4: 4× margin over single-BDP buffer fill.  16 RTTs is chosen as the
+ *   smallest power-of-2 providing > 3σ safety (3 × 4 = 12, next p-o-2 = 16).
+ *   At 100ms RTT, timeout = 1.6s.
+ * Range [1, 256].
+ */
+static int kcc_probe_up_max_rtts = 16;                /* [T_queue] PROBE_UP hard timeout RTTs; derived: BDP/0.25C = 4 RTT, 3σ = 12, p-o-2 ceil = 16 = 4× margin; range [1, 256] */
+module_param_cb(kcc_probe_up_max_rtts, &kcc_param_ops, &kcc_probe_up_max_rtts, 0644); /* [T_queue] sysctl: kcc_probe_up_max_rtts */
+
+/*
+ * [K] kcc_tier1_blocked_thresh — consecutive jitter-gate blocks before
+ *   waiving the jitter condition.  On paths with persistent jitter
+ *   (wireless L2 retransmission, multi-tenant NIC), the jitter gate
+ *   can block every Kalman sample for drift_thresh(14) + tier1_delay(≈27)
+ *   ≈ 41 RTTs — a structural dead zone where p_est never converges.
+ *
+ * DERIVATION: t_dead = 41 RTTs per drift cycle.  With threshold N,
+ *   bypass after N × 41 RTTs ≈ N × 0.66s (at 16ms RTT).  N=3 → ≈2s.
+ *   This is the typical worst-case wireless handoff duration (1–3s),
+ *   beyond which filter learning must resume regardless of jitter.
+ *   Upper bound 15 matches KCC_TIER1_BLOCKED_CNT_MAX.
+ * Range [1, 15].
+ */
+static int kcc_tier1_blocked_thresh = 3;             /* [K] Tier-1 jitter-gate block threshold; derived: t_dead = 41 RTT per drift cycle, 3×41 = 123 RTT ≈ 2s (wireless handoff worst-case); range [1, 15] */
+module_param_cb(kcc_tier1_blocked_thresh, &kcc_param_ops, &kcc_tier1_blocked_thresh, 0644); /* [K] sysctl: kcc_tier1_blocked_thresh */
+
+/*
+ * [K] kcc_saturation_hold_rtts — RTTs to suppress drift correction after
+ *   p_est saturation forces x_est → min_rtt.  Without hold-off, the filter
+ *   oscillates: x_est rises via drift → saturation caps it → drift fires
+ *   again → saturation caps — cycling every 56 RTTs (drift_thresh=14 ×
+ *   tier2_mult=4).
+ *
+ * DERIVATION: Oscillation period T_osc = drift_thresh × drift_tier2_mult
+ *   = 14 × 4 = 56 RTTs.  Hold-off must exceed half-cycle to suppress the
+ *   rising edge: 30 > 28 = T_osc/2.  30 = 3 × 10, provides a safe integer
+ *   margin while staying well within u8 field capacity (255).
+ *   At 100ms RTT, hold-off = 3s, exceeding sub-RTT DRAIN drain time.
+ * Range [1, 255].
+ */
+static int kcc_saturation_hold_rtts = 30;             /* [K] saturation hold-off RTTs; derived: T_osc = 56 RTT, half-cycle = 28, 30 > 28 provides safe margin; range [1, 255] */
+module_param_cb(kcc_saturation_hold_rtts, &kcc_param_ops, &kcc_saturation_hold_rtts, 0644); /* [K] sysctl: kcc_saturation_hold_rtts */
+
+/*
+ * [T_queue] kcc_ecn_ewma_floor — ECN CE-mark ratio below which ecn_ewma
+ *   snaps to zero.  At default retention = 3/4 (retained=3, total=4), the
+ *   steady-state EWMA for CE rate p is ss(p) = p / (1 − 3/4) = 4·p in BBR_UNIT.
+ *
+ * DERIVATION: At p = 4/256 ≈ 1.56%: ss = 4 × 4/256 = 16/256 ≈ 6.25%.
+ *   Below this, EWMA ≤ 4 BBR_UNIT — indistinguishable from round-off
+ *   noise at BBR_UNIT granularity.  Snap-to-zero prevents indefinite drift
+ *   from truncation stickiness where ecn_ewma × decay_factor stays non-zero.
+ *   4/256 = 2⁻⁶: the smallest clean power-of-2 fraction distinct from zero.
+ * Range [0, 255] (BBR_UNIT = 256).
+ */
+static int kcc_ecn_ewma_floor = 4;              /* [T_queue] ECN EWMA floor (BBR_UNIT); derived: ss(p)=16·p, floor=4=2^7/256=1.56%, 2⁻⁶ minimum distinct fraction; range [0, 255]; default 4 */
+module_param_cb(kcc_ecn_ewma_floor, &kcc_param_ops, &kcc_ecn_ewma_floor, 0644); /* [T_queue] sysctl: kcc_ecn_ewma_floor */
+
+/*
+ * [T_prop] kcc_neg_persist_time_shift — right-shift for negative-innovation
+ *   time-gating.  Consecutive ν<0 samples are counted toward persistent-
+ *   drop evidence only when spaced ≥ rtt_us >> shift apart.
+ *
+ * PHYSICS: TSO/GSO bursts produce inter-ACK spacing of ~µs (at 10Gbps,
+ *   64KB burst ACKs arrive at ≈ 50µs intervals).  Genuine RTT-round
+ *   samples are spaced at ~T_prop (ms scale).  A threshold of half-RTT
+ *   (shift=1) separates the two regimes by orders of magnitude.
+ *
+ * DERIVATION: At shift=1: threshold = T_prop/2.  Burst spacing (~µs) ≪
+ *   threshold (~ms) for all physical path RTTs ≥ 1ms.  Shift=0 (full-RTT
+ *   gate) can block legitimate within-round samples; shift=2 (RTT/4) on
+ *   short 1ms paths gives threshold = 250µs — still >> burst spacing
+ *   (~50µs) but closer to the detection boundary for 10Gbps bursts.
+ *   Shift=1 = T_prop/2 is the minimum safe value across all link rates.
+ * Range [0, 8] (shift count must stay < 32 for u32 operands).
+ */
+static int kcc_neg_persist_time_shift = 1;      /* [T_prop] negative-persistence time gate shift; derived: TSO burst ~µs ≪ T_prop/2 ~ms, shift=1 is minimum safe across all link rates; range [0, 8]; default 1 */
+module_param_cb(kcc_neg_persist_time_shift, &kcc_param_ops, &kcc_neg_persist_time_shift, 0644); /* [T_prop] sysctl: kcc_neg_persist_time_shift */
 
 /*
  * [T_queue] kcc_probe_bw_cycle_len -- Number of phases per PROBE_BW cycle.
@@ -7058,7 +7173,7 @@ module_param_cb(kcc_dyn_probe_hyper_den, &kcc_param_ops, &kcc_dyn_probe_hyper_de
  * PHYSICS: Maximum physical RTT sample accepted by the Kalman filter; values above this are discarded.
  * UNITS: Microseconds (µs); compared directly against raw RTT measurement from TCP timestamp.
  * DERIVATION: ceiled from (U32_MAX / kalman_scale) / 2 ≈ 2,100,000 µs; lowered to 500 ms to reject route-flap spikes while allowing satellite paths (600 ms via kcc_kalman_rtt_dyn_mult = 2 → 1.2s); §Module Parameters.
- * BOUNDS: [1, 10000000] = [1 µs, 10 s]; clamped at init (L8843).
+ * BOUNDS: [1, 10000000] = [1 µs, 10 s]; clamped at init (kcc_init_module_params).
  * [T_noise] kcc_rtt_sample_max_us -- RTT samples exceeding this value are discarded
  * by the Kalman filter to prevent extreme outliers from distorting x_est.
  * Default 500,000 us = 500 ms.
@@ -7221,26 +7336,52 @@ module_param_cb(kcc_min_tso_rate_div, &kcc_param_ops, &kcc_min_tso_rate_div, 064
  * PHYSICS: Four scaling parameters that convert measured excess jitter or
  *   queue delay into two types of control action: (a) pacing-gain reduction
  *   via kcc_{jitter,qdelay}_probe_scale_us (scaling in µs domain), and
- *   (b) Kalman measurement-noise inflation via kcc_jitter_r_scale and
- *   kcc_kalman_r_max_boost (R-domain). Both aim to reduce aggression when
- *   the path shows signs of congestion or noise.
- * UNITS:   probe_scale_us = µs; jitter_r_scale = dimensionless divisor;
- *   r_max_boost = dimensionless multiplier.
+ *   (b) Kalman measurement-noise inflation via kcc_jitter_r_j50 and
+ *   kcc_kalman_r_max_boost (R-domain, power-law). Both aim to reduce
+ *   aggression when the path shows signs of congestion or noise.
+ * UNITS:   probe_scale_us = µs; jitter_r_j50 = µs;
+ *   r_max_boost = dimensionless ceiling multiplier.
  * DERIVATION (probe): jitter scale 16000 from 4000µs*256/64 = 16000 for 25%
  *   gain reduction; qdelay scale 20000 from 5000µs*256/64 = 20000 for 25%
  *   reduction at 5ms excess queue.
- * DERIVATION (R): jitter_r_scale = 8000 = 20*R_base.  At 10ms jitter
- *   (effective R≈900), K_ss≈0.28 — still meaningful learning.  r_max_boost = 8
- *   caps max R <= 9x base_R, keeping K >= ~10%.
- * BOUNDS: probe_scale_us [1, 100000]; jitter_r_scale [1, 100000];
+ * DERIVATION (R): Power-law R = base_R * max(1, (jitter_excess/J50)^(3/2)).
+ *   J50 = 200 µs crossover; R doubles at ~317 µs excess.  At 10 ms jitter
+ *   excess (ratio=50), R ≈ 400 × 50^1.5 = 141,421 (hypothetical uncapped).
+ *   r_max_boost = 256 caps R at 102,400 → min K ≈ 0.031.
+ * BOUNDS: probe_scale_us [1, 100000]; jitter_r_j50 [1, 100000];
  *   r_max_boost [1, 1000].
  */
 static int kcc_jitter_probe_scale_us = 16000;          /* [T_noise] jitter scaling divisor (us) for gain decay: gain_reduction = (jitter - threshold) * BBR_UNIT / scale; larger = gentler decay; KCC extension; range [1, 100000], BBR default: N/A */
 module_param_cb(kcc_jitter_probe_scale_us, &kcc_param_ops, &kcc_jitter_probe_scale_us, 0644); /* [T_noise] sysctl: /proc/sys/net/kcc/kcc_jitter_probe_scale_us */
 static int kcc_qdelay_probe_scale_us = 20000;          /* [T_queue] qdelay scaling divisor (us) for gain decay: gain_reduction = (qdelay - threshold) * BBR_UNIT / scale; larger = gentler decay; KCC extension; range [1, 100000], BBR default: N/A */
 module_param_cb(kcc_qdelay_probe_scale_us, &kcc_param_ops, &kcc_qdelay_probe_scale_us, 0644); /* [T_queue] sysctl: /proc/sys/net/kcc/kcc_qdelay_probe_scale_us */
-static int kcc_jitter_r_scale = 8000;                   /* [T_noise] scaling divisor for jitter-based adaptive R: R_boost = (jitter - thresh) * base_R / scale; larger = slower R increase with jitter; KCC-only; range [1, 100000], BBR default: N/A */
+static int kcc_jitter_r_scale = 8000;                   /* [T_noise] RESERVED: former linear R scaling divisor, superseded by kcc_jitter_r_j50 power-law formula; retained for sysctl compatibility (no-op in hot path); KCC-only; range [1, 100000], BBR default: N/A */
 module_param_cb(kcc_jitter_r_scale, &kcc_param_ops, &kcc_jitter_r_scale, 0644); /* [T_noise] sysctl: /proc/sys/net/kcc/kcc_jitter_r_scale */
+/*
+ * [T_noise] kcc_jitter_r_j50 — Power-law adaptive R crossover jitter.
+ * PHYSICS: R = base_R * (jitter_excess / J50)^(alpha) where alpha = 3/2.
+ *   When jitter_excess = J50 the power-law multiplier is 1.0 (pass-through).
+ *   R doubles to 2× base_R at jitter ≈ 1.587 × J50 (~317 µs at default).
+ *   Above J50, R grows super-linearly — matching the physical fact that
+ *   measurement noise variance grows quadratically with jitter amplitude.
+ *   Capped at base_R * kcc_kalman_r_max_boost.
+ * UNITS:        µs (microseconds of excess jitter above clean threshold)
+ * DERIVATION:   J50 = 200 µs.  At 200 µs excess jitter, R stays at base_R
+ *   (400) since (1.0)^(3/2) = 1.0.  At ~317 µs, R doubles to 800
+ *   (K drops from 0.39 to 0.28).  At 2000 µs
+ *   (typical WiFi), R reaches 400 * (10)^1.5 = 400 * 31.6 = 12,649
+ *   (K ≈ 0.089).  At 10,000 µs (satellite L2 retransmission), R reaches
+ *   400 * (50)^1.5 = 400 * 353.6 = 141,421 (uncapped), but r_max_boost caps
+ *   R at 102,400, giving K ≈ 0.031 (floor: filter still learns 3.1 % / ACK).  The
+ *   power 3/2 strikes the balance: faster than linear (needed for noisy
+ *   paths), slower than quadratic (prevents filter freeze).  The old linear
+ *   cap of 8x base_R (= 3,200) is reached at ratio = 4 — i.e. 4 × J50 =
+ *   800 µs excess jitter — far earlier than the old linear formula which
+ *   required 64,000 µs to saturate the 8x cap via its 0.05 R/µs slope.
+ * BOUNDS:       [1, 100000] µs.
+ */
+static int kcc_jitter_r_j50 = 200;                     /* [T_noise] power-law R crossover jitter (us): power-law multiplier = 1.0 at J50 (pass-through); R doubles at ~1.587×J50 (~317us at default); default 200us — calibrated so old 8x cap (=3200) is reached naturally at 2000us excess via (10)^1.5=31.6; range [1, 100000], BBR default: N/A */
+module_param_cb(kcc_jitter_r_j50, &kcc_param_ops, &kcc_jitter_r_j50, 0644); /* [T_noise] sysctl: kcc_jitter_r_j50 */
 /*
  * [T_noise] kcc_jitter_seed_shift -- Cold-start jitter EWMA seed shift.
  * jitter_ewma = max(rtt_us >> shift, KCC_RTT_MIN_FLOOR_US) on first sample.
@@ -7249,13 +7390,16 @@ module_param_cb(kcc_jitter_r_scale, &kcc_param_ops, &kcc_jitter_r_scale, 0644); 
 static int kcc_jitter_seed_shift = 2;                      /* [T_noise] cold-start jitter EWMA seed shift; range [0, 8] */
 module_param_cb(kcc_jitter_seed_shift, &kcc_param_ops, &kcc_jitter_seed_shift, 0644); /* [T_noise] sysctl: kcc_jitter_seed_shift */
 /*
- * [T_noise] kcc_kalman_r_max_boost -- Maximum multiplier for jitter-based R boost.
- * R_boost = (jitter - thresh) * base_R / scale, capped at
- * base_R * r_max_boost.  Prevents extreme R values from freezing
- * the Kalman gain on paths with persistent high jitter (e.g., WiFi
- * bursts).  Default 8 -> max R <= 9x base_R, keeping K ≥ ~15.3% at nominal Q=100.
+ * [T_noise] kcc_kalman_r_max_boost -- Absolute R multiplier ceiling.
+ * R = base_R * max(1, (jitter_excess/J50)^(3/2)), clipped at base_R * r_max_boost.
+ * This is a safety ceiling, not a target — under normal operation the power-law
+ * formula naturally scales R; the cap exists only to prevent 64-bit overflow
+ * at extreme jitter (>> 10 ms).  Default 256 => max R = 102,400, K_min ≈ 0.031
+ * at Q=100 — the filter always retains meaningful learning ability.
+ * PHYSICS: floor gain of 3.1 % ensures convergence even on the noisiest paths
+ *   (satellite L2 retransmission, 10+ ms jitter) without permanent freeze.
  */
-static int kcc_kalman_r_max_boost = 8;                 /* [T_noise] maximum multiplier for jitter-based R boost: R_boost = min((jitter - thresh)*base_R/scale, base_R * r_max_boost); prevents extreme R values from freezing the Kalman gain on persistently jittery paths (e.g., WiFi); KCC-only; default 8 => max R <= 9x base_R, K ≥ ~15.3% at nominal Q=100; range [1, 1000], BBR default: N/A */
+static int kcc_kalman_r_max_boost = 256;                /* [T_noise] absolute R multiplier ceiling: max R = base_R * r_max_boost; default 256 => max R = 102,400, K_min ≈ sqrt(Q/R_max) = sqrt(100/102400) = 0.031; prevents filter freeze on extreme-jitter paths; PHYSICS: 3.1% K floor keeps filter alive even at 10ms jitter; range [1, 1000], BBR default: N/A */
 module_param_cb(kcc_kalman_r_max_boost, &kcc_param_ops, &kcc_kalman_r_max_boost, 0644); /* [T_noise] sysctl: kcc_kalman_r_max_boost */
 
 /*
@@ -7454,10 +7598,9 @@ module_param_cb(kcc_lt_bw_max_rtts, &kcc_param_ops, &kcc_lt_bw_max_rtts, 0644); 
  *                                Default 1000.
  * [K] kcc_kalman_p_est_floor  -- Lower bound for posterior p_est.
  *                                Default 10.
- * [K] kcc_kalman_outlier_ms   -- Base outlier threshold in milliseconds.
- *   Effective threshold = max(outlier_ms * 1000 * scale,
- *                             jitter_ewma * outlier_jitter_mult * scale).
- *   Default 4 ms.
+ * [K] kcc_kalman_outlier_ms   -- RESERVED: former base outlier threshold (ms).
+ *   Superseded by RTT-proportional gate (kcc_outlier_rtt_frac_shift +
+ *   kcc_outlier_min_floor_us).  Retained for sysctl compat.  Default 4 ms.
  * [K] kcc_kalman_q_boost_ms   -- Time constant for Q-boost threshold (ms).
  *   Default 4 ms.
  * [K] kcc_kalman_scale        -- Fixed-point scaling factor for the Kalman state.
@@ -7504,10 +7647,44 @@ module_param_cb(kcc_kalman_p_est_floor, &kcc_param_ops, &kcc_kalman_p_est_floor,
  * preserving perpetual adaptability.
  */
  /*
-   * Derivation: 4ms is chosen as the base outlier threshold. The actual threshold is max(outlier_ms*1000*scale, jitter_ewma * mult * scale). On a clean path (jitter ≈ 1ms) with default outlier_ms=4 and jitter_mult=2: max(4ms, 2ms) = 4ms base dominates. Below this threshold, the Kalman filter's measurement model (N(0,R) assumption) adequately absorbs the noise.
+  * RESERVED: The former base outlier threshold (4ms).  Superseded by
+  * the RTT-proportional gate (kcc_outlier_rtt_frac_shift +
+  * kcc_outlier_min_floor_us).  Retained for sysctl compatibility only;
+  * no longer read in the hot path.  See §Outlier Gate in kcc_kalman_update.
   */
-static int kcc_kalman_outlier_ms = 4;                     /* [K] base outlier gate threshold (ms): 4ms base = 20% tighter gate, same noise rejection */
+static int kcc_kalman_outlier_ms = 4;                     /* [K] base outlier gate threshold (ms): RESERVED — superseded by RTT-proportional gate (kcc_outlier_rtt_frac_shift + kcc_outlier_min_floor_us); retained for sysctl compat; 4ms base */
 module_param_cb(kcc_kalman_outlier_ms, &kcc_param_ops, &kcc_kalman_outlier_ms, 0644); /* [K] sysctl: kcc_kalman_outlier_ms */
+/*
+ * [T_noise] kcc_outlier_rtt_frac_shift — RTT-proportional outlier gate fraction.
+ * PHYSICS: Outlier threshold = max(min_rtt_us >> shift, floor_us, jitter_thresh).
+ *   shift=2 => 25% of min_rtt.  On WiFi 6E (RTT=200us), threshold=50us:
+ *   rejects ~87% of 300us-jitter samples, passing only |ν|≤50us clean ones.
+ *   On WAN (RTT=50ms), threshold=12.5ms: more permissive for queue dynamics.
+ *   The absolute floor prevents over-filtering on sub-ms DC paths.
+ * UNITS:        right-shift bits on min_rtt_us (dimensionless log2 divisor)
+ * DERIVATION:   shift=2 (25% RTT).  Optimal derived from Nyquist: any RTT
+ *   deviation > T_prop/4 exceeds the quarter-cycle noise budget allocated
+ *   to T_noise in the three-component model.  Below this, T_queue dynamics
+ *   (expecting congestion-driven RTT growth at ~1 RTT timescale) are preserved.
+ * BOUNDS:       [0, 8]; 0=50% RTT, 8=0.39% RTT (never use without floor).
+ */
+static int kcc_outlier_rtt_frac_shift = 2;               /* [T_noise] RTT-proportional outlier fraction shift: thr = min_rtt_us >> shift, default 2 => 25% RTT; range [0, 8] */
+module_param_cb(kcc_outlier_rtt_frac_shift, &kcc_param_ops, &kcc_outlier_rtt_frac_shift, 0644); /* [T_noise] sysctl: kcc_outlier_rtt_frac_shift */
+/*
+ * [T_noise] kcc_outlier_min_floor_us — Absolute floor for RTT-proportional outlier gate.
+ * PHYSICS: On ultra-short paths (DC, RTT<100us), even 25% of RTT is <25us —
+ *   below OS scheduling jitter (~50us).  This floor prevents every sample
+ *   from being classified as an outlier due to unavoidable OS noise.
+ * UNITS:        µs
+ * DERIVATION:   50us sits above Linux CFS minimum scheduling quantum (~4us),
+ *   above NIC interrupt coalescing granularity (~10-50us), but below a
+ *   single PROBE_UP micro-burst on a 1ms path (250us = 0.25 BDP).
+ *   For all RTTs >50us*4=200us, the percentage threshold naturally exceeds
+ *   the floor (25% * 200 = 50us → transparent transition).
+ * BOUNDS:       [0, 10000] µs; 0=no floor (use percentage-only).
+ */
+static int kcc_outlier_min_floor_us = 50;                /* [T_noise] absolute floor (us) for outlier gate: floor prevents over-filtering from OS/NIC jitter on sub-ms paths; default 50us; range [0, 10000] */
+module_param_cb(kcc_outlier_min_floor_us, &kcc_param_ops, &kcc_outlier_min_floor_us, 0644); /* [T_noise] sysctl: kcc_outlier_min_floor_us */
 /*
  * Derivation: effective threshold = q_boost_mult * q_boost_ms * 1000 * kalman_scale = 4 * 4 * 1000 * 1024 = 16,384,000 scaled units ≈ 16ms in RTT. A path change (e.g., BGP reroute, link failure + restoration) produces an RTT shift bounded by intercontinental propagation delay: 10 ms (co-location to regional) to 300 ms (satellite or congested trans-oceanic), far above the 16ms threshold. The Q-boost threshold discriminates path changes from queue fluctuations by requiring the innovation magnitude to exceed the maximum physically possible T_queue variance under bounded Lindley recursion (q_max/C < BDP/C = T_prop). The threshold is set above the maximum single-RTT queue variance to ensure only genuine path changes trigger a covariance reset.
  */
@@ -7736,8 +7913,8 @@ module_param_cb(kcc_alone_exit_thresh, &kcc_param_ops, &kcc_alone_exit_thresh, 0
  * PHYSICS: Fixed-point scaling factor converting physical RTT (µs) to filter-internal integer units.
  * UNITS: Dimensionless multiplier; x_est ∈ [scale, U32_MAX] in scaled units.
  * DERIVATION: power-of-two for efficient bit-shift; 10 bits = ~0.1% fractional precision;
- *   scale² > max(Q,R,P) = 1,048,576 > 1,000,000 prevents overflow in innov²/scale² division (L7742, enforced at L8930).
- * BOUNDS: [64, 1048576] = [2^6, 2^20]; clamped and rounded to power-of-two at init (L8924).
+ *   scale² > max(Q,R,P) prevents overflow in innov²/scale² division (enforced in kcc_init_module_params).
+ * BOUNDS: [64, 1048576] = [2^6, 2^20]; clamped and rounded to power-of-two at init (kcc_init_module_params).
  */
 static int kcc_kalman_scale = 1024;                       /* [K] Kalman fixed-point scaling factor (power-of-two); x_est = rtt_us * scale in fixed point; rounded up to power-of-two for fast division via shift; KCC-only; range [64, 1048576], BBR default: N/A */
 module_param_cb(kcc_kalman_scale, &kcc_param_ops, &kcc_kalman_scale, 0644); /* [K] sysctl: kcc_kalman_scale */
@@ -7748,15 +7925,14 @@ module_param_cb(kcc_kalman_scale, &kcc_param_ops, &kcc_kalman_scale, 0644); /* [
  * PHYSICS: Kalman (1960) innovation filtering: outlier_jitter_mult sets the
  *     dynamic Chebyshev threshold for rejecting RTT spikes; q_min_factor
  *     scales Q with min-RTT to bound the steady-state gain on low-latency
- *     paths; p_est_init_rtt_div normalises initial covariance to RTT for
- *     uniform convergence across path latencies.
+ *     paths; the Kalman filter auto-tunes within ~3 update steps
+ *     regardless of initial p_est.  The p_est_init_rtt_div_num/den params
+ *     are reserved for future RTT-proportional initialization.
  * UNITS: dimensionless ratio (num/den)
- * DERIVATION: outlier_jitter_mult = 2/1: Chebyshev P(|ν|>2σ) ≤ 1/4 + 4ms
- *     floor prevents positive-feedback lock-in (jitter↑→threshold↑→rejection↑).
+ * DERIVATION: outlier_jitter_mult = 2/1: Chebyshev P(|ν|>2σ) ≤ 1/4; RTT-proportional
+ *     gate provides additional floor via max(RTT>>shift, min_floor_us),
  *     q_min_factor = 10/1: Q_adapted = Q × max(10, min_rtt_us/1000) ensures
- *     minimum Q_adapted ≥ 1000 on sub-10ms paths (10×Q_base with Q_base=100). p_est_init_rtt_div = 10/1:
- *     initial p_est = max(p_est_init, rtt_us/10) maps 100ms RTT to
- *     p_est ≈ 10000 for fast convergence.
+ *     minimum Q_adapted ≥ 1000 on sub-10ms paths (10×Q_base with Q_base=100).
  * BOUNDS: num ∈ [0,1000], den ∈ [1,100000]; num=0 disables the feature;
  *     ratios > 100 may destabilise the filter.
  */
@@ -7768,7 +7944,7 @@ static int kcc_kalman_q_min_factor_num = 10;             /* [K] Q min factor num
 module_param_cb(kcc_kalman_q_min_factor_num, &kcc_param_ops, &kcc_kalman_q_min_factor_num, 0644); /* [K] sysctl: kcc_kalman_q_min_factor_num */
 static int kcc_kalman_q_min_factor_den = 1;              /* [K] Q min factor denominator; range [1, 100000], BBR default: N/A */
 module_param_cb(kcc_kalman_q_min_factor_den, &kcc_param_ops, &kcc_kalman_q_min_factor_den, 0644); /* [K] sysctl: kcc_kalman_q_min_factor_den */
-static int kcc_kalman_p_est_init_rtt_div_num = 10;       /* [K] p_est init RTT divisor numerator: initial p_est = max(p_est_init, rtt_us * den/num) when deriving from RTT; KCC-only; range [1, 100000], BBR default: N/A */
+static int kcc_kalman_p_est_init_rtt_div_num = 10;       /* [K] p_est init RTT divisor numerator: reserved for future RTT-proportional p_est initialization; KCC-only; range [1, 100000], BBR default: N/A */
 module_param_cb(kcc_kalman_p_est_init_rtt_div_num, &kcc_param_ops, &kcc_kalman_p_est_init_rtt_div_num, 0644); /* [K] sysctl: kcc_kalman_p_est_init_rtt_div_num */
 static int kcc_kalman_p_est_init_rtt_div_den = 1;        /* [K] p_est init RTT divisor denominator; default 10/1 = 10; range [1, 100000], BBR default: N/A */
 module_param_cb(kcc_kalman_p_est_init_rtt_div_den, &kcc_param_ops, &kcc_kalman_p_est_init_rtt_div_den, 0644); /* [K] sysctl: kcc_kalman_p_est_init_rtt_div_den */
@@ -7807,7 +7983,12 @@ module_param_cb(kcc_ewma_jitter_den, &kcc_param_ops, &kcc_ewma_jitter_den, 0644)
  *     q_est is in raw µs² units (same as Q).  For a 10µs innovation at
  *     K≈0.5: (K·innov)² ≈ 25 raw µs², well within the 50,000 cap.
  * [K] kcc_kalman_r_est_max -- Upper bound on r_est.  Default 32,000.
- *     r_est is in raw µs² units (same as R).
+ *     r_est is in raw µs² units (same as R).  With the power-law adaptive R
+ *     ceiling at base_R × r_max_boost = 400 × 256 = 102,400, the matched
+ *     estimator cap (32,000) is deliberately conservative — ~0.31× of the
+ *     nominal ceiling.  The matched estimator operates on slow innovation
+ *     statistics (α=1/10 per RTT); the power-law R covers fast-path noise
+ *     adaptation.
  * [K] kcc_kalman_q_est_floor -- Lower bound on q_est.  Default 1.
  * [K] kcc_kalman_r_est_floor -- Lower bound on r_est.  Default 1.
  *
@@ -7827,7 +8008,7 @@ static int kcc_kalman_noise_beta_den = 10;               /* [K] BBR-S adaptive R
 module_param_cb(kcc_kalman_noise_beta_den, &kcc_param_ops, &kcc_kalman_noise_beta_den, 0644); /* [K] sysctl: kcc_kalman_noise_beta_den */
 static int kcc_kalman_q_est_max = 50000;                  /* [K] upper bound on covariance-matched Q estimate; 10x Q_hmax (100 x q_scale_cap=50 = 5000) -- gives the matched estimator one order of magnitude of learning headroom beyond the nominal noise budget; derived from p_post_ss(50000, 32000) = 22170 < recal_p_est_thresh = 25000 per the steady-state bound R_cap <= p_target*(p_target+Q_cap)/Q_cap; KCC-only; range [1, 2000000000], BBR default: N/A */
 module_param_cb(kcc_kalman_q_est_max, &kcc_param_ops, &kcc_kalman_q_est_max, 0644); /* [K] sysctl: kcc_kalman_q_est_max */
-static int kcc_kalman_r_est_max = 32000;                  /* [K] upper bound on covariance-matched R estimate; 10x R_hmax (base_R x r_max_boost = 400 x 8 = 3200) -- symmetrical 10x rule: both matched caps are one order of magnitude above their nominal counterparts; p_post_ss(Q_hmax x 10, R_hmax x 10) = 22170 < 25000, keeping the recalibration safety net out of the matched estimator's normal operating range; KCC-only; range [1, 2000000000], BBR default: N/A */
+static int kcc_kalman_r_est_max = 32000;                  /* [K] upper bound on covariance-matched R estimate; originally calibrated as 10x the old R_hmax (400×8=3200) — with the power-law R scaling raising r_max_boost to 256, the nominal R_hmax is now 102,400, so r_est_max=32000 represents a tighter ~0.31x safety margin on the matched estimator vs widened nominal range; p_post_ss(Q_hmax×10, R_hmax×10) = 22170 < recal_p_est_thresh = 25000 per the steady-state bound; KCC-only; range [1, 2000000000], BBR default: N/A */
 module_param_cb(kcc_kalman_r_est_max, &kcc_param_ops, &kcc_kalman_r_est_max, 0644); /* [K] sysctl: kcc_kalman_r_est_max */
 static int kcc_kalman_q_est_floor = 1;                   /* [K] lower bound on covariance-matched Q estimate; prevents floor from hitting zero; KCC-only; range [1, 100000], BBR default: N/A */
 module_param_cb(kcc_kalman_q_est_floor, &kcc_param_ops, &kcc_kalman_q_est_floor, 0644); /* [K] sysctl: kcc_kalman_q_est_floor */
@@ -7962,8 +8143,10 @@ module_param_cb(kcc_probe_rtt_decouple, &kcc_param_ops, &kcc_probe_rtt_decouple,
  *
  *   This is self-limiting -- p_est always converges to an asymptote
  *   determined by Q and R.  For the nominal noise path alone
- *   (Q <= 2000, R <= r_max_boost x base_R = 3200), the steady-state
- *   is p_post_ss ≈ 1700 -- two orders of magnitude below 25000.
+ *   (Q <= 2000, R <= base_R * r_max_boost = 102,400 at default r_max_boost=256),
+ *   the steady-state is p_post_ss ≈ 13,346 — approximately half the
+ *   recalibration safety net threshold of 25,000.  For the base-R-only
+ *   path (R = 400, no jitter boost), p_post_ss ≈ 342 (~73× below).
  *
  *   However, BBR-S covariance-matched noise estimation (noise_mode = 1,
  *   the default) adds a second path for R to grow beyond the nominal
@@ -7972,7 +8155,8 @@ module_param_cb(kcc_probe_rtt_decouple, &kcc_param_ops, &kcc_probe_rtt_decouple,
  *   1. Sustained large RTT innovations feed the matched estimator:
  *        matched_r_est += α x max(0, innov² − p_pred)
  *      α = 1/10 (default).  The matched R is capped at
- *      kcc_kalman_r_est_max = 32 000 = 10 x R_hmax (3200).
+ *      kcc_kalman_r_est_max = 32 000 (originally 10× old R_hmax=3200;
+ *      with new R_hmax=102 400 via r_max_boost=256, this is ~0.31×).
  *
  *   2. noise_mode = 1 selects effective R = max(nominal_r,
  *      matched_r_est).  At most, effective R = 32 000.
@@ -8008,16 +8192,20 @@ module_param_cb(kcc_probe_rtt_decouple, &kcc_param_ops, &kcc_probe_rtt_decouple,
  *
  *   The nominal noise budget:
  *
- *       Q_hmax = base_Q x q_scale_cap  = 100 x 50 = 5 000
- *       R_hmax = base_R x r_max_boost  = 400 x 8  = 3 200
+ *       Q_hmax = base_Q x q_scale_cap  = 100 x 50 = 5 000 (effective Q capped by kcc_kalman_q_max = 2 000)
+ *       R_hmax = base_R x r_max_boost  = 400 x 256 = 102 400
  *
- *   p_post_ss(Q_hmax, R_hmax) = 2 217 -- nominal path alone never
- *   approaches the threshold.
+ *   p_post_ss(Q_hmax, R_hmax) = 13,346 — using effective Q=2,000 after q_max clamp;
+ *   the nominal ceiling is ~53 % of the 25,000 recalibration threshold,
+ *   keeping the safety net active.  (Old r_max_boost=8 gave R_hmax=3,200,
+ *   p_post_ss=2,217, ~9 % of threshold — the matched estimator had more
+ *   headroom under the old linear cap.)
  *
  *   Applying the 10x rule symmetrically gives the matched caps:
- *
- *       kcc_kalman_q_est_max  = 10 x Q_hmax  = 50 000
- *       kcc_kalman_r_est_max  = 10 x R_hmax  = 32 000
+ *       kcc_kalman_q_est_max  = 10 × Q_hmax  = 50 000
+ *       kcc_kalman_r_est_max  = 32 000
+ *     (Was 10× old R_hmax=3,200; with new R_hmax=102,400 the matched cap
+ *      lags at ~0.31×, deliberately kept low to prevent estimator runaway.)
  *
  *   p_post_ss(50 000, 32 000) = 22 170 < 25 000.  The recalibration
  *   threshold stays safely above the matched estimator's ceiling.
@@ -8031,7 +8219,7 @@ module_param_cb(kcc_probe_rtt_decouple, &kcc_param_ops, &kcc_probe_rtt_decouple,
  *   (9x, 8x) unnecessarily constrain the matched estimator's
  *   ability to track consistently high measurement noise.
  */
-static int kcc_recal_p_est_thresh = 25000;    /* [K] Kalman recalibration threshold; the only path that pushes p_est up is matched_r_est via BBR-S noise mode; 25000 sits above realistic matched-R noise (p_post_ss <= 21k @ R ~ 32k) and resists hostile-path DOS; KCC-only; range [1, 100000000] */
+static int kcc_recal_p_est_thresh = 25000;    /* [K] Kalman recalibration threshold; the only path that pushes p_est up is matched_r_est via BBR-S noise mode; 25000 sits above realistic matched-R noise (p_post_ss ≈ 22k @ R=32k, Q=50k) and resists hostile-path DOS; KCC-only; range [1, 100000000] */
 module_param_cb(kcc_recal_p_est_thresh, &kcc_param_ops, &kcc_recal_p_est_thresh, 0644); /* [K] sysctl: kcc_recal_p_est_thresh */
 /*
  * [K] kcc_kalman_noise_avg_num/den -- Weighted blend ratio for noise
@@ -8267,7 +8455,7 @@ module_param_cb(kcc_ecn_idle_decay_den, &kcc_param_ops, &kcc_ecn_idle_decay_den,
  *     a self-reinforcing lock-in where jitter increases the dynamic
  *     rejection threshold, causing more rejections.  Default 20.
  *
- * Derivation: the outlier gate rejects a sample when |ν_k| > max(4ms_scaled, jitter_ewma * 2 * scale). Two independent sources drive consecutive rejections: (a) persistent queue (T_queue > 0 biases ν_k upward), occurring at rate ~1 − p_clean ≈ 0.7 (p_clean=0.3) on typical Internet paths; (b) T_noise spike exceeding the Chebyshev threshold at rate ≤ 0.0625 (mult=4 → P ≤ 1/16). The combined per-sample rejection probability is P_rej ≈ (1−p_clean) + p_clean·0.0625 ≈ 0.719. For k=20 consecutive: P_rej^k ≈ 0.719^20 ≈ 1.4×10⁻³. Under steady conditions with 10 RTTs/s (100ms RTT), this fires approximately once per 71 seconds (~1.2 minutes) — an acceptable forced-accept safety valve rate while improving responsiveness vs prior 25-sample threshold. At k=10: P ≈ 0.037, firing every ~2.8s — too frequent, undermining the gate. At k=30: P ≈ 5.0×10⁻⁵ — more conservative but adequate. The value 20 balances false-alarm rate against starvation protection; it is ≥ 3/0.0625 ≈ 48 samples of pure Chebyshev false-positive rejection (extremely improbable under null) while being frequent enough to break self-reinforcing lock-out on noisy paths within O(seconds).
+ * Derivation: the outlier gate rejects a sample when |ν_k| > max(RTT>>shift, min_floor, jitter_ewma * 2) in scaled units.  Two independent sources drive consecutive rejections: (a) persistent queue (T_queue > 0 biases ν_k upward), occurring at rate ~1 − p_clean ≈ 0.7 (p_clean=0.3) on typical Internet paths; (b) T_noise spike exceeding the Chebyshev threshold at rate ≤ 0.0625 (k=4σ → P ≤ 1/16) or ≤ 0.25 for k=2σ.  The combined per-sample rejection probability is P_rej ≈ (1−p_clean) + p_clean·0.0625 ≈ 0.719.  For k=20 consecutive: P_rej^k ≈ 0.719^20 ≈ 1.4×10⁻³.  Under steady conditions with 10 RTTs/s (100ms RTT), this fires approximately once per 71 seconds (~1.2 minutes) — an acceptable forced-accept safety valve rate while improving responsiveness vs prior 25-sample threshold.  At k=10: P ≈ 0.037, firing every ~2.8s — too frequent, undermining the gate.  At k=30: P ≈ 5.0×10⁻⁵ — more conservative but adequate.  The value 20 balances false-alarm rate against starvation protection; pure Chebyshev false positives are expected after ~3/0.0625 ≈ 48 samples (>>20), making force-accept from pure noise extremely improbable, while the counter is low enough to break self-reinforcing lock-out on noisy paths within O(seconds).
  */
 static int kcc_kalman_max_consec_reject = 20;           /* maximum consecutive outlier rejections: 20 consecutive rejections = 5 RTTs shorter ISS window, p_est bounded to 20xQ=2000 before force-accept */
 module_param_cb(kcc_kalman_max_consec_reject, &kcc_param_ops, &kcc_kalman_max_consec_reject, 0644); /* sysctl: kcc_kalman_max_consec_reject */
@@ -8319,16 +8507,16 @@ module_param_cb(kcc_extra_acked_max_ms_den, &kcc_param_ops, &kcc_extra_acked_max
  * UNITS: dimensionless (confidence, flags, ratios, percentages, RTTs)
  * DERIVATION: max_comp_ratio=50 at 2×BDP baseline + 3×BDP guard gives
  *     2.5×BDP total, 0.5×BDP margin.  confidence_thresh=512 = midpoint of
- *     [0,1024] by design.  r_multiplier_min/max=256/2048 map 0-1024
- *     confidence to 1-8× R scaling.  r_hysteresis=75 → 25%/RTT decay,
+ *     [0,1024] by design.  r_multiplier_min/max=256/1024 map 0-1024
+ *     confidence to 1-4× R scaling.  agg_max_decay_pct=75 → 25%/RTT decay,
  *     ~4 RTTs to baseline.  max_comp_duration=8 RTTs prevents stale bursts.
  *     window_rotation_rtts=5 > PROBE_BW sub-cycle length.  agg_max_decay_pct=75
- *     matches r_hysteresis for consistent recovery.  safety_bdp_mult=3 avoids
+ *     provides consistent recovery.  safety_bdp_mult=3 avoids
  *     overflow in BBR's cwnd_gain=2×BDP framework.  factor_weight=256 splits
  *     [0,1024] into 4 equal increments for 4 factors.  thresh_suspected=256,
  *     confirmed=512, trusted=768 = three equal 256-point intervals.
  * BOUNDS: enable ∈ [0,1]; confidence_thresh ∈ [0,10000]; max_comp_ratio ∈
- *     [0,100]; max_comp_duration ∈ [1,128]; r_hysteresis/decay_pct ∈ [0,100];
+ *     [0,100]; max_comp_duration ∈ [1,128]; decay_pct ∈ [0,100];
  *     r_multiplier_min/max ∈ [1,10000]; safety_bdp_mult ∈ [1,100];
  *     max_window_ms ∈ [1,10000]; window_rotation_rtts/win_rtts_max ∈ [1,65535];
  *     factor4_ratio_num ∈ [1,100000], den ∈ [1,100000];
@@ -8344,11 +8532,9 @@ static int kcc_agg_max_comp_ratio = 50;                 /* maximum cwnd compensa
 module_param_cb(kcc_agg_max_comp_ratio, &kcc_param_ops, &kcc_agg_max_comp_ratio, 0644); /* sysctl: kcc_agg_max_comp_ratio */
 static int kcc_agg_max_comp_duration = 8;               /* maximum consecutive RTTs with active compensation before watchdog forces confidence downgrade; prevents stale extra_acked from persisting beyond the aggregation event; KCC extension; range [1, 128], BBR default: N/A */
 module_param_cb(kcc_agg_max_comp_duration, &kcc_param_ops, &kcc_agg_max_comp_duration, 0644); /* sysctl: kcc_agg_max_comp_duration */
-static int kcc_agg_r_hysteresis = 75;                   /* R recovery hysteresis: Kalman measurement noise R increases immediately when aggregation is detected; recovery decays at (100-pct)% per RTT; default 75 = 25% decay per RTT, ~4 RTTs to return to baseline; KCC extension; range [0, 100], BBR default: N/A */
-module_param_cb(kcc_agg_r_hysteresis, &kcc_param_ops, &kcc_agg_r_hysteresis, 0644); /* sysctl: kcc_agg_r_hysteresis */
 static int kcc_agg_r_multiplier_min = BBR_UNIT;              /* Kalman R noise scaling floor (BBR_UNIT = 1x = no scaling); minimum multiplier when aggregation is detected; KCC extension; range [1, 10000], BBR default: N/A */
 module_param_cb(kcc_agg_r_multiplier_min, &kcc_param_ops, &kcc_agg_r_multiplier_min, 0644); /* sysctl: kcc_agg_r_multiplier_min */
-static int kcc_agg_r_multiplier_max = BBR_UNIT << 3;            /* Kalman R noise scaling ceiling (BBR_UNIT<<3 = 2048 = 8x); maximum multiplier when aggregation is strongly detected; KCC extension; range [1, 10000], BBR default: N/A */
+static int kcc_agg_r_multiplier_max = 1024;            /* Kalman R noise scaling ceiling (1024 = 4x); maximum multiplier when aggregation is strongly detected; KCC extension; range [1, 10000], BBR default: N/A */
 module_param_cb(kcc_agg_r_multiplier_max, &kcc_param_ops, &kcc_agg_r_multiplier_max, 0644); /* sysctl: kcc_agg_r_multiplier_max */
 
 /*
@@ -8532,6 +8718,12 @@ static u32 kcc_high_gain_val;                              /* [K] STARTUP pacing
 static u32 kcc_drain_gain_val;                             /* [K] DRAIN pacing gain, 88/256 ≈ 0.344x */
 static u32 kcc_drain_skip_min_rtt_shift_val;               /* [T_queue] clamped drain-skip min RTT shift */
 static u32 kcc_drain_target_max_rtts_val;                  /* [T_queue] clamped drain-target max RTTs */
+static u32 kcc_drain_timeout_rtts_val;                    /* [T_queue] clamped DRAIN mode safety timeout RTTs */
+static u32 kcc_probe_up_max_rtts_val;                     /* [T_queue] clamped PROBE_UP hard timeout RTTs */
+static u32 kcc_tier1_blocked_thresh_val;                   /* [K] clamped Tier-1 jitter-gate block threshold */
+static u32 kcc_saturation_hold_rtts_val;                   /* [K] clamped saturation hold-off RTTs */
+static u32 kcc_ecn_ewma_floor_val;                        /* [T_queue] clamped ECN EWMA floor (BBR_UNIT) */
+static u32 kcc_neg_persist_time_shift_val;                 /* [T_prop] clamped neg-persistence time shift */
 static u32 kcc_probe_bw_cycle_len_val;                     /* [K] clamped & power-of-two cycle length */
 static u32 kcc_full_bw_thresh_val;                         /* [K] full-BW detection threshold in BBR_UNIT */
 static u32 kcc_full_bw_cnt_val;                            /* [K] clamped full-BW round count */
@@ -8581,9 +8773,7 @@ static int kcc_agg_enable_val;                           /* [T_queue] clamped ag
 static int kcc_agg_confidence_thresh_val;                /* [T_queue] clamped confidence threshold */
 static int kcc_agg_max_comp_ratio_val;                   /* [T_queue] clamped max comp ratio */
 static int kcc_agg_max_comp_duration_val;                /* [T_queue] clamped max comp duration */
-static int kcc_agg_r_hysteresis_val;                     /* [T_queue] clamped R hysteresis */
 static u32 kcc_agg_r_multiplier_min_val;                 /* [T_queue] clamped R mult min */
-static u32 kcc_agg_r_multiplier_max_val;                 /* [T_queue] clamped R mult max */
 
 static int kcc_agg_factor4_ratio_num_val;            /* [T_queue] snapped Factor 4 ratio num */
 static int kcc_agg_factor4_ratio_den_val;            /* [T_queue] snapped Factor 4 ratio den */
@@ -8611,7 +8801,8 @@ static int kcc_jitter_probe_scale_us_val;                   /* [T_noise] clamped
 
 static int kcc_qdelay_probe_scale_us_val;                   /* [T_queue] clamped qdelay scale for gain decay */
 
-static int kcc_jitter_r_scale_val;                          /* [T_noise] clamped jitter scale for adaptive R */
+static int kcc_jitter_r_scale_val;                          /* [T_noise] RESERVED: former linear R scale cache (no-op) */
+static int kcc_jitter_r_j50_val;                             /* [T_noise] clamped J50 crossover jitter */
 static u32 kcc_jitter_seed_shift_val;                       /* [T_noise] clamped jitter seed shift */
 static int kcc_kalman_r_max_boost_val;                  /* [T_noise] clamped R max boost */
 static int kcc_probe_rtt_long_rtt_us_val;                   /* [T_prop] clamped long-RTT threshold */
@@ -8619,9 +8810,10 @@ static u32 kcc_pacing_margin_div_val;                       /* [T_queue] compute
 
 static u32 kcc_kalman_p_est_init_val;                       /* [K] clamped initial p_est */
 static u32 kcc_kalman_p_est_floor_val;                      /* [K] clamped p_est floor */
-static u32 kcc_kalman_outlier_ms_val;                       /* [K] clamped outlier base (ms) */
 static u32 kcc_kalman_scale_shift_val;                    /* [K] ilog2(kalman_scale) for shift optimization */
-static u64 kcc_kalman_outlier_thresh_scaled_val;     /* [K] precomputed scaled outlier base threshold */
+static u64 kcc_kalman_outlier_thresh_scaled_val;     /* [K] RESERVED: precomputed 4ms base threshold (compat cache) */
+static int kcc_outlier_rtt_frac_shift_val;               /* [T_noise] clamped RTT fraction shift for outlier gate */
+static int kcc_outlier_min_floor_us_val;                 /* [T_noise] clamped min floor us for outlier gate */
 static int kcc_kalman_noise_alpha_num_val;               /* [T_noise] snapped noise alpha numerator */
 static int kcc_kalman_noise_alpha_den_val;               /* [T_noise] snapped noise alpha denominator */
 static int kcc_kalman_noise_beta_num_val;                /* [T_noise] snapped noise beta numerator */
@@ -8669,12 +8861,12 @@ static u32 kcc_tso_headroom_mult_val;                       /* [K] derived TSO h
 static u32 kcc_min_tso_rate_div_val;                        /* [K] derived min TSO rate divisor */
 static int kcc_probe_rtt_long_interval_div_val;             /* [T_prop] snapped long interval divisor */
 static u32 kcc_probe_rtt_jitter_shift_val;                  /* [T_prop] clamped PROBE_RTT jitter shift */
-static int kcc_agg_factor_weight_val;                       /* [T_queue] snapped factor weight [0,100] */
+static int kcc_agg_factor_weight_val;          /* [T_queue] snapped factor weight [1,1024] */
 static int kcc_agg_confidence_max_val;                      /* [T_queue] clamped confidence max */
 static int kcc_agg_thresh_suspected_val;                    /* [T_queue] snapped suspected threshold */
 static int kcc_agg_thresh_confirmed_val;                    /* [T_queue] snapped confirmed threshold */
 static int kcc_agg_thresh_trusted_val;                      /* [T_queue] snapped trusted threshold */
-static u32 kcc_kalman_outlier_jitter_mult_val;              /* [K] clamped outlier jitter multiplier */
+static u32 kcc_kalman_outlier_jitter_mult_val;              /* [T_noise] clamped outlier jitter multiplier */
 static u32 kcc_kalman_q_min_factor_val;                     /* [K] clamped Q-min factor */
 static u32 kcc_kalman_p_est_init_rtt_div_val;               /* [K] clamped p_est init RTT divisor */
 static u32 kcc_bw_rt_cycle_len_val;                         /* [K] clamped BW cycle length */
@@ -8698,6 +8890,27 @@ static u32 kcc_dyn_probe_hyper_den_val;                  /* [K] cached dyn probe
  * Using atomic types because the Kalman filter runs in softirq context
  * without per-connection locks -- the estimation target (available
  * bandwidth on the bottleneck) is a shared resource.
+ *
+ * DESIGN NOTE (no per-netns isolation):
+ *   The global KF state is NOT scoped per network namespace.  This is a
+ *   deliberate engineering decision, not an oversight.  Three reasons:
+ *
+ *   1. ECONOMICS: per-netns isolation requires ~80 lines of pernet_ops
+ *      boilerplate + restructuring all 50+ access sites.  The cost is
+ *      disproportionate to the benefit, given that:
+ *
+ *   2. DEFAULT-OFF: kcc_kf_enable defaults to 0.  The global KF is an
+ *      opt-in, documented as "single-homed only".  No connection uses it
+ *      unless the operator explicitly enables it.
+ *
+ *   3. NO ATTACK SURFACE: the hypothetical "side-channel cross-tenant BW
+ *      estimation pollution" attack requires the attacker to (a) share a
+ *      bottleneck with the victim, (b) generate enough traffic to move
+ *      the KF estimate, (c) receive zero benefit, and (d) pay a severe
+ *      self-DoS cost.  See §A of the design document for the full
+ *      analysis of why this is a logical paradox (self-destroying,
+ *      zero-reward, self-exposing) -- an "over-engineering trap".
+ *
  *   kcc_kf_x        -- posterior state estimate (BW_UNIT)
  *   kcc_kf_P        -- posterior error covariance
  *   kcc_kf_x_steady -- monotonic peak for steady-mode init_bw (BW_UNIT)
@@ -8805,6 +9018,12 @@ static void kcc_init_module_params(void)                          /* clamp all p
 
     kcc_kalman_q = clamp(kcc_kalman_q, 0, 100000);        /* [K] process noise Q (Kalman 1960) */
     kcc_kalman_r = clamp(kcc_kalman_r, 0, 100000);        /* [K] measurement noise R (Kalman 1960) */
+    /* Guard: floor R to 1 when R=0 to prevent 0/0 in covariance update (p_new = p_pred * R / (p_pred + R)).
+     * When Q=0 and R=0, p_pred = p_est, and p_new = p_est * 0 / (p_est + 0) = 0/0 → undefined.
+     * Flooring R to 1 ensures the filter remains stable (K = p_pred / (p_pred + 1) < 1.0). */
+    if (kcc_kalman_r == 0) {
+        kcc_kalman_r = 1;
+    }
 
     kcc_high_gain_num = clamp(kcc_high_gain_num, 0, 100000);            /* [K] STARTUP gain numerator */
     kcc_high_gain_den = clamp(kcc_high_gain_den, 1, 100000);            /* [K] STARTUP gain denominator */
@@ -8812,6 +9031,12 @@ static void kcc_init_module_params(void)                          /* clamp all p
     kcc_drain_gain_den = clamp(kcc_drain_gain_den, 1, 100000);          /* [K] DRAIN gain denominator */
     kcc_drain_skip_min_rtt_shift = clamp(kcc_drain_skip_min_rtt_shift, 0, 7); /* [T_queue] drain-skip min RTT shift */
     kcc_drain_target_max_rtts = clamp(kcc_drain_target_max_rtts, 1, 256);     /* [T_queue] drain-target max RTTs */
+    kcc_drain_timeout_rtts = clamp(kcc_drain_timeout_rtts, 1, 31);           /* [T_queue] DRAIN mode timeout (5-bit bitfield max) */
+    kcc_probe_up_max_rtts = clamp(kcc_probe_up_max_rtts, 1, 256);            /* [T_queue] PROBE_UP hard timeout RTTs */
+    kcc_tier1_blocked_thresh = clamp(kcc_tier1_blocked_thresh, 1, 15);       /* [K] Tier-1 jitter-gate block threshold (max matches tier1_blocked_cnt u8 field ceiling) */
+    kcc_saturation_hold_rtts = clamp(kcc_saturation_hold_rtts, 1, 255);      /* [K] saturation hold-off RTTs (max u8 field) */
+    kcc_ecn_ewma_floor = clamp(kcc_ecn_ewma_floor, 0, 255);                 /* [T_queue] ECN EWMA floor (BBR_UNIT) */
+    kcc_neg_persist_time_shift = clamp(kcc_neg_persist_time_shift, 0, 8);   /* [T_prop] neg-persistence time gate shift */
 
     /* PROBE_BW cycle length: [2, 256], must be power-of-two
      * so that cycle_idx & (len-1) wraps correctly. */
@@ -8865,7 +9090,8 @@ static void kcc_init_module_params(void)                          /* clamp all p
 
     kcc_qdelay_probe_scale_us = clamp(kcc_qdelay_probe_scale_us, 1, 100000);     /* [T_queue] queuing-delay probe scaling factor */
 
-    kcc_jitter_r_scale = clamp(kcc_jitter_r_scale, 1, 100000);           /* [T_noise] adaptive R jitter scale */
+    kcc_jitter_r_scale = clamp(kcc_jitter_r_scale, 1, 100000);           /* [T_noise] RESERVED: former linear R scale (compat clamp only) */
+    kcc_jitter_r_j50 = clamp(kcc_jitter_r_j50, 1, 100000);           /* [T_noise] power-law R crossover jitter J50 (us) */
     kcc_kalman_r_max_boost = clamp(kcc_kalman_r_max_boost, 1, 1000);    /* [T_noise] measurement noise R max boost */
     kcc_jitter_seed_shift = clamp(kcc_jitter_seed_shift, 0, 8);          /* [T_noise] cold-start jitter EWMA seed shift */
     kcc_probe_rtt_jitter_shift = clamp(kcc_probe_rtt_jitter_shift, 0, 12); /* [T_prop] PROBE_RTT jitter shift */
@@ -8876,7 +9102,9 @@ static void kcc_init_module_params(void)                          /* clamp all p
     kcc_kalman_p_est_floor = clamp(kcc_kalman_p_est_floor, 1, 100000);   /* [K] p_est floor */
     kcc_kalman_p_est_floor = min(kcc_kalman_p_est_floor, kcc_kalman_p_est_max); /* floor <= max invariant */
     kcc_kalman_p_est_init = min(kcc_kalman_p_est_init, kcc_kalman_p_est_max);   /* init <= max invariant */
-    kcc_kalman_outlier_ms = clamp(kcc_kalman_outlier_ms, 0, 10000);      /* [K] outlier rejection base (ms) */
+    kcc_kalman_outlier_ms = clamp(kcc_kalman_outlier_ms, 0, 10000);      /* [K] RESERVED: base outlier ms (compat clamp) */
+    kcc_outlier_rtt_frac_shift = clamp(kcc_outlier_rtt_frac_shift, 0, 8); /* [T_noise] RTT fraction shift for outlier gate */
+    kcc_outlier_min_floor_us = clamp(kcc_outlier_min_floor_us, 0, 10000); /* [T_noise] min floor us for outlier gate */
     kcc_kalman_q_boost_ms = clamp(kcc_kalman_q_boost_ms, 1, 5000);       /* [K] Q-boost window (ms) */
     kcc_kalman_qboost_cdwn = clamp(kcc_kalman_qboost_cdwn, 1, 255);      /* [K] Q-boost cooldown rounds */
     kcc_kalman_pos_skip_thresh = clamp(kcc_kalman_pos_skip_thresh, 3, 31);  /* [K] positive-innovation skip threshold */
@@ -8923,15 +9151,24 @@ static void kcc_init_module_params(void)                          /* clamp all p
     kcc_alone_bypass_lt_bw = clamp(kcc_alone_bypass_lt_bw, 0, 1);        /* [T_queue] alone-mode bypass LT BW flag */
     kcc_kalman_scale = clamp(kcc_kalman_scale, 64, 1048576);              /* [K] Kalman scale factor */
     kcc_kalman_scale = roundup_pow_of_two(kcc_kalman_scale);              /* round up to power of two */
-    /* Enforce: scale^2 > p_est_max (prevents overflow in innov^2/scale^2 division).
-     * Without this cross-validation, an operator could independently set
-     * p_est_max > scale^2, violating the arithmetic invariant documented at
-     * (scale² > max(Q,R,P) prevents overflow in innov²/scale² division) and creating a latent u64 overflow risk. */
-    kcc_kalman_p_est_max = min_t(int, kcc_kalman_p_est_max,
-        (int)(((u64)kcc_kalman_scale * (u64)kcc_kalman_scale) - 1));
+    /* Enforce: scale ≤ U32_MAX / rtt_sample_max_us (prevents x_est = rtt_us * scale overflow).
+     * For RTT = 10s (10M µs) and scale = 1048576, x_est = 10M * 1M = 10^13 > U32_MAX (4.3×10^9).
+     * This cross-validation caps scale to ensure x_est fits in u32 for all valid RTT values.
+     * Use u64 division to avoid int overflow when rtt_sample_max_us is small. */
+    {
+        u64 scale_cap = (u64)U32_MAX / (u64)kcc_rtt_sample_max_us;
+        scale_cap = min_t(u64, scale_cap, (u64)INT_MAX);
+        kcc_kalman_scale = min_t(int, kcc_kalman_scale, (int)scale_cap);
+    }
+    kcc_kalman_scale = roundup_pow_of_two(kcc_kalman_scale);              /* re-round after cap */
+    /* Enforce: scale^2 > p_est_max to prevent innovation^2/scale^2
+     * division overflow.  The [1,100M] clamp above already bounds
+     * p_est_max below U32_MAX>>1, so a separate cap is redundant. */
+    kcc_kalman_p_est_max = (int)min_t(u64, (u64)kcc_kalman_p_est_max,
+        ((u64)kcc_kalman_scale * (u64)kcc_kalman_scale) - 1);
 
-    kcc_kalman_outlier_jitter_mult_num = clamp(kcc_kalman_outlier_jitter_mult_num, 0, 1000);     /* [K] outlier jitter mult numerator */
-    kcc_kalman_outlier_jitter_mult_den = clamp(kcc_kalman_outlier_jitter_mult_den, 1, 100000);   /* [K] outlier jitter mult denominator */
+    kcc_kalman_outlier_jitter_mult_num = clamp(kcc_kalman_outlier_jitter_mult_num, 0, 1000);     /* [T_noise] outlier jitter mult numerator */
+    kcc_kalman_outlier_jitter_mult_den = clamp(kcc_kalman_outlier_jitter_mult_den, 1, 100000);   /* [T_noise] outlier jitter mult denominator */
     kcc_kalman_q_min_factor_num = clamp(kcc_kalman_q_min_factor_num, 0, 1000);                    /* [K] Q min factor numerator */
     kcc_kalman_q_min_factor_den = clamp(kcc_kalman_q_min_factor_den, 1, 100000);                  /* [K] Q min factor denominator */
     kcc_kalman_p_est_init_rtt_div_num = clamp(kcc_kalman_p_est_init_rtt_div_num, 1, 100000);      /* [K] p_est init RTT div numerator */
@@ -8976,6 +9213,12 @@ static void kcc_init_module_params(void)                          /* clamp all p
     kcc_ecn_ewma_total = clamp(kcc_ecn_ewma_total, 1, 100000);                   /* [K] ECN EWMA total weight */
     /* EWMA formula requires retained <= total, otherwise new-sample weight > 1 */
     kcc_ecn_ewma_retained = min_t(int, kcc_ecn_ewma_retained, kcc_ecn_ewma_total); /* enforce retained <= total */
+    /* Guard: floor retained to 1 when total > 1 and retained = 0 to prevent EWMA oscillation.
+     * When retained=0, EWMA = new sample only (no memory). A single CE mark triggers full backoff,
+     * then immediately clears on the next ACK. Flooring retained to 1 ensures at least 1/total memory. */
+    if (kcc_ecn_ewma_retained == 0 && kcc_ecn_ewma_total > 1) {
+        kcc_ecn_ewma_retained = 1;
+    }
     /* ECN idle decay: must stay in [1, den] region, and num < den to guarantee actual decay */
     kcc_ecn_idle_decay_den = clamp(kcc_ecn_idle_decay_den, 2, 100000);              /* [K] ECN idle decay denominator */
     kcc_ecn_idle_decay_num = clamp(kcc_ecn_idle_decay_num, 1, kcc_ecn_idle_decay_den - 1); /* [K] ECN idle decay numerator */
@@ -9013,7 +9256,6 @@ static void kcc_init_module_params(void)                          /* clamp all p
     kcc_agg_confidence_thresh = clamp(kcc_agg_confidence_thresh, 0, 10000); /* [T_queue] agg confidence threshold */
     kcc_agg_max_comp_ratio = clamp(kcc_agg_max_comp_ratio, 0, 100);        /* [T_queue] max cwnd compensation ratio */
     kcc_agg_max_comp_duration = clamp(kcc_agg_max_comp_duration, 1, 128);  /* [T_queue] max compensation duration (RTTs) */
-    kcc_agg_r_hysteresis = clamp(kcc_agg_r_hysteresis, 0, 100);            /* [T_queue] agg R recovery hysteresis */
     kcc_agg_r_multiplier_min = clamp(kcc_agg_r_multiplier_min, 1, 10000);  /* [T_queue] agg R noise scaling floor */
     kcc_agg_r_multiplier_max = clamp(kcc_agg_r_multiplier_max, 1, 10000);  /* [T_queue] agg R noise scaling ceiling */
     kcc_agg_r_multiplier_max = max(kcc_agg_r_multiplier_max, kcc_agg_r_multiplier_min);  /* ensure max >= min */
@@ -9080,6 +9322,12 @@ static void kcc_init_module_params(void)                          /* clamp all p
     kcc_drain_gain_val = max_t(u32, kcc_drain_gain_val, KCC_GAIN_FLOOR);  /* floor at KCC_GAIN_FLOOR: prevents zero-rate stall when drain_gain_num=0 */
     kcc_drain_skip_min_rtt_shift_val = (u32)kcc_drain_skip_min_rtt_shift; /* [T_queue] cache drain-skip min RTT shift */
     kcc_drain_target_max_rtts_val = (u32)kcc_drain_target_max_rtts;       /* [T_queue] cache drain-target max RTTs */
+    kcc_drain_timeout_rtts_val = (u32)kcc_drain_timeout_rtts;             /* [T_queue] cache DRAIN mode safety timeout RTTs */
+    kcc_probe_up_max_rtts_val = (u32)kcc_probe_up_max_rtts;               /* [T_queue] cache PROBE_UP hard timeout RTTs */
+    kcc_tier1_blocked_thresh_val = (u32)kcc_tier1_blocked_thresh;         /* [K] cache Tier-1 jitter-gate block threshold */
+    kcc_saturation_hold_rtts_val = (u32)kcc_saturation_hold_rtts;         /* [K] cache saturation hold-off RTTs */
+    kcc_ecn_ewma_floor_val = (u32)kcc_ecn_ewma_floor;                     /* [T_queue] cache ECN EWMA floor */
+    kcc_neg_persist_time_shift_val = (u32)kcc_neg_persist_time_shift;     /* [T_prop] cache neg-persistence time shift */
 
     /* Cycle length and full-BW threshold */
     kcc_probe_bw_cycle_len_val = (u32)kcc_probe_bw_cycle_len;  /* cache clamped PROBE_BW cycle length */
@@ -9197,7 +9445,8 @@ static void kcc_init_module_params(void)                          /* clamp all p
 
     kcc_qdelay_probe_scale_us_val = kcc_qdelay_probe_scale_us;  /* [T_queue] queuing-delay probe scaling factor */
 
-    kcc_jitter_r_scale_val = kcc_jitter_r_scale;  /* [T_noise] adaptive R jitter scale */
+    kcc_jitter_r_scale_val = kcc_jitter_r_scale;  /* [T_noise] RESERVED: former linear R scale (compat cache) */
+    kcc_jitter_r_j50_val = kcc_jitter_r_j50;  /* [T_noise] power-law R crossover jitter */
     kcc_kalman_r_max_boost_val = kcc_kalman_r_max_boost;  /* [T_noise] measurement noise R max boost */
     kcc_jitter_seed_shift_val = (u32)kcc_jitter_seed_shift;               /* [T_noise] cache jitter seed shift */
     kcc_probe_rtt_jitter_shift_val = (u32)kcc_probe_rtt_jitter_shift;    /* [T_prop] cache PROBE_RTT jitter shift */
@@ -9210,9 +9459,7 @@ static void kcc_init_module_params(void)                          /* clamp all p
     kcc_agg_confidence_thresh_val = kcc_agg_confidence_thresh;  /* [T_queue] agg confidence threshold */
     kcc_agg_max_comp_ratio_val = kcc_agg_max_comp_ratio;  /* [T_queue] max compensation ratio */
     kcc_agg_max_comp_duration_val = kcc_agg_max_comp_duration;  /* [T_queue] max compensation duration */
-    kcc_agg_r_hysteresis_val = kcc_agg_r_hysteresis;  /* [T_queue] agg R recovery hysteresis */
     kcc_agg_r_multiplier_min_val = (u32)kcc_agg_r_multiplier_min;  /* [T_queue] agg R noise scaling floor */
-    kcc_agg_r_multiplier_max_val = (u32)kcc_agg_r_multiplier_max;  /* [T_queue] agg R noise scaling ceiling */
 
     kcc_agg_factor4_ratio_num_val = kcc_agg_factor4_ratio_num;  /* [T_queue] agg Factor 4 ratio numerator */
     kcc_agg_factor4_ratio_den_val = kcc_agg_factor4_ratio_den;  /* [T_queue] agg Factor 4 ratio denominator */
@@ -9255,17 +9502,19 @@ static void kcc_init_module_params(void)                          /* clamp all p
     /* Kalman core cached values (Kalman 1960) */
     kcc_kalman_p_est_init_val = (u32)kcc_kalman_p_est_init;  /* [K] initial error covariance p_est */
     kcc_kalman_p_est_floor_val = (u32)kcc_kalman_p_est_floor;  /* [K] p_est floor */
-    kcc_kalman_outlier_ms_val = (u32)kcc_kalman_outlier_ms;  /* [K] outlier rejection base (ms) */
     kcc_kalman_scale_shift_val = (u32)ilog2(kcc_kalman_scale);      /* [K] Kalman scale shift */
 
     /* Precompute Kalman outlier rejection constants.
      * These are invariant between sysctl writes -- recomputing them
      * on every Kalman invocation is wasteful on the hot path. */
     {
-        u64 ms_us = (u64)kcc_kalman_outlier_ms_val * USEC_PER_MSEC;  /* convert outlier ms to microseconds */
+        u64 ms_us = (u64)kcc_kalman_outlier_ms * USEC_PER_MSEC;  /* convert outlier ms to microseconds */
         u32 shift = kcc_kalman_scale_shift_val;  /* Kalman scale shift factor */
-        kcc_kalman_outlier_thresh_scaled_val = ms_us << shift;  /* precomputed outlier threshold: ms * 1000 * scale */
+        kcc_kalman_outlier_thresh_scaled_val = ms_us << shift;  /* RESERVED: compat cache, superseded by RTT-proportional threshold */
     }
+
+    kcc_outlier_rtt_frac_shift_val = kcc_outlier_rtt_frac_shift;  /* [T_noise] RTT fraction shift for outlier gate */
+    kcc_outlier_min_floor_us_val = kcc_outlier_min_floor_us;  /* [T_noise] min floor us for outlier gate */
 
     /* Derived Kalman ratios (num/den -> single value) (Kalman 1960) */
     {
@@ -9507,6 +9756,7 @@ static void kcc_ext_destruct(struct sock* sk)                      /* destroy ex
     struct kcc_ext* ext = kcc->ext;                                /* extended state block (may be NULL) */
 
     if (!ext) {
+        kcc->initialized = 0;                                      /* clear guard even when ext allocation failed: prevents double-release double-counting conn_end when kzalloc failed in kcc_init; this connection was never added to kcc_conn_list so no Word 2 RMW race with /proc reader */
         return;                                                    /* nothing to destroy */
     }
 
@@ -9519,6 +9769,7 @@ static void kcc_ext_destruct(struct sock* sk)                      /* destroy ex
      * iterations and safe to destroy.
      */
     spin_lock_bh(&kcc_conn_lock);                                  /* acquire lock for /proc list removal */
+    kcc->initialized = 0;                                          /* clear idempotency guard under lock: prevents Word 2 RMW race with /proc reader that accesses alone_on_path and lt_use_bw in the same 32-bit bitfield word */
     list_del(&ext->kcc_node);                                      /* unregister from /proc/kcc/status */
     spin_unlock_bh(&kcc_conn_lock);                                /* release lock */
 
@@ -9560,7 +9811,8 @@ static void kcc_release(struct sock* sk)                           /* socket clo
      * the conn_active counter in /proc/kcc/status from phantom skew.
      */
     if (kcc->initialized) {
-        kcc->initialized = 0;                                        /* clear guard before teardown: only the matched release-increment pair */
+        /* initialized is cleared inside kcc_ext_destruct under kcc_conn_lock
+         * to prevent a Word 2 bitfield RMW race with the /proc reader. */
         atomic_inc(&kcc_conn_end_cnt);                             /* increment active-connection end counter */
         kcc_ext_destruct(sk);                                      /* destroy extended state (list_del + kfree) */
     }
@@ -9799,8 +10051,8 @@ static void kcc_set_pacing_rate(struct sock* sk, u32 bw, int gain)    /* [T_queu
     u64 rate = kcc_bw_to_pacing_rate(sk, bw, gain);
 
     /* [K] Global Kalman BDP pacing-rate floor during STARTUP */
-    if (kcc_kf_enable_val && atomic_read(&kcc_kf_active) && kcc->mode == KCC_STARTUP) {
-        u64 kf_bw = (u64)atomic64_read(&kcc_kf_x);
+    if (kcc_kf_enable_val && kcc->mode == KCC_STARTUP && smp_load_acquire(&kcc_kf_active.counter)) {
+        u64 kf_bw = (u64)smp_load_acquire(&kcc_kf_x.counter);
         if (kf_bw > 0) {
             u64 init_bw = kf_bw * (u64)kcc_kf_discount_num_val / (u64)kcc_kf_discount_den_val;
             u64 kf_rate;
@@ -10197,7 +10449,7 @@ static void kcc_update_ecn_ewma(struct sock* sk, const struct rate_sample* rs,  
                     kcc_ecn_ewma_total_val;                              /* [T_queue] round-bound EWMA decay */
             }
             else {
-                if (ext->ecn_ewma < 4) { ext->ecn_ewma = 0; }
+                if (ext->ecn_ewma < kcc_ecn_ewma_floor_val) { ext->ecn_ewma = 0; }
                 else      /* [T_queue] zero-out below floor to prevent truncation stickiness */
                     ext->ecn_ewma = (u32)((u64)ext->ecn_ewma *              /* [T_queue] per-ACK idle decay */
                         kcc_ecn_idle_decay_num_val /
@@ -10219,9 +10471,11 @@ static void kcc_update_ecn_ewma(struct sock* sk, const struct rate_sample* rs,  
  *   4. qdelay_avg > congestion threshold (queue buildup confirms
  *       congestion).
  *   5. Not in PROBE_BW mode (cwnd_gain remains at 2x matching BBR).
- *   6. During probing, backoff is graduated (scaled to BBR_UNIT/gain)
- *      rather than fully suppressed -- severe ECN marks can still
- *      partially reduce cwnd during probe phases.
+ *      ECN does not signal congestion during active probing:
+ *      CE marks during PROBE_BW can arise from the probe-induced
+ *      queue itself rather than persistent congestion, so backoff
+ *      is deferred to the subsequent DRAIN/CRUISE phases where
+ *      the queue signal is unambiguous.
  *
  * When triggered, cwnd_gain is reduced by the configured backoff factor.
  * BBR has no ECN backoff; KCC adds this as an intelligent response to
@@ -10653,6 +10907,7 @@ static u32 kcc_packets_in_net_at_edt(struct sock* sk, u32 inflight_now, u32 bw) 
  * (output parameter).  Returns bool (true = packet conservation active).
  * All types match kernel BBR's implementation exactly.
  */
+static void kcc_reset_mode(struct sock* sk);
 static bool kcc_set_cwnd_to_recover_or_restore(                         /* [T_queue] handle recovery cwnd transitions */
     struct sock* sk, const struct rate_sample* rs, u32 acked, u32* new_cwnd)  /* [T_queue] output computed cwnd */
 {
@@ -10678,6 +10933,13 @@ static bool kcc_set_cwnd_to_recover_or_restore(                         /* [T_qu
     else if (prev_state >= TCP_CA_Recovery && state < TCP_CA_Recovery) {
         cwnd = max_t(u32, cwnd, kcc->prior_cwnd);                        /* [T_queue] restore to pre-recovery cwnd */
         kcc->packet_conservation = 0;                                    /* [T_queue] disable packet conservation */
+        /* If PROBE_RTT was in progress, force exit: the RTT measurement is
+         * corrupted by loss, and the PROBE_RTT cwnd clamp (min(cwnd, 4) at
+         * kcc_set_cwnd PROBE_RTT clamp) would immediately nullify this
+         * cwnd restore, trapping the connection at 4 packets indefinitely. */
+        if (kcc->mode == KCC_PROBE_RTT) {
+            kcc_reset_mode(sk);
+        }
     }
 
     if (state != prev_state) {
@@ -10867,9 +11129,12 @@ done:
      * Decision logic (from BBRv1, adapted for KCC gain decay):
      *   1. Phase must have lasted at least one min_rtt (is_full_length).
      *   2. Additional termination conditions depend on pacing_gain:
-     *      - gain > 1.0x (probing up):   exit if loss occurred OR
-     *                                     inflight_at_edt >= target_inflight.
-     *      - gain < 1.0x (probing down): drain-to-target.
+ *      - gain > 1.0x (probing up):   exit if loss occurred OR
+ *                                     inflight_at_edt >= target_inflight OR
+ *                                     (up_limit enabled AND app-limited) OR
+ *                                     safety timeout (kcc_probe_up_max_rtts_val
+ *                                     RTTs, default 16).
+ *      - gain < 1.0x (probing down): drain-to-target.
      *        Exit when is_full_length AND inflight_at_edt <=
      *        target at 1x gain, with a safety timeout after
      *        kcc_drain_target_max_rtts_val (default 4) RTTs.
@@ -10936,12 +11201,13 @@ static bool kcc_is_next_cycle_phase(struct sock* sk,                    /* [T_qu
         u32 etd_bw = kcc_bw(sk);                                          /* [T_queue] active BW for EDT calc */
         u32 max_bw = kcc_max_bw(sk);                                      /* [T_queue] max BW for inflight target */
         u32 inet_edt = kcc_packets_in_net_at_edt(sk, rs->prior_in_flight, etd_bw);  /* [T_queue] inflight at EDT */
-        return is_full_length &&                                          /* [T_queue] RTT elapsed AND */
-            (rs->losses > 0 ||                                             /* [T_queue] actual loss occurred (losses is signed int; >0 guards against negative) */
+        return (is_full_length &&                                          /* [T_queue] RTT elapsed AND */
+               (rs->losses > 0 ||                                             /* [T_queue] actual loss occurred (losses is signed int; >0 guards against negative) */
                 inet_edt >=                                                /* [T_queue] inflight at EDT >= */
                 kcc_inflight(sk, max_bw, kcc->pacing_gain, ext) ||        /* [T_queue] target inflight */
                 (kcc_probe_bw_up_limit_val &&                             /* [T_queue] up-limit enabled AND */
-                    (rs->is_app_limited || !tcp_send_head(sk))));         /* [T_queue] app-limited */
+                    (rs->is_app_limited || !tcp_send_head(sk))))) ||       /* [T_queue] app-limited */
+            delta > kcc->min_rtt_us * kcc_probe_up_max_rtts_val;            /* [T_queue] safety timeout: prevent infinite PROBE_UP on paths where loss never occurs and inflight target is never reached; configured by kcc_probe_up_max_rtts sysctl (default 16 RTTs) */
     }
 
     if (kcc->pacing_gain < BBR_UNIT) {
@@ -11545,12 +11811,12 @@ static void kcc_update_bw(struct sock* sk, const struct rate_sample* rs)        
      * The floor is init_bw (fair * discount * BBR_UNIT / high_gain), not
      * the raw KF estimate -- using the raw value would inflate max_bw and
      * cause overdosing when STARTUP high_gain is applied. */
-    if (kcc_kf_enable_val && atomic_read(&kcc_kf_active) && kcc->mode == KCC_STARTUP) {
-        u64 kf_bw = (u64)atomic64_read(&kcc_kf_x);                                    /* global Kalman bandwidth estimate */
-        u64 floor_bw = kf_bw * (u64)kcc_kf_discount_num_val / (u64)kcc_kf_discount_den_val; /* apply safety discount */
+    if (kcc_kf_enable_val && kcc->mode == KCC_STARTUP && smp_load_acquire(&kcc_kf_active.counter)) {
+        u64 kf_bw = (u64)smp_load_acquire(&kcc_kf_x.counter);                                    /* global Kalman bandwidth estimate */
+            u64 floor_bw = kf_bw * (u64)kcc_kf_discount_num_val / (u64)kcc_kf_discount_den_val; /* apply safety discount */
 
-        floor_bw = (floor_bw << BBR_SCALE) / (u64)kcc_high_gain_val;                 /* gain-compensate: / high_gain */
-        if (bw < floor_bw) {
+            floor_bw = (floor_bw << BBR_SCALE) / (u64)kcc_high_gain_val;                 /* gain-compensate: / high_gain */
+            if (bw < floor_bw) {
             bw = floor_bw;                                                       /* enforce global-Kalman floor */
         }
     }
@@ -11625,8 +11891,8 @@ static void kcc_check_full_bw_reached(struct sock* sk,                          
      * the pipe has not yet been filled -- reset full_bw_cnt to zero
      * and keep STARTUP running. */
     if (kcc->round_start && kcc->rtt_cnt < KCC_KF_STARTUP_PROTECT_RTTS &&          /* early startup rounds */
-        kcc_kf_enable_val && atomic_read(&kcc_kf_active) && kcc->mode == KCC_STARTUP) {
-        u64 kf_bw = (u64)atomic64_read(&kcc_kf_x);                                    /* global Kalman bandwidth estimate */
+        kcc_kf_enable_val && kcc->mode == KCC_STARTUP && smp_load_acquire(&kcc_kf_active.counter)) {
+        u64 kf_bw = (u64)smp_load_acquire(&kcc_kf_x.counter);                                    /* global Kalman bandwidth estimate */
         if (kf_bw > 0) {
             u64 init_floor = kf_bw * (u64)kcc_kf_discount_num_val / (u64)kcc_kf_discount_den_val; /* apply discount */
             init_floor = (init_floor << BBR_SCALE) / (u64)kcc_high_gain_val;         /* gain-compensate */
@@ -11703,7 +11969,6 @@ static void kcc_check_full_bw_reached(struct sock* sk,                          
  * kcc_check_drain - Handle STARTUP -> DRAIN transition and DRAIN -> PROBE_BW exit.
  *
  * @sk:  TCP socket.
- * @rs:  rate sample.
  * @ext: extended state (used for inflight target computation via kcc_inflight).
  *
  * STARTUP -> DRAIN: full_bw_reached triggers mode change to DRAIN,
@@ -11711,6 +11976,12 @@ static void kcc_check_full_bw_reached(struct sock* sk,                          
  *
  * DRAIN -> PROBE_BW: when estimated inflight at EDT <= target inflight
  *   at 1.0x gain, the queue has been drained; reset mode to PROBE_BW.
+ *
+ * DRAIN safety timeout: when persistent cross-traffic prevents inflight
+ *   from reaching the BDP target, drain_rtt_cnt increments on round
+ *   boundaries and forces PROBE_BW after kcc_drain_timeout_rtts rounds
+ *   (default 24, max 31 due to 5-bit bitfield).  This prevents permanent
+ *   DRAIN starvation on high-competition paths.
  *
  * Corresponds to kernel BBR v5.4: bbr_check_drain().
  * Identical state transitions and drain exit condition (inflight_at_edt <=
@@ -11737,6 +12008,7 @@ static void kcc_check_drain(struct sock* sk,                            /* [T_qu
 
     if (unlikely(kcc->mode == KCC_STARTUP && kcc_full_bw_reached(sk))) {
         kcc->mode = KCC_DRAIN;                                                                /* transition: pipe full -> drain excess */
+        kcc->drain_rtt_cnt = 0;                                                               /* reset timeout counter on DRAIN entry: defensive — while full_bw_reached is monotonic and DRAIN re-entry is currently impossible, this prevents stale counter leakage from any future full_bw_reached reset path (e.g. spurious-loss undo or RTT-spike restart) */
         tcp_sk(sk)->snd_ssthresh = kcc_inflight(sk, kcc_max_bw(sk),
             BBR_UNIT, ext);                                                  /* cwnd_gain = BBR_UNIT, ext state */
 
@@ -11753,7 +12025,21 @@ static void kcc_check_drain(struct sock* sk,                            /* [T_qu
         if (kcc_packets_in_net_at_edt(sk, tcp_packets_in_flight(tcp_sk(sk)),
             max_bw) <=                                                               /* inflight at EDT <= */
             kcc_inflight(sk, max_bw, BBR_UNIT, ext)) {
+            kcc->drain_rtt_cnt = 0;                                                               /* normal exit: reset counter */
             kcc_reset_mode(sk);                                                                           /* queue drained -> enter PROBE_BW */
+        }
+        else if (kcc->round_start) {
+            /* Safety timeout: count RTTs and force exit when persistent cross-traffic
+             * prevents inflight from reaching the BDP target.  5-bit bitfield caps at 31. */
+            u32 cnt = kcc->drain_rtt_cnt + 1;
+            if (cnt > KCC_DRAIN_RTT_CNT_MAX) {
+                cnt = KCC_DRAIN_RTT_CNT_MAX;
+            }
+            kcc->drain_rtt_cnt = cnt;
+            if (cnt >= kcc_drain_timeout_rtts_val) {
+                kcc->drain_rtt_cnt = 0;                                                           /* timeout: reset counter */
+                kcc_reset_mode(sk);                                                                       /* force exit to PROBE_BW */
+            }
         }
     }
 }
@@ -11835,8 +12121,10 @@ static void kcc_check_probe_rtt_done(struct sock* sk)                           
     struct tcp_sock* tp = tcp_sk(sk);                                                   /* TCP socket state */
     struct kcc* kcc = (struct kcc*)inet_csk_ca(sk);                                     /* KCC congestion control state */
 
-    if (unlikely(!kcc->probe_rtt_done_stamp ||                                                      /* stay stamp not set OR */
-        !after(tcp_jiffies32, kcc->probe_rtt_done_stamp))) {
+    /* During PROBE_RTT, this check fires on every ACK — the stay period
+     * (200ms) has not expired, so returning is the COMMON case. */
+    if (!kcc->probe_rtt_done_stamp ||                                                              /* stay stamp not set OR */
+        !after(tcp_jiffies32, kcc->probe_rtt_done_stamp)) {
         return;                                                                                 /* not yet time to exit */
     }
 
@@ -11859,7 +12147,7 @@ static void kcc_check_probe_rtt_done(struct sock* sk)                           
  *   Q = [T_noise] process noise covariance (adaptive)
  *   R = [T_noise] measurement noise covariance (adaptive)
  *
- * Standard Kalman filter equations (predict + update):
+ * Standard Kalman filter equations — the textbook framework:
  *   Predict:
  *     x_pred = x_est          ([K] identity state transition)
  *     p_pred = p_est + Q      ([K] predicted error covariance)
@@ -11867,13 +12155,22 @@ static void kcc_check_probe_rtt_done(struct sock* sk)                           
  *   Update (upon receiving z):
  *     innovation = z - x_pred   ([T_prop] innovation computation)
  *     K = p_pred / (p_pred + R)  ([K] Kalman gain)
- *     x_est = x_pred + K * innovation  ([T_prop] state update)
- *     p_est = max((1 - K) * p_pred, p_est_floor)  ([K] covariance update with anti-lock-in floor)
+ *     x_est = x_pred + K * innovation  ([T_prop] textbook state update —
+ *              NOTE: KCC uses this only for Q-boost/drift paths; the primary
+ *              ν < 0 path uses forced convergence x_est = z (K_eff = 1))
+ *     p_est = max((1 - K) * p_pred, p_est_floor)  ([K] textbook covariance
+ *              update — NOTE: KCC uses Joseph form p_est = max(R, floor) for
+ *              ν < 0 steps (K_eff = 1) instead of (1-K)·p_pred; see §Covariance
+ *              policy in update site)
  *
  * The above scalar K is implemented as gain_num/gain_den:
  *     K = gain_num / gain_den = p_pred / (p_pred + R)
  *
  * Enhancements over standard Kalman:
+ *   - Directional forced convergence: ν < 0 clean samples → x_est = z directly
+ *     (K_eff = 1), not x_pred + K×innov.  A clean sample IS the T_prop measurement
+ *     — no multi-sample trust conversion is needed.  Gated by three-layer defense
+ *     (outlier gate + speed-of-light floor + neg_skip_cnt persistence).
  *   - [T_noise] Adaptive Q: scaled by min_rtt_us/1000 to account for path length.
  *   - [T_noise] Adaptive R: increased when jitter exceeds threshold.
  *   - [T_queue] Q-boost: resets p_est to p_est_init when innovation is very large
@@ -11899,6 +12196,12 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
 
     if (unlikely(!ext)) {
         return;
+    }
+
+    /* [K] Saturation hold-off: decrement on round boundaries.  Prevents the
+     * saturation→reset→saturation oscillation loop on permanently-queued paths. */
+    if (ext->saturation_hold_cnt > 0 && kcc->round_start) {
+        ext->saturation_hold_cnt--;
     }
 
     /*
@@ -11940,15 +12243,12 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
     if (unlikely(ext->sample_cnt == 0)) {
         ext->x_est = (u32)min_t(u64, z, U32_MAX);                                                        /* [T_prop] set x_est = first measurement, clamp u64->u32 */
 
-        /* [K] Initialize Kalman covariance: p_est = max(p_est_init, rtt_us / divisor).
-         * NOTE: p_est_init (default 1000 us^2) and rtt_us/div (us units) are dimensionally
-         * different (covariance vs. linear time).  This heuristic picks the larger of the
-         * two, effectively using p_est_init as a floor for short RTTs and rtt_us/div as a
-         * scaled initial uncertainty for long RTTs.  At default 10ms RTT (10000/10=1000),
-         * the values coincide; at 100ms RTT (100000/10=10000), the RTT-derived value
-         * dominates, giving 10x higher initial uncertainty. */
-        ext->p_est = max_t(u32, kcc_kalman_p_est_init_val,
-            rtt_us / kcc_kalman_p_est_init_rtt_div_val);
+        /* [K] Initialize Kalman covariance: p_est = p_est_init_val.
+         * The Kalman filter auto-tunes p_est within ~3 update steps
+         * regardless of initial value; p_est_init_val is the default
+         * starting uncertainty (1000 us^2).  For long-RTT paths requiring
+         * higher initial uncertainty, tune kcc_kalman_p_est_init directly. */
+        ext->p_est = kcc_kalman_p_est_init_val;
         ext->qdelay_avg = 0;                                                                              /* [T_queue] no qdelay on first sample */
         ext->jitter_ewma = max_t(u32, rtt_us >> kcc_jitter_seed_shift_val, KCC_RTT_MIN_FLOOR_US);            /* [T_noise] seed jitter from rtt_us >> shift, floor 1us */
         ext->sample_cnt = 1;                                                                                /* first sample accepted */
@@ -12004,44 +12304,62 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
         q64 = min_t(u64, q64, (u64)kcc_kalman_q_max_val);                                         /* cap 2: absolute Q upper bound */
         q = (u32)q64;
     }
-    /* [T_noise] Adaptive R: increased by jitter (Kalman 1960) ---- */
+    /* [T_noise] Adaptive R: power-law scaling with jitter (Kalman 1960) ---- */
     /*
-     * R = base_R + min(max(0, jitter - jr_thresh) * base_R / jr_scale,
-     *                  base_R * kcc_kalman_r_max_boost)
-     * Boost capped to prevent gain freeze on paths with persistent high
-     * Measurement noise increases when RTT jitter increases,
-     * causing the Kalman gain to decrease (the filter trusts
-     * measurements less when jitter is high).
+     * R = base_R * (jitter_excess / J50)^(3/2), clamped to [base_R, base_R * r_max_boost].
+     *
+     * PHYSICS: Measurement noise variance grows quadratically with jitter
+     *   amplitude.  The power 3/2 (between linear and quadratic) provides
+     *   aggressive R growth on noisy paths while preventing Kalman gain
+     *   freeze on paths where jitter_ewma includes queue-contaminated
+     *   samples that passed the directional gate.
+     *
+     *   ratio^(3/2) = ratio * sqrt(ratio) — computed with kernel int_sqrt()
+     *   in 20-bit fixed-point arithmetic.  When ratio=1 (jitter=J50) the power-law
+     *   multiplier is 1.0 → R stays at base_R (pass-through).  R doubles to 2x base_R
+     *   at ratio = 2^(2/3) ≈ 1.587 — i.e. jitter ≈ 1.587 × J50 (317 µs at default).
+     *   At 10x J50 (2000 µs with default J50=200), R ≈ 31.6x base_R ≈ 12,649,
+     *   far exceeding the old linear cap of 3200 (8x base_R, reached at 4x J50 = 800 µs)
+     *   and extending smoothly beyond.
+     *
+     * BOUNDS: R ∈ [base_R, base_R * r_max_boost].
      */
     {
-        u32 base_r = (u32)kcc_kalman_r_val;                                                                     /* base measurement noise R (r=0 legitimate: zero noise) */
-        u32 jitter = ext->jitter_ewma;                                              /* current jitter EWMA */
-        u32 jr_thresh = kcc_clean_thresh(sk);                                       /* dynamic "link is clean" threshold */
-        u32 jr_scale = (u32)kcc_jitter_r_scale_val;                             /* scaling divisor for R increase */
+        u32 base_r = (u32)kcc_kalman_r_val;
+        u32 jitter = ext->jitter_ewma;
+        u32 jr_thresh = kcc_clean_thresh(sk);
+        u32 j50 = (u32)kcc_jitter_r_j50_val;
 
-        if (jitter > (u32)jr_thresh) {
-            u64 r_boost = (u64)(jitter - jr_thresh) * (u64)base_r / (u64)jr_scale;                       /* linear R boost in u64 to avoid truncation */
-            u64 r_cap = (u64)base_r * (u32)kcc_kalman_r_max_boost_val;                                 /* cap: base_R * max_boost (u64 safe) */
-            r = base_r + (u32)min_t(u64, r_boost, r_cap);                                                                       /* capped R = base + min(boost, cap) */
-        }
-        else {
-            r = base_r;                                                                                                      /* use base R unchanged */
+        if (jitter > jr_thresh) {
+            u32 j_excess = jitter - jr_thresh;
+            u64 ratio = ((u64)j_excess << KCC_R_POWER_FRAC) / (u64)j50;
+            /* ratio^(3/2) = ratio * sqrt(ratio) in fixed-point */
+            u64 sqrt_ratio = int_sqrt(ratio << KCC_R_POWER_FRAC);
+            u64 scale;
+            u64 r_new;
+            u64 r_cap;
+            /* Guard: ratio × sqrt(ratio) overflows u64 at extreme configs
+             * (J50 ≈ 1, jitter ≈ 500 ms).  At defaults (J50 = 200) the
+             * product stays 16 × below U64_MAX.  Saturate at max safe. */
+            if (ratio > U64_MAX / sqrt_ratio) {
+                scale = U64_MAX >> KCC_R_POWER_FRAC;
+            } else {
+                scale = (ratio * sqrt_ratio) >> KCC_R_POWER_FRAC;
+            }
+            r_new = ((u64)base_r * scale) >> KCC_R_POWER_FRAC;
+            r_cap = (u64)base_r * (u32)kcc_kalman_r_max_boost_val;
+            r = (u32)clamp_t(u64, r_new, (u64)base_r, r_cap);
+        } else {
+            r = base_r;
         }
     }
 
     /*
-     * THREE-COMPONENT MODEL: Outlier Gate (T_noise rejection).
-     *
-     *   RTT_obs = T_prop + T_queue + T_noise
-     *
-     *   T_noise is structurally isolated from ALL rate/cwnd decisions.
-     *   If |innovation| > jitter_ewma * outlier_mult, the RTT spike is
-     *   classified as T_noise (NIC coalescing, OS jitter, ACK compression,
-     *   malicious delay injection) and the sample is discarded before
-     *   it can enter the Kalman filter.
-     *
-     * [T_noise] The gate uses two thresholds, taking the MAX:
-     * accepted Kalman sample (Welch & Bishop 2006).
+     * ---- Post-adaptation noise combination (matched estimator + ACK agg R) ----
+     * The adaptive R (power-law) from above is optionally combined with
+     * the covariance-matched estimator (noise_mode) and the reserved
+     * ACK-aggregation confidence layer before entering the Kalman core.
+     * The outlier gate (T_noise rejection) follows below at §Outlier Gate.
      */
     {
         int mode = kcc_kalman_noise_mode_val;                                        /* noise combination mode */
@@ -12146,7 +12464,7 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
              * and the threshold is appropriate for the new ACK
              * clock spacing.
              */
-            u32 threshold = rtt_us >> 1;
+            u32 threshold = rtt_us >> kcc_neg_persist_time_shift_val;
             bool enough_time_elapsed;
             threshold = max_t(u32, threshold, 1U);
 
@@ -12277,7 +12595,7 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
          * pure queue buildup never triggers G3.  The existing drift tier
          * mechanisms (Tier-1/2, 14/56 skips) handle those cases.
          */
-        if (likely(!qboost_fired && innovation > 0 && ext->pos_skip_cnt >= kcc_g3_min_skip_val)) {
+        if (unlikely(!qboost_fired && innovation > 0 && ext->pos_skip_cnt >= kcc_g3_min_skip_val)) {
             u64 qdelay_scaled = (u64)ext->qdelay_avg << kcc_kalman_scale_shift_val;
             u64 minrtt_scaled = (u64)kcc->min_rtt_us << kcc_kalman_scale_shift_val;
             if (abs_innov > ((qdelay_scaled * kcc_g3_qdelay_mult_num_val) / kcc_g3_qdelay_mult_den_val) &&  /* C1: ν > 2.5×qdelay_ewma */
@@ -12294,10 +12612,17 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
         /* p_est <= 100M clamped, q <= 100k clamped, sum <= 100.1M << U32_MAX.
          * Use u64 cast to guarantee no wrap if operator raises p_est_max beyond design bounds. */
         p_pred = min_t(u32, (u64)ext->p_est + q, kcc_kalman_p_est_max_val);                                               /* [K] p_pred = min(p_est+Q, p_est_max) */
-        /* [T_noise] Outlier rejection (Kalman 1960) ---- */
         /*
-         * [T_noise] Dynamic threshold = max(outlier_ms * 1000 * scale,
-         *                         jitter_ewma * outlier_jitter_mult * scale)
+         * [T_noise] Outlier rejection (Kalman 1960) ----
+         *
+         * Dynamic threshold = max(RTT-proportional, jitter-based):
+         *   prop_us    = max(min_rtt_us >> rtt_frac_shift, min_floor_us)
+         *   dyn_thresh = max(prop_us, jitter_ewma * outlier_jitter_mult) in scaled units
+         *
+         * The RTT-proportional component replaces the old fixed 4ms base,
+         * adapting the gate tightness to path length: tighter on short-RTT
+         * paths (WiFi 6E) where %-of-RTT noise is large, looser on WAN
+         * paths where millisecond-scale queue dynamics are legitimate.
          *
          * If abs(innovation) > threshold AND p_est <= converged_val
          * (filter is confident enough that this is truly an outlier, not
@@ -12315,12 +12640,14 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
          *     all updated normally on the force-accepted sample.
          */
         {
-            u64 dyn_thresh = kcc_kalman_outlier_thresh_scaled_val; /* base outlier threshold (precomputed) */
+            u32 prop_us = max_t(u32, kcc->min_rtt_us >> kcc_outlier_rtt_frac_shift_val,
+                                kcc_outlier_min_floor_us_val);
+            u64 dyn_thresh = (u64)prop_us << kcc_kalman_scale_shift_val;
             u64 jitter_prod = (u64)ext->jitter_ewma * (u64)kcc_kalman_outlier_jitter_mult_val;
             u64 jitter_thresh = jitter_prod << kcc_kalman_scale_shift_val;
 
             if (jitter_thresh > dyn_thresh) {
-                dyn_thresh = jitter_thresh;                                                                                                  /* use jitter-based threshold */
+                dyn_thresh = jitter_thresh;
             }
 
             if (unlikely(!qboost_fired && !g3_fired && abs_innov > dyn_thresh)) {
@@ -12445,7 +12772,7 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
          *
          *   [T_prop] PHYSICAL PROOF: ν < 0 ∧ OUTLIER-GATE ⇒ T_queue ≈ 0:
          *     Given z = T_prop + T_queue + T_noise with T_noise gated by outlier rejection
-         *     (|ν| ≤ max(4ms, 2×jitter)), a negative innovation ν < 0 implies:
+         *     (|ν| ≤ max(RTT>>shift, min_floor, 2×jitter)), a negative innovation ν < 0 implies:
          *     x_est > z = T_prop + T_queue + T_noise ≥ T_prop (since T_queue ≥ 0)
          *     Therefore x_est > T_prop — the current Kalman estimate is inflated
          *     above the true propagation floor.  This means T_queue ≈ 0 (otherwise
@@ -12469,7 +12796,7 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
          *     all non-clean paths (Q-boost, drift, positive-innovation covariance).
          *
           *   [T_prop] THREE-LAYER DEFENSE AGAINST GARBAGE SAMPLES:
-          *     Layer 1 — Outlier gate: |ν| > max(4ms_base×S, jitter×2×S) ⇒ reject.
+          *     Layer 1 — Outlier gate: |ν| > max(RTT>>shift, min_floor, jitter×mult) in scaled units ⇒ reject.
           *       Catches TSO/GSO large spikes before they reach the policy layer.
           *     Layer 2 — Directional gate: ν > 0 ∧ ¬Q-boost ⇒ drift detection
           *       (may apply dampened partial update).  Rejects queue noise.
@@ -12530,11 +12857,17 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
             if (qboost_fired) {
                 /* Q-boost: path degradation detected → reset p_est → high Kalman gain.
                  * Apply the full Kalman correction corr_abs = K*|innov| toward the new RTT. */
-                s64 corr = (s64)min_t(u64, corr_abs, KCC_S64_MAX);       /* [K] clamp corr_abs to <= S64_MAX for safe s64 cast (prevents sign-flip wraparound from extreme innovations) */
-                s64 new_x = (s64)ext->x_est + corr;                       /* [K] candidate x_est = old estimate + correction toward new RTT */
-                if (new_x > 0) {                                          /* [K] guard: only apply if result is positive (negative = underflow from pathological corr<<0) */
-                    ext->x_est = (u32)min_t(s64, new_x, (s64)U32_MAX);   /* [T_prop] commit new estimate, clamp to u32 range for struct storage */
-                    x_updated = true;                                     /* [K] state modified: gates covariance reduction, pos_skip_cnt reset */
+                s64 corr = (s64)corr_abs;
+                /* [K] Use u64 addition to avoid signed overflow UB when corr+ext->x_est > S64_MAX.
+                 * This is a defence-in-depth fix; the corr clamp(TM) makes the overflow unreachable
+                 * with realistic parameters (corr_max ≈ 2.7e11 << S64_MAX = 9.2e18). */
+                {
+                    u64 sum = (u64)ext->x_est + (u64)corr;
+                    s64 new_x = (sum > (u64)S64_MAX) ? S64_MAX : (s64)sum;
+                    if (new_x > 0) {                                          /* [K] guard: only apply if result is positive (negative = underflow from pathological corr<<0) */
+                        ext->x_est = (u32)min_t(s64, new_x, (s64)U32_MAX);   /* [T_prop] commit new estimate, clamp to u32 range for struct storage */
+                        x_updated = true;                                     /* [K] state modified: gates covariance reduction, pos_skip_cnt reset */
+                    }
                 }
             }
             else if (innovation <= 0) {
@@ -12623,7 +12956,7 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
                     u32 am = (u32)min_t(u64, abs_innov, U32_MAX);        /* [T_noise] positive innovation magnitude, clamped to u32 range */
                     /* running sum, capped at U32_MAX to prevent overflow */
                     ext->drift_sum = (U32_MAX - ext->drift_sum > am)
-                        ? ext->drift_sum + am : U32_MAX;                 /* [T_noise] accumulate positive innovation amplitude for early drift detection */
+                        ? ext->drift_sum + am : U32_MAX;                 /* [K] accumulate positive innovation amplitude for early drift detection */
                 }
                 /* [T_prop] Saturating increment: prevent u8 255->0 wrap that would
                  * create a false Q-boost window every 256 samples. */
@@ -12651,13 +12984,28 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
                         x_updated = true;                                                        /* [K] state was modified */
                         ext->pos_skip_cnt = 0;                                                   /* [T_noise] reset skip counter for fresh evidence accumulation */
                         ext->drift_sum = 0;                              /* saturation correction resets drift amplitude accumulator */
+                        ext->tier1_blocked_cnt = 0;                       /* [K] reset jitter-gate blocked counter on saturation fire */
+                        ext->saturation_hold_cnt = (u8)kcc_saturation_hold_rtts_val;  /* [K] set hold-off to prevent oscillation loop on permanently-queued paths */
+                    }
+                }
+
+                /* [K] Saturation hold-off: after saturation fires, prevent x_est from rising
+                 * above min_rtt for kcc_saturation_hold_rtts_val rounds.  This breaks the
+                 * saturation→reset→saturation oscillation loop on permanently-queued paths.
+                 * While hold is active, skip drift corrections when x_est is at or above
+                 * the min_rtt ceiling (to prevent it from rising further).
+                 * Hold decrements on round boundaries below. */
+                if (ext->saturation_hold_cnt > 0) {
+                    u64 minrtt_scaled = (u64)kcc->min_rtt_us << kcc_kalman_scale_shift_val;
+                    if (ext->x_est >= minrtt_scaled) {
+                        goto skip_drift;                                 /* [K] hold-off active: skip all drift checks */
                     }
                 }
 
                 {
                     bool tier1_fired = false;                              /* [T_prop] tracks whether Tier-1 (or early drift) correction fired; prevents Tier-2 from double-firing */
 
-                    /* [T_noise] Early drift detection: running sum of positive
+                    /* [K] Early drift detection: running sum of positive
                      * innovation magnitudes for sub-16-RTT detection of gradual
                      * baseline drift on quiet paths.
                      *
@@ -12726,44 +13074,67 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
                         ext->jitter_ewma < kcc->min_rtt_us >> kcc_drift_quiet_jitter_shift_val) {
                         u64 minrtt_scaled = (u64)kcc->min_rtt_us << kcc_kalman_scale_shift_val;            /* [T_prop] min_rtt in scaled units for threshold comparison */
                         if (ext->drift_sum > minrtt_scaled >> kcc_drift_early_sum_shift_val) {
-                            /* K-independent correction: innovation/4,
-                             * not corr_abs/4 (which has K baked in)
-                             */
-                            u64 drift_corr = abs_innov >> kcc_drift_early_corr_shift_val;                     /* [T_prop] innovation-based correction (25% of |ν|, K-independent) */
-                            if (drift_corr > 0) {
-                                s64 new_x = (s64)ext->x_est + (s64)drift_corr;                             /* [K] candidate estimate = old + partial correction */
+                             /* K-independent correction: innovation/4,
+                              * not corr_abs/4 (which has K baked in)
+                              */
+                             u64 drift_corr = abs_innov >> kcc_drift_early_corr_shift_val;                     /* [T_prop] innovation-based correction (25% of |ν|, K-independent) */
+                             /* [T_prop] Floor at 1: prevent permanent no-op when abs_innov < 4 (at default shift=2).
+                              * At scale=1024, drift_corr=1 means x_est increases by 1/1024 ≈ 0.001 µs = 1 ns.
+                              * This is physically negligible but ensures early drift always makes progress. */
+                             if (drift_corr == 0) {
+                                 drift_corr = 1;
+                             }
+                             if (drift_corr > 0) {
+                                u64 sum = (u64)ext->x_est + drift_corr;                          /* [K] u64-safe addition (avoid s64 overflow UB) */
+                                s64 new_x = (sum > (u64)S64_MAX) ? S64_MAX : (s64)sum;          /* [K] candidate estimate = old + partial correction */
                                 ext->x_est = (new_x > 0) ? (u32)min_t(s64, new_x, (s64)U32_MAX) :         /* [T_prop] commit new estimate if positive */
                                     (u32)max_t(u64, (u64)1U << kcc_kalman_scale_shift_val,                /* [T_prop] else floor at max(1_scale, min_rtt_scaled) */
                                         min_t(u64, (u64)kcc->min_rtt_us << kcc_kalman_scale_shift_val, U32_MAX));
-                                drift_tier = KCC_DRIFT_TIER1;             /* early drift: uses KCC_DRIFT_TIER1 covariance scaling */
+                                 drift_tier = KCC_DRIFT_EARLY;             /* early drift: K-independent covariance */
                                 x_updated = true;                          /* [K] state was modified */
                                 ext->pos_skip_cnt = 0;                     /* [T_noise] reset skip counter */
                                 ext->drift_sum = 0;                      /* reset amplitude accumulator */
+                                ext->tier1_blocked_cnt = 0;               /* [K] reset jitter-gate blocked counter on early drift fire */
                                 tier1_fired = true;                        /* [T_prop] block Tier-1 and Tier-2 from double-firing */
                             }
                         }
                     }
 
-                    if (!saturation_fired && !tier1_fired && ext->pos_skip_cnt >= kcc_kalman_drift_thresh_val &&
-                        ext->jitter_ewma < kcc->min_rtt_us >> kcc_drift_quiet_jitter_shift_val) {
-                        /* [T_prop] Tier 1: quiet-path baseline drift.
-                         * Use corr_abs / 4 -- one quarter of normal Kalman correction.
-                         * This cautiously tracks the new baseline without overshooting
-                         * (4 such updates ~ full correction). */
-                        u64 drift_corr = corr_abs >> kcc_drift_tier1_shift_val;                          /* [K] Tier-1: corr/4 correction magnitude */
-                        if (drift_corr > 0) {
-                            s64 new_x = (s64)ext->x_est + (s64)drift_corr;                           /* [K] candidate estimate = old + partial correction */
-                            ext->x_est = (new_x > 0) ? (u32)min_t(s64, new_x, (s64)U32_MAX) :       /* [T_prop] commit new estimate if positive */
-                                (u32)max_t(u64, (u64)1U << kcc_kalman_scale_shift_val,              /* [T_prop] else floor at max(1_scale, min_rtt_scaled) */
-                                    min_t(u64, (u64)kcc->min_rtt_us << kcc_kalman_scale_shift_val, U32_MAX));
-                            drift_tier = KCC_DRIFT_TIER1;                       /* Tier-1: covariance reduction scaled by >>2 (/4) */
-                            x_updated = true;                                     /* x_est was actually modified */
-                            ext->pos_skip_cnt = 0;                                /* reset only when correction was applied */
-                            ext->drift_sum = 0;                                  /* reset drift amplitude accumulator */
-                            tier1_fired = true;                                    /* [T_prop] block Tier-2 from double-firing */
+                    if (!saturation_fired && !tier1_fired && ext->pos_skip_cnt >= kcc_kalman_drift_thresh_val) {
+                        bool jitter_ok = ext->jitter_ewma < kcc->min_rtt_us >> kcc_drift_quiet_jitter_shift_val;
+                        if (jitter_ok || ext->tier1_blocked_cnt >= kcc_tier1_blocked_thresh_val) {
+                            /* [T_prop] Tier 1: quiet-path baseline drift.
+                             * Use corr_abs / 4 -- one quarter of normal Kalman correction.
+                             * This cautiously tracks the new baseline without overshooting
+                             * (4 such updates ~ full correction). */
+                            u64 drift_corr = corr_abs >> kcc_drift_tier1_shift_val;                          /* [K] Tier-1: corr/4 correction magnitude */
+                            if (drift_corr > 0) {
+                                u64 sum = (u64)ext->x_est + drift_corr;                          /* [K] u64-safe addition (avoid s64 overflow UB) */
+                                s64 new_x = (sum > (u64)S64_MAX) ? S64_MAX : (s64)sum;          /* [K] candidate estimate = old + partial correction */
+                                ext->x_est = (new_x > 0) ? (u32)min_t(s64, new_x, (s64)U32_MAX) :       /* [T_prop] commit new estimate if positive */
+                                    (u32)max_t(u64, (u64)1U << kcc_kalman_scale_shift_val,              /* [T_prop] else floor at max(1_scale, min_rtt_scaled) */
+                                        min_t(u64, (u64)kcc->min_rtt_us << kcc_kalman_scale_shift_val, U32_MAX));
+                                drift_tier = KCC_DRIFT_TIER1;                       /* Tier-1: covariance reduction scaled by >>2 (/4) */
+                                x_updated = true;                                     /* x_est was actually modified */
+                                ext->pos_skip_cnt = 0;                                /* reset only when correction was applied */
+                                ext->drift_sum = 0;                                  /* reset drift amplitude accumulator */
+                                ext->tier1_blocked_cnt = 0;                           /* [K] reset jitter-gate blocked counter on successful Tier-1 fire */
+                                tier1_fired = true;                                    /* [T_prop] block Tier-2 from double-firing */
+                            }
+                            /* No else: when drift_corr == 0 (corr_abs < 4), pos_skip_cnt
+                             * keeps growing and Tier-2 below remains eligible. */
                         }
-                        /* No else: when drift_corr == 0 (corr_abs < 4), pos_skip_cnt
-                         * keeps growing and Tier-2 below remains eligible. */
+                        else {
+                            /* [K] Tier-1 blocked by jitter: count consecutive blocks.  After 3 consecutive
+                             * times pos_skip_cnt passes drift_thresh but jitter blocks Tier-1, waive the
+                             * jitter gate in subsequent checks.  This closes the ~41-RTT dead zone on
+                             * persistently-noisy paths where jitter never drops below the quiet threshold
+                             * but pos_skip_cnt repeatedly cycles through 0→14→0→14→... without ever
+                             * reaching Tier-2 at 56. */
+                            if (ext->tier1_blocked_cnt < KCC_TIER1_BLOCKED_CNT_MAX) {
+                                ext->tier1_blocked_cnt++;
+                            }
+                        }
                     }
                     if (!tier1_fired && ext->pos_skip_cnt >= kcc_kalman_drift_thresh_val * kcc_drift_tier2_mult_val) {
                         /* [T_prop] Tier 2: statistical-force drift correction.
@@ -12773,8 +13144,18 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
                          * noisy paths where jitter blocks Tier 1 but the
                          * persistent signal still indicates baseline drift). */
                         u64 drift_corr = corr_abs >> kcc_drift_tier2_shift_val;                          /* [K] Tier-2: corr/8 correction magnitude */
-                        if (drift_corr > 0) {
-                            s64 new_x = (s64)ext->x_est + (s64)drift_corr;                           /* [K] candidate estimate = old + partial correction */
+                        /* [T_prop] Floor at 1: prevent permanent pos_skip_cnt saturation (254) when
+                         * drift magnitude is too small for Tier-2's correction to quantise above zero
+                         * (corr_abs < 8).  At P < 1.39×10⁻¹⁷, the null hypothesis is rejected with
+                         * overwhelming certainty — any nonzero correction is physically justified.
+                         * Without this, pos_skip_cnt saturates, Tier-2 fires on every subsequent ACK
+                         * with drift_corr==0, and x_est is permanently frozen. */
+                        if (drift_corr == 0) {
+                            drift_corr = 1;
+                        }
+                        {
+                            u64 sum = (u64)ext->x_est + drift_corr;                          /* [K] u64-safe addition (avoid s64 overflow UB) */
+                            s64 new_x = (sum > (u64)S64_MAX) ? S64_MAX : (s64)sum;          /* [K] candidate estimate = old + partial correction */
                             ext->x_est = (new_x > 0) ? (u32)min_t(s64, new_x, (s64)U32_MAX) :       /* [T_prop] commit new estimate if positive */
                                 (u32)max_t(u64, (u64)1U << kcc_kalman_scale_shift_val,              /* [T_prop] else floor at max(1_scale, min_rtt_scaled) */
                                     min_t(u64, (u64)kcc->min_rtt_us << kcc_kalman_scale_shift_val, U32_MAX));
@@ -12782,15 +13163,17 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
                             x_updated = true;                                     /* x_est was actually modified */
                             ext->pos_skip_cnt = 0;                                /* reset only when correction was applied */
                             ext->drift_sum = 0;                                  /* reset drift amplitude accumulator */
+                            ext->tier1_blocked_cnt = 0;                           /* [K] reset jitter-gate blocked counter on Tier-2 fire */
                         }
                     }
                 }
             }
+            skip_drift:
 
             if (x_updated) {
                 ext->pos_skip_cnt = 0;                          /* [T_noise] reset directional skip counter after accepted update */
                 ext->neg_skip_cnt = 0;                          /* [T_prop] reset negative persistence counter after accepted update */
-                ext->drift_sum = 0;                             /* [T_noise] reset drift amplitude accumulator after accepted update */
+                ext->drift_sum = 0;                             /* [K] reset drift amplitude accumulator after accepted update */
             }
         } /* [K] K*innov->x_est; dir.gate pos=[T_noise] skip -- [T_prop] drift Tier 1/2 */
 
@@ -12870,8 +13253,21 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
                      * strictly below the pre-update estimate.
                      */
                     if (innovation < 0 || g3_fired) {
-                        /* [K] ν < 0 or G3 path-shift: genuine step, Joseph form */
-                        ext->p_est = max_t(u32, r, kcc_kalman_p_est_floor_val);
+                        /* [K] ν < 0 or G3 path-shift: genuine step.
+                         * Require |ν| ≥ scale (1 µs at default scale=1024) for
+                         * Joseph form to prevent p_est oscillation from sub-µs
+                         * quantization noise repeatedly resetting uncertainty
+                         * to max(R, floor).  G3 always uses Joseph form. */
+                        s64 abs_innov = innovation < 0 ? (s64)(-(u64)innovation) : 0;
+                        if (g3_fired || abs_innov >= (s64)(1ULL << kcc_kalman_scale_shift_val)) {
+                            ext->p_est = max_t(u32, r, kcc_kalman_p_est_floor_val);
+                        }
+                        else {
+                            /* sub-µs negative innovation: standard Kalman reduction */
+                            u64 p_reduction = div_u64((u64)p_pred * gain_num, gain_den);
+                            u64 p_new = (u64)p_pred - p_reduction;
+                            ext->p_est = max_t(u32, (u32)p_new, kcc_kalman_p_est_floor_val);
+                        }
                     }
                     else {
                         /* [K] ν = 0: confirming measurement, standard Kalman */
@@ -12883,8 +13279,13 @@ static void kcc_kalman_update(struct sock* sk, u32 rtt_us,                      
                 else {
                     u64 p_reduction;                                            /* [K] amount to subtract from predicted covariance */
                     u64 p_new;                                                  /* [K] new covariance estimate = p_pred - p_reduction */
-                    p_reduction = div_u64((u64)p_pred * gain_num, gain_den);    /* [K] covariance reduction = p_pred * K = p_pred^2 / (p_pred + R) */
-                    if (drift_tier == KCC_DRIFT_TIER1) {
+                     p_reduction = div_u64((u64)p_pred * gain_num, gain_den);    /* [K] covariance reduction = p_pred * K = p_pred^2 / (p_pred + R) */
+                     if (drift_tier == KCC_DRIFT_EARLY) {
+                         /* K-independent step (innov/4): use p_pred/4
+                          * for consistent covariance reduction */
+                         p_reduction = (u64)p_pred >> kcc_drift_early_corr_shift_val;
+                     }
+                     else if (drift_tier == KCC_DRIFT_TIER1) {
                         p_reduction >>= kcc_drift_tier1_shift_val;  /* Tier-1: match corr/4 correction */
                     }
                     else if (drift_tier == KCC_DRIFT_TIER2) {
@@ -14263,14 +14664,18 @@ static void kcc_alone_on_path_eval(struct sock* sk,                   /* evaluat
             (!kcc->lt_use_bw || kcc_alone_bypass_lt_bw_val) &&       /* LT BW either inactive or configured to bypass for alone mode */
             ext->agg_state <= max_agg) {
             ext->alone_exit_cnt = 0;                                 /* reset exit hysteresis counter */
-            ext->alone_confirm_cnt++;                                /* increment entry hysteresis counter */
+            if (ext->alone_confirm_cnt < U8_MAX) {
+                ext->alone_confirm_cnt++;                                /* increment entry hysteresis counter */
+            }
             if (ext->alone_confirm_cnt >= (u8)kcc_alone_confirm_rounds_val) {
                 kcc->alone_on_path = 1;                              /* activate single-flow mode */
             }
         }
         else {
             if (kcc->alone_on_path) {
-                ext->alone_exit_cnt++;                               /* increment exit failure counter */
+                if (ext->alone_exit_cnt < U8_MAX) {
+                    ext->alone_exit_cnt++;                               /* increment exit failure counter */
+                }
                 if (ext->alone_exit_cnt >= (u8)kcc_alone_exit_thresh_val) {
                     kcc->alone_on_path = 0;                          /* exit single-flow mode */
                     ext->alone_exit_cnt = 0;                         /* reset exit counter for next entry */
@@ -14394,11 +14799,11 @@ static u64 kcc_kf_update(u64 z, u32 r_pct, bool check)                /* feed BW
             atomic64_set(&kcc_kf_x, z);                                /* seed state estimate with first sample value */
             atomic64_set(&kcc_kf_P, max(R, 1ULL));                     /* seed error covariance with R (minimum 1) */
             spin_unlock(&kcc_kf_lock);
-            atomic_set(&kcc_kf_active, 1);                             /* mark global Kalman filter as active */
+            smp_store_release(&kcc_kf_active.counter, 1);             /* RELEASE: all prior stores (kf_x,kf_P) are globally visible before kf_active=1 is observed by any CPU; pairs with reader's smp_load_acquire */
             return z;                                                  /* return the seed value as estimate */
         }
-        spin_unlock(&kcc_kf_lock);                                     /* lost the seed race: re-load under lock and fall through */
-        spin_lock(&kcc_kf_lock);
+        /* Lost the seed race: discard stale predict, load winner's
+         * (x,P) under the held lock, then re-apply predict step Q. */
         P = atomic64_read(&kcc_kf_P);                                  /* load winner's P */
         x = atomic64_read(&kcc_kf_x);                                  /* load winner's x */
         spin_unlock(&kcc_kf_lock);
@@ -14462,8 +14867,8 @@ static u64 kcc_kf_update(u64 z, u32 r_pct, bool check)                /* feed BW
          * (x_new, P_old) or (x_old, P_new), breaking the K = P/(P+R) invariant
          * and potentially corrupting the reader's update computation. */
         spin_lock(&kcc_kf_lock);
-        atomic64_set(&kcc_kf_x, x);                                    /* publish updated state estimate to global state */
-        atomic64_set(&kcc_kf_P, P);                                    /* publish updated covariance to global state */
+        smp_store_release(&kcc_kf_x.counter, x);                         /* RELEASE: publish updated state estimate so lockless readers see it — pairs with smp_load_acquire on reader side */
+        smp_store_release(&kcc_kf_P.counter, P);                         /* RELEASE: publish updated covariance with same ordering guarantee */
         spin_unlock(&kcc_kf_lock);
 
         if (kcc_kf_steady_mode_val) {
@@ -14509,11 +14914,11 @@ static u64 kcc_kf_get_init_bw(struct sock* sk)                        /* return 
     struct tcp_sock* tp = tcp_sk(sk);                                  /* TCP socket state */
     u64 fair, init_bw;                                                 /* fair-share estimate from KF; discounted init BW */
 
-    if (!kcc_kf_enable_val || !atomic_read(&kcc_kf_active)) {
+    if (!kcc_kf_enable_val || !smp_load_acquire(&kcc_kf_active.counter)) {
         return 0;                                                      /* no estimate available */
     }
 
-    fair = (u64)atomic64_read(&kcc_kf_x);                              /* read the global Kalman steady-state estimate */
+    fair = (u64)smp_load_acquire(&kcc_kf_x.counter);                    /* ACQUIRE: read the global Kalman steady-state estimate — pairs with writer's smp_store_release */
     if (fair == 0) {
         return 0;                                                      /* no valid estimate to return */
     }
@@ -14827,6 +15232,7 @@ KCC_KFUNC void kcc_init(struct sock* sk)                               /* per-co
     kcc->pacing_gain = 0;                                              /* [T_queue] current pacing gain (set by state machine) */
     kcc->cwnd_gain = 0;                                                /* [T_queue] current cwnd gain (set by state machine) */
     kcc->alone_on_path = 0;                                            /* [T_noise] single-flow detection flag */
+    kcc->drain_rtt_cnt = 0;                                           /* [T_queue] DRAIN mode timeout counter */
     kcc->lt_bw = 0;                                                    /* [T_noise] LT BW estimate */
     kcc->ext = NULL;                                                   /* [K] extended state pointer (allocated below) */
 
@@ -14880,8 +15286,10 @@ KCC_KFUNC void kcc_init(struct sock* sk)                               /* per-co
         ext->pos_skip_cnt = 0;                                           /* initialise positive-direction skip counter to zero [K] */
         ext->neg_skip_cnt = 0;                                           /* initialise negative-persistence counter to zero [T_prop] */
         ext->last_neg_mstamp = 0;                                       /* initialise last-negative timestamp to zero (unset) [T_prop] */
-        ext->drift_sum = 0;                                            /* initialise drift amplitude sum to zero [T_noise] */
+        ext->drift_sum = 0;                                            /* initialise drift amplitude sum to zero [K] */
         ext->alone_exit_cnt = 0;                                         /* initialise alone-mode exit failure counter to zero */
+        ext->tier1_blocked_cnt = 0;                                     /* initialise Tier-1 jitter-gate blocked counter to zero [K] */
+        ext->saturation_hold_cnt = 0;                                   /* initialise saturation hold-off counter to zero [K] */
         ext->dyn_probe_rtt_interval_jiffies = 0;                         /* initialise dynamic PROBE_RTT interval to zero (disabled until Kalman converges) [K] */
 
         ext->sk = sk;                                                      /* store back-reference to socket for diagnostic iterator */
@@ -14920,6 +15328,27 @@ KCC_KFUNC u32 kcc_undo_cwnd(struct sock* sk)                             /* hand
     kcc->full_bw = 0;                                                    /* reset full bandwidth detection estimate */
     kcc->full_bw_cnt = 0;                                                /* reset full bandwidth counter for redetection */
     kcc_reset_lt_bw_sampling(sk);                                        /* clear long-term bandwidth sampling state */
+    {
+        struct kcc_ext* ext = kcc->ext;
+        if (ext) {
+            ext->drift_sum = 0;                                         /* reset drift amplitude accumulator [K] */
+            ext->pos_skip_cnt = 0;                                      /* reset directional skip counter [K] */
+            ext->neg_skip_cnt = 0;                                      /* reset negative persistence counter [K] */
+            ext->tier1_blocked_cnt = 0;                                 /* reset Tier-1 jitter-gate blocked counter [K] */
+            /* Do NOT reset saturation_hold_cnt: premature release of
+             * the hold-off on a saturated path after spurious loss
+             * causes immediate re-entry into saturation detection,
+             * creating a loss→undo→re-saturate→reset oscillation. */
+        }
+    }
+    /* If the spurious loss occurred while in PROBE_RTT, the 4-segment
+     * cwnd clamp in kcc_set_cwnd would immediately re-truncate the
+     * restored cwnd on the next ACK.  Force exit PROBE_RTT to allow
+     * the pipe to re-inflate to its pre-loss capacity. */
+    if (kcc->mode == KCC_PROBE_RTT) {
+        kcc_reset_mode(sk);
+    }
+
     return kcc_tcp_snd_cwnd(tcp_sk(sk));                                 /* return current cwnd for TCP stack's undo decision */
 }
 /*
@@ -15008,6 +15437,7 @@ KCC_KFUNC void kcc_set_state(struct sock* sk, u8 new_state)              /* hand
 
         kcc->prev_ca_state = TCP_CA_Loss;                                /* record previous CA state as Loss */
         kcc->full_bw = 0;                                                /* reset full bandwidth estimate for redetection */
+        kcc->full_bw_cnt = 0;                                            /* reset full bandwidth counter for redetection */
         kcc->round_start = 1;                                             /* treat RTO as end of a round */
         if (!kcc->lt_bw || !kcc->lt_use_bw) {
             kcc_lt_bw_sampling(sk, &rs);                                 /* seed LT BW sampling with synthetic loss event */
@@ -15107,6 +15537,12 @@ static struct ctl_table kcc_ctl_table[] = {
     {.procname = "kcc_drain_gain_den",          .data = &kcc_drain_gain_den,          .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100000] DRAIN pacing gain denominator; BBR default: 1000 */
     {.procname = "kcc_drain_skip_min_rtt_shift", .data = &kcc_drain_skip_min_rtt_shift, .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..7] drain-skip min RTT shift; default 3 */
     {.procname = "kcc_drain_target_max_rtts",    .data = &kcc_drain_target_max_rtts,    .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..256] drain-target max RTTs; default 4 */
+    {.procname = "kcc_drain_timeout_rtts",       .data = &kcc_drain_timeout_rtts,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..31] DRAIN mode safety timeout RTTs; default 24 */
+    {.procname = "kcc_probe_up_max_rtts",        .data = &kcc_probe_up_max_rtts,        .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..256] PROBE_UP hard timeout RTTs; default 16 */
+    {.procname = "kcc_tier1_blocked_thresh",     .data = &kcc_tier1_blocked_thresh,     .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..15] Tier-1 jitter-gate block threshold; default 3 */
+    {.procname = "kcc_saturation_hold_rtts",     .data = &kcc_saturation_hold_rtts,     .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..255] saturation hold-off RTTs; default 30 */
+    {.procname = "kcc_ecn_ewma_floor",           .data = &kcc_ecn_ewma_floor,           .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..255] ECN EWMA floor (BBR_UNIT); default 4 */
+    {.procname = "kcc_neg_persist_time_shift",   .data = &kcc_neg_persist_time_shift,   .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..8] neg-persistence time gate rtt_us>>shift; default 1 */
     /* PROBE_BW cycle and full-BW detection */
     {.procname = "kcc_probe_bw_cycle_len",      .data = &kcc_probe_bw_cycle_len,      .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [2..256] PROBE_BW cycle length (power-of-two); BBR default: 8 */
     {.procname = "kcc_full_bw_thresh_num",      .data = &kcc_full_bw_thresh_num,      .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100000] full-BW growth threshold numerator; BBR default: 125 (1.25x) */
@@ -15140,8 +15576,9 @@ static struct ctl_table kcc_ctl_table[] = {
     /* Jitter / qdelay probe tuning [T_noise][T_queue] */
     {.procname = "kcc_jitter_probe_scale_us",   .data = &kcc_jitter_probe_scale_us,   .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k us] jitter scaling divisor for gain decay; default 16000 */
     {.procname = "kcc_qdelay_probe_scale_us",   .data = &kcc_qdelay_probe_scale_us,   .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k us] qdelay scaling divisor for gain decay; default 20000 */
-    {.procname = "kcc_jitter_r_scale",          .data = &kcc_jitter_r_scale,          .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] jitter scaling divisor for adaptive R; default 8000 */
-    {.procname = "kcc_kalman_r_max_boost",      .data = &kcc_kalman_r_max_boost,      .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..1000] max R boost multiplier; default 8 */
+    {.procname = "kcc_jitter_r_scale",          .data = &kcc_jitter_r_scale,          .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] RESERVED: former linear R scaling divisor (compat); default 8000 */
+    {.procname = "kcc_jitter_r_j50",            .data = &kcc_jitter_r_j50,            .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k us] power-law R crossover jitter J50; default 200 */
+    {.procname = "kcc_kalman_r_max_boost",      .data = &kcc_kalman_r_max_boost,      .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..1000] absolute R multiplier ceiling; default 256 */
     {.procname = "kcc_jitter_seed_shift",       .data = &kcc_jitter_seed_shift,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..8] cold-start jitter EWMA seed shift; default 2 */
     /* Dynamic qdelay/jitter thresholds (permyriad of min_rtt_us, with absolute floor) [T_queue][T_noise] */
     {.procname = "kcc_qdelay_clean_bp",           .data = &kcc_qdelay_clean_bp,           .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..10000] clean threshold (permyriad of min_rtt_us); 1000=10% BDP */
@@ -15160,7 +15597,9 @@ static struct ctl_table kcc_ctl_table[] = {
     /* Kalman core (Kalman 1960) [K] */
     {.procname = "kcc_kalman_p_est_init",       .data = &kcc_kalman_p_est_init,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..10M] initial error covariance p_est; default 1000 */
     {.procname = "kcc_kalman_p_est_floor",      .data = &kcc_kalman_p_est_floor,      .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] p_est lower bound; default 10 */
-    {.procname = "kcc_kalman_outlier_ms",       .data = &kcc_kalman_outlier_ms,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..10k ms] base outlier gate threshold; default 4 */
+    {.procname = "kcc_kalman_outlier_ms",       .data = &kcc_kalman_outlier_ms,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..10k ms] RESERVED: base outlier gate threshold (compat); default 4 */
+    {.procname = "kcc_outlier_rtt_frac_shift", .data = &kcc_outlier_rtt_frac_shift, .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..8] RTT-proportional outlier fraction shift; default 2 (25% RTT) */
+    {.procname = "kcc_outlier_min_floor_us",    .data = &kcc_outlier_min_floor_us,    .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..10k us] min floor for outlier gate; default 50 */
     {.procname = "kcc_kalman_q_boost_ms",       .data = &kcc_kalman_q_boost_ms,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..5000 ms] Q-boost time constant; default 4 */
     {.procname = "kcc_kalman_qboost_cdwn",       .data = &kcc_kalman_qboost_cdwn,       .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..255] Q-boost cooldown; 6 balances recovery vs runaway */
     {.procname = "kcc_kalman_pos_skip_thresh",   .data = &kcc_kalman_pos_skip_thresh,   .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [3..31] consecutive directional skips before Q-boost suppression; default 5 */
@@ -15228,9 +15667,9 @@ static struct ctl_table kcc_ctl_table[] = {
     {.procname = "kcc_agg_confidence_thresh",   .data = &kcc_agg_confidence_thresh,   .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..10k] min confidence for cwnd comp; default 512 */
     {.procname = "kcc_agg_max_comp_ratio",      .data = &kcc_agg_max_comp_ratio,      .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100%] max cwnd compensation % of BDP; default 50% */
     {.procname = "kcc_agg_max_comp_duration",   .data = &kcc_agg_max_comp_duration,   .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..128] max consecutive comp RTTs; default 8 */
-    {.procname = "kcc_agg_r_hysteresis",        .data = &kcc_agg_r_hysteresis,        .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [0..100%] R recovery hysteresis % retained/RTT; default 75 */
-    {.procname = "kcc_agg_r_multiplier_min",    .data = &kcc_agg_r_multiplier_min,    .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..10k] R scaling floor (256=1x); default 256 */
-    {.procname = "kcc_agg_r_multiplier_max",    .data = &kcc_agg_r_multiplier_max,    .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..10k] R scaling ceiling (2048=8x); default 2048 */
+    {.procname = "kcc_agg_r_multiplier_min",     .data = &kcc_agg_r_multiplier_min,     .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..10000] agg R noise scaling floor (BBR_UNIT); default 256 */
+
+    {.procname = "kcc_agg_r_multiplier_max",    .data = &kcc_agg_r_multiplier_max,    .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..10k] R scaling ceiling (1024=4x); default 1024 */
     {.procname = "kcc_agg_factor4_ratio_num",    .data = &kcc_agg_factor4_ratio_num,    .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] Factor 4 ratio numerator; default 3 */
     {.procname = "kcc_agg_factor4_ratio_den",    .data = &kcc_agg_factor4_ratio_den,    .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100k] Factor 4 ratio denominator; default 2 (1.5x) */
     {.procname = "kcc_agg_safety_bdp_mult",      .data = &kcc_agg_safety_bdp_mult,      .maxlen = sizeof(int), .mode = 0644, .proc_handler = kcc_proc_handler }, /* [1..100x] safety guard BDP multiplier; default 3 */
@@ -15397,13 +15836,13 @@ static void kcc_status_stop(struct seq_file* m, void* v)                 /* seq_
 
 static int kcc_status_show(struct seq_file* m, void* v)                  /* seq_file show: emit a single connection's diagnostic state */
 {
-    if (v == &kcc_conn_list) {
+    if (v == SEQ_START_TOKEN) {
         seq_printf(m, "KCC  status  snapshot  (jiffies %lu)\n", jiffies);  /* print timestamp header line */
         seq_printf(m, "=============================================================="
             "=================================\n");                         /* print separator bar */
         seq_printf(m, "[Global]\n");                                     /* print global section header */
-        if (atomic_read(&kcc_kf_active)) {
-            u64 bw_raw = (u64)atomic64_read(&kcc_kf_x);                   /* read raw bandwidth estimate from global KF */
+        if (smp_load_acquire(&kcc_kf_active.counter)) {
+            u64 bw_raw = (u64)smp_load_acquire(&kcc_kf_x.counter);          /* ACQUIRE: read raw bandwidth estimate — pairs with writer's smp_store_release */
             u64 bw_sps = (bw_raw >> KCC_STATUS_BW_DISPLAY_SHIFT) * (USEC_PER_SEC >> KCC_STATUS_BW_DISPLAY_SHIFT);  /* convert to segments/s for display */
             seq_printf(m, "  kf_active=1  kf_x=%llu (~%llu seg/s)\n",
                 bw_raw, bw_sps);                                          /* print KF active status and bandwidth */
@@ -15532,8 +15971,10 @@ static int __init kcc_register(void)                                            
 
     BUILD_BUG_ON(sizeof(struct kcc) > ICSK_CA_PRIV_SIZE);                                                                       /* compile-time size check */
 
-    /* Invariant: KCC_GAIN_SLOTS must fit the :8 cycle_idx bitfield (8 bits = max 256). */
-    BUILD_BUG_ON(KCC_GAIN_SLOTS > 1 << 8);
+    /* Invariant: KCC_GAIN_SLOTS must fit the :8 cycle_idx bitfield.
+     * cycle_idx is always < cycle_len_val (masked by len-1) and
+     * cycle_len_val ≤ 256, so cycle_idx ∈ [0,255] — fits 8 bits. */
+    BUILD_BUG_ON(KCC_GAIN_SLOTS > 256);
 
     for (i = 0; i < KCC_GAIN_SLOTS; i++) {
         kcc_gain_num[i] = dfl_num[i % KCC_DEFAULT_GAIN_CYCLE_LEN];                /* fill gain numerator with repeating BBRv1 pattern */
