@@ -998,7 +998,7 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
 	 */
 	if (bbr->min_rtt_us != ~0U && bbr->min_rtt_us > 0)
 		jitter_jif = usecs_to_jiffies(
-			(u32)(sk->sk_hash & 0xFF) * bbr->min_rtt_us >> 6);
+			(u32)(sk->sk_hash & 0xFF) * bbr->min_rtt_us >> 7);
 
 	/* Track min RTT seen in the min_rtt_win_sec filter window: */
 	filter_expired = after(tcp_jiffies32,

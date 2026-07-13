@@ -1,12 +1,12 @@
 # ----------------------------------------------------------------------------
 # Kernel Module Makefile - tcp_kcc
-# Version: 1.0
+# Version: 2.0
 # Supports: build, clean, install, uninstall, load, unload, modload, sign, status, dkms-help
 # ----------------------------------------------------------------------------
 
 MODULE_NAME := tcp_kcc
 obj-m := $(MODULE_NAME).o
-VERSION ?= 1.0
+VERSION ?= 2.0
 
 # --------------------------------------------------------------------------
 # Configuration (may be overridden on command line or in environment)
@@ -86,6 +86,7 @@ clean:
 help:
 	@echo "Available targets:"
 	@echo "  all               - Build the kernel module"
+	@echo "  build             - Same as all"
 	@echo "  clean             - Remove all build artifacts"
 	@echo "  install           - Build, install and (optionally) sign module (root)"
 	@echo "  uninstall         - Remove installed module for current kernel (root)"

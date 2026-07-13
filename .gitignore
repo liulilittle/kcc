@@ -10,6 +10,9 @@ Module.symvers
 modules.order
 .*.cmd
 *.d
+.backup/
+.ruff_cache/
+*.bak
 
 # Internal research (not for public submission)
 .research/
