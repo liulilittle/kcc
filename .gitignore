@@ -13,6 +13,7 @@ modules.order
 .backup/
 .ruff_cache/
 *.bak
+.claude
 
 # Internal research (not for public submission)
 .research/
