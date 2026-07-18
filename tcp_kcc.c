@@ -5595,7 +5595,7 @@ static int kcc_one_int = 1;
 static int kcc_ten_thousand = 10000;
 static int kcc_1024 = 1024;
 
-static int kcc_sysctl_handler(struct ctl_table* ctl, int write,
+static int kcc_sysctl_handler(KCC_CTL_TABLE* ctl, int write,
     void __user* buffer, size_t* lenp, loff_t* ppos)
 {
     int ret = proc_dointvec_minmax(ctl, write, buffer, lenp, ppos);
@@ -5607,7 +5607,7 @@ static int kcc_sysctl_handler(struct ctl_table* ctl, int write,
 }
 
 static struct ctl_table_header* kcc_ctl_header;
-static KCC_CTL_TABLE kcc_ctl_table[] = {
+static struct ctl_table kcc_ctl_table[] = {
     {
         .procname = "kcc_kf_enable",
         .data = &kcc_kf_enable,
