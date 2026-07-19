@@ -3703,6 +3703,14 @@ static u32 kcc_tso_segs_goal(struct sock* sk)
     return min_t(u32, segs, KCC_TSO_MAX_SEGS);
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+static u32 kcc_tso_segs(struct sock* sk, unsigned int mss_now)
+{
+    (void)mss_now;
+    return kcc_tso_segs_goal(sk);
+}
+#endif
+
 /*
  * kcc_save_cwnd - Save the current cwnd for later restoration.
  * @sk: TCP socket.
@@ -4042,7 +4050,7 @@ static void kcc_set_cwnd(struct sock* sk, const struct rate_sample* rs, u32 acke
         cwnd = cwnd + acked;
     }
 
-    cwnd = max(cwnd, KCC_CWND_MIN_TARGET);
+    cwnd = max_t(u32, cwnd, KCC_CWND_MIN_TARGET);
 
 done:
     kcc_tcp_snd_cwnd_set(tp, min(cwnd, tp->snd_cwnd_clamp));
@@ -5584,7 +5592,11 @@ static struct tcp_congestion_ops tcp_kcc_cong_ops __read_mostly = {
     .undo_cwnd = kcc_undo_cwnd,
     .cwnd_event = kcc_cwnd_event,
     .ssthresh = kcc_ssthresh,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+    .tso_segs = kcc_tso_segs,
+#else
     .min_tso_segs = kcc_min_tso_segs,
+#endif
     .get_info = kcc_get_info,
     .set_state = kcc_set_state,
 };
