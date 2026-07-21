@@ -14,6 +14,8 @@ modules.order
 .ruff_cache/
 *.bak
 .claude
+*opencode*
 
 # Internal research (not for public submission)
 .research/
+goal.ps1
