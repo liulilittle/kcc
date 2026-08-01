@@ -15,6 +15,9 @@ modules.order
 *.bak
 .claude
 *opencode*
+mpmc/
+docs/
+scripts/
 
 # Internal research (not for public submission)
 .research/

@@ -443,10 +443,14 @@ static u32 bbr_packets_in_net_at_edt(struct sock *sk, u32 inflight_now)
 	interval_us = div_u64(edt_ns - now_ns, NSEC_PER_USEC);
 	interval_delivered = (u64)bbr_bw(sk) * interval_us >> BW_SCALE;
 	inflight_at_edt = inflight_now;
-	if (bbr->pacing_gain > BBR_UNIT)              /* increasing inflight */
+	if (bbr->pacing_gain > BBR_UNIT) {             /* increasing inflight */
 		inflight_at_edt += bbr_tso_segs_goal(sk);  /* include EDT skb */
-	if (interval_delivered >= inflight_at_edt)
+	}
+
+	if (interval_delivered >= inflight_at_edt) {
 		return 0;
+	}
+
 	return inflight_at_edt - interval_delivered;
 }
 

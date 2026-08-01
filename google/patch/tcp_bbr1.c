@@ -1080,7 +1080,12 @@ static void bbr_update_model(struct sock *sk, const struct rate_sample *rs)
 	bbr_update_gains(sk);
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
+static void bbr_main(struct sock *sk, u32 ack __maybe_unused,
+		     int flags __maybe_unused, const struct rate_sample *rs)
+#else
 static void bbr_main(struct sock *sk, const struct rate_sample *rs)
+#endif
 {
 	struct bbr *bbr = inet_csk_ca(sk);
 	u32 bw;
