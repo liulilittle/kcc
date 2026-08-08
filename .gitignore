@@ -19,6 +19,8 @@ mpmc/
 docs/
 scripts/
 
-# Internal research (not for public submission)
-.research/
+# Python bytecode artifacts from .research/ simulation scripts
+__pycache__/
+*.pyc
+
 goal.ps1

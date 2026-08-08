@@ -1,0 +1,90 @@
+G3 STRUCTURAL VERIFICATION RESULTS
+========================================================================
+
+--- TEST 1: Noise Immunity (H0) ---
+
+  T_prop=    100us: G3 triggers=0/1000 seeds
+  T_prop=   1000us: G3 triggers=0/1000 seeds
+  T_prop=  10000us: G3 triggers=0/1000 seeds
+  T_prop= 100000us: G3 triggers=0/1000 seeds
+  T_prop=1000000us: G3 triggers=0/1000 seeds
+
+  TOTAL G3 triggers across all 100M RTTs: 0 / 5000 seeds
+
+========================================================================
+STRUCTURAL GUARANTEE PROOF:
+========================================================================
+  Analytical guarantee: at sigma = T_prop/100:
+    P(z > 1.1 * T_prop) = P(N(0,1) > 10) = 7.62e-24
+    P(3 independent triggers without reset) = (7.62e-24)^3 = 4.4e-71
+    Expected FP over 10^9 RTTs: ~4e-62  =>  STRUCTURALLY ZERO
+========================================================================
+  Time: 88.8s
+
+--- TEST 2: Path Change Detection Speed (H1) ---
+
+  T=    100us amp=  5%: detect_rate=100.0% avg_delay=    7.7 RTTs
+  T=    100us amp= 10%: detect_rate=100.0% avg_delay=    3.9 RTTs
+  T=    100us amp= 25%: detect_rate=100.0% avg_delay=    3.3 RTTs
+  T=    100us amp= 50%: detect_rate=100.0% avg_delay=    3.3 RTTs
+  T=    100us amp=100%: detect_rate=100.0% avg_delay=    3.1 RTTs
+  T=    100us amp=200%: detect_rate=100.0% avg_delay=    3.2 RTTs
+  T=    100us small_amp=0.5%: false_trigger_rate=  0.0%
+  T=    100us small_amp=1.0%: false_trigger_rate=  0.0%
+  T=    100us small_amp=2.0%: false_trigger_rate=  0.0%
+  T=   1000us amp=  5%: detect_rate=100.0% avg_delay=    8.6 RTTs
+  T=   1000us amp= 10%: detect_rate=100.0% avg_delay=    3.9 RTTs
+  T=   1000us amp= 25%: detect_rate=100.0% avg_delay=    3.0 RTTs
+  T=   1000us amp= 50%: detect_rate=100.0% avg_delay=    3.1 RTTs
+  T=   1000us amp=100%: detect_rate=100.0% avg_delay=    3.0 RTTs
+  T=   1000us amp=200%: detect_rate=100.0% avg_delay=    3.0 RTTs
+  T=   1000us small_amp=0.5%: false_trigger_rate=  0.0%
+  T=   1000us small_amp=1.0%: false_trigger_rate=  0.0%
+  T=   1000us small_amp=2.0%: false_trigger_rate=  0.0%
+  T=  10000us amp=  5%: detect_rate=100.0% avg_delay=    9.1 RTTs
+  T=  10000us amp= 10%: detect_rate=100.0% avg_delay=    3.9 RTTs
+  T=  10000us amp= 25%: detect_rate=100.0% avg_delay=    3.0 RTTs
+  T=  10000us amp= 50%: detect_rate=100.0% avg_delay=    3.1 RTTs
+  T=  10000us amp=100%: detect_rate=100.0% avg_delay=    3.0 RTTs
+  T=  10000us amp=200%: detect_rate=100.0% avg_delay=    3.0 RTTs
+  T=  10000us small_amp=0.5%: false_trigger_rate=  0.0%
+  T=  10000us small_amp=1.0%: false_trigger_rate=  0.0%
+  T=  10000us small_amp=2.0%: false_trigger_rate=  0.0%
+  T= 100000us amp=  5%: detect_rate=100.0% avg_delay=    7.7 RTTs
+  T= 100000us amp= 10%: detect_rate=100.0% avg_delay=    3.8 RTTs
+  T= 100000us amp= 25%: detect_rate=100.0% avg_delay=    3.0 RTTs
+  T= 100000us amp= 50%: detect_rate=100.0% avg_delay=    3.0 RTTs
+  T= 100000us amp=100%: detect_rate=100.0% avg_delay=    3.0 RTTs
+  T= 100000us amp=200%: detect_rate=100.0% avg_delay=    3.1 RTTs
+  T= 100000us small_amp=0.5%: false_trigger_rate=  0.0%
+  T= 100000us small_amp=1.0%: false_trigger_rate=  0.0%
+  T= 100000us small_amp=2.0%: false_trigger_rate=  0.0%
+  T=1000000us amp=  5%: detect_rate=100.0% avg_delay=    8.0 RTTs
+  T=1000000us amp= 10%: detect_rate=100.0% avg_delay=    3.9 RTTs
+  T=1000000us amp= 25%: detect_rate=100.0% avg_delay=    3.1 RTTs
+  T=1000000us amp= 50%: detect_rate=100.0% avg_delay=    3.1 RTTs
+  T=1000000us amp=100%: detect_rate=100.0% avg_delay=    3.0 RTTs
+  T=1000000us amp=200%: detect_rate=100.0% avg_delay=    3.0 RTTs
+  T=1000000us small_amp=0.5%: false_trigger_rate=  0.0%
+  T=1000000us small_amp=1.0%: false_trigger_rate=  0.0%
+  T=1000000us small_amp=2.0%: false_trigger_rate=  0.0%
+
+  Time: 1.4s
+
+--- TEST 3: BDP Corruption Demo (Old vs Fixed) ---
+
+  Step  1000: OLD mr=96845 x=99398 | FIXED mr=100000 x=99398
+  Step  2000: OLD mr=96837 x=100765 | FIXED mr=100000 x=100765
+  Step  3000: OLD mr=96062 x=100679 | FIXED mr=100000 x=100679
+  Step  4000: OLD mr=96062 x=98843 | FIXED mr=100000 x=98843
+  Step  5000: OLD mr=96062 x=99970 | FIXED mr=100000 x=99970
+  Step  6000: OLD mr=96062 x=100682 | FIXED mr=100000 x=100682
+  Step  7000: OLD mr=96062 x=99907 | FIXED mr=100000 x=99907
+  Step  8000: OLD mr=96062 x=101538 | FIXED mr=100000 x=101538
+  Step  9000: OLD mr=96062 x=99488 | FIXED mr=100000 x=99488
+  Step 10000: OLD mr=96062 x=100387 | FIXED mr=100000 x=100387
+
+  BDP corruption: OLD drifts 3938us below true T_prop; FIXED drifts 0us
+  Time: 0.0s
+
+Total elapsed: 90.2s

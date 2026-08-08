@@ -1,0 +1,105 @@
+{
+  "parameters": {
+    "baseline_ms": 100.0,
+    "sigma_ms": 1.0,
+    "exceed_factor": 1.05,
+    "return_factor": 1.01,
+    "h0_seeds": 10000,
+    "h0_samples": 50000,
+    "h1_seeds": 50,
+    "h1_samples": 20000
+  },
+  "results": {
+    "3": {
+      "fp": 0,
+      "fp_rate": 0.0,
+      "passed_h0": true,
+      "detected_5pct": 50,
+      "median_delay_5pct": 5,
+      "detected_3pct": 50,
+      "median_delay_3pct": 278
+    },
+    "5": {
+      "fp": 0,
+      "fp_rate": 0.0,
+      "passed_h0": true,
+      "detected_5pct": 50,
+      "median_delay_5pct": 9,
+      "detected_3pct": 50,
+      "median_delay_3pct": 731
+    },
+    "7": {
+      "fp": 0,
+      "fp_rate": 0.0,
+      "passed_h0": true,
+      "detected_5pct": 50,
+      "median_delay_5pct": 13,
+      "detected_3pct": 49,
+      "median_delay_3pct": 4969
+    },
+    "10": {
+      "fp": 0,
+      "fp_rate": 0.0,
+      "passed_h0": true,
+      "detected_5pct": 50,
+      "median_delay_5pct": 19,
+      "detected_3pct": 18,
+      "median_delay_3pct": 20000
+    },
+    "15": {
+      "fp": 0,
+      "fp_rate": 0.0,
+      "passed_h0": true,
+      "detected_5pct": 50,
+      "median_delay_5pct": 29,
+      "detected_3pct": 1,
+      "median_delay_3pct": 20000
+    },
+    "20": {
+      "fp": 0,
+      "fp_rate": 0.0,
+      "passed_h0": true,
+      "detected_5pct": 50,
+      "median_delay_5pct": 39,
+      "detected_3pct": 0,
+      "median_delay_3pct": 20000
+    },
+    "25": {
+      "fp": 0,
+      "fp_rate": 0.0,
+      "passed_h0": true,
+      "detected_5pct": 50,
+      "median_delay_5pct": 50,
+      "detected_3pct": 0,
+      "median_delay_3pct": 20000
+    },
+    "30": {
+      "fp": 0,
+      "fp_rate": 0.0,
+      "passed_h0": true,
+      "detected_5pct": 50,
+      "median_delay_5pct": 60,
+      "detected_3pct": 0,
+      "median_delay_3pct": 20000
+    },
+    "40": {
+      "fp": 0,
+      "fp_rate": 0.0,
+      "passed_h0": true,
+      "detected_5pct": 50,
+      "median_delay_5pct": 80,
+      "detected_3pct": 0,
+      "median_delay_3pct": 20000
+    },
+    "50": {
+      "fp": 0,
+      "fp_rate": 0.0,
+      "passed_h0": true,
+      "detected_5pct": 50,
+      "median_delay_5pct": 99,
+      "detected_3pct": 0,
+      "median_delay_3pct": 20000
+    }
+  },
+  "optimal_threshold": 3
+}
