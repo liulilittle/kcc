@@ -142,7 +142,7 @@ The three-component model T_prop, T_queue, T_noise is the unique minimal identif
 
 1. **G1 (instant min):** Absorbs downward noise instantaneously. On any clean sample (≥1 per 8-RTT cycle, Lemma Q.2), x_est resets to T_prop + |η|, bounding the steady-state error to the measurement noise floor.
 
-2. **G2 (bounded per-step growth):** The cap-at-observation ensures |x_est_new − x_est_old| ≤ max(z_k − x_est_old, 0.122·x_est_old).  This prevents unbounded geometric divergence: without the cap, x_est → ∞ under persistent positive innovations.  With the cap, x_est ≤ max(z_1, ..., z_k) — bounded by the maximum observed RTT.  Over multiple steps during persistent queue (T_queue > 0), x_est does drift upward at 12.2%/RTT toward z_k = T_prop + T_queue + η_k: the cap prevents divergence above the observation, but T_queue contamination of x_est up to the current observation value is NOT blocked by the cap alone.  The definitive T_queue rejection comes from the G1 per-cycle reset on clean samples (Lemma Q.2), combined with G4's BDP safety floor (model_rtt = min(x_est, min_rtt_us)).
+2. **G2 (bounded per-step growth):** The cap-at-observation ensures |x_est_new − x_est_old| ≤ max(z_k − x_est_old, 0.122·x_est_old).  This prevents unbounded geometric divergence: without the cap, x_est → ∞ under persistent positive innovations.  With the cap, x_est ≤ max(z_1, ..., z_k) — bounded by the maximum observed RTT.  Over multiple steps during persistent queue (T_queue > 0), x_est does drift upward at 12.2%/RTT toward z_k = T_prop + T_queue + η_k: the cap prevents divergence above the observation, but T_queue contamination of x_est up to the current observation value is NOT blocked by the cap alone.  The definitive T_queue rejection comes from the G1 per-cycle reset on clean samples (Lemma Q.2), combined with G4's BDP safety floor (model_rtt = min_rtt_us, the confirmed minimum).
 
 3. **G3 (dual-threshold confirmation):** Requires 6 consecutive exceedances (fast) / 7 consecutive (slow) above 1.10×/1.05× min_rtt before updating the baseline.  False-positive probability ≤ 1.64×10⁻¹⁰ (Chebyshev bound: slow path (1/5²)⁷ = 0.04⁷; fast path (1/10²)⁶ = 10⁻¹², dominated by slow; distribution-free, σ ≤ T_prop/100, assumes independent samples; successive RTT samples within a congestion epoch are correlated by shared queue state, making this an approximate rather than strict bound).
 
@@ -320,8 +320,8 @@ The filter therefore conditions on the event q_k = 0, receiving unbiased observa
 
 G3 dual-threshold detection handles the persistent-positive-innovation case where T_prop genuinely increases (path change):
 
-- G3 fast path: when x_est ≥ 1.1 × min_rtt × SCALE (exceeds 110% of baseline), confirm_cnt++ and confirm_slow_cnt++. confirm_cnt resets to 0 when x_est falls below 110% (consecutive fast path).
-- G3 slow path: when x_est ≥ 1.05 × min_rtt × SCALE but < 1.1 × min_rtt × SCALE (105–110% of baseline), confirm_cnt=0 and confirm_slow_cnt++ (consecutive slow path; resets to 0 when x_est falls below 105%).
+- G3 fast path: evaluated once per completed round on `round_min` (that round's minimum RTT, delayed-ACK samples excluded). When `round_min` ≥ 1.1 × min_rtt, confirm_cnt++ and confirm_slow_cnt++. Both reset when a round's minimum falls below the threshold (consecutive counting).
+- G3 slow path: when `round_min` ≥ 1.05 × min_rtt but < 1.1 × min_rtt, confirm_cnt=0 and confirm_slow_cnt++ (consecutive slow path; resets to 0 when a round's minimum falls below 105%).
 - If x_est returns to ≤ min_rtt × SCALE, both counters are reset to 0.
 - When confirm_cnt ≥ 6 (fast path triggered): min_rtt_us = x_est >> shift, both counters reset. Converges in ~6 RTTs.
 - When confirm_slow_cnt ≥ 7 (slow path triggered): min_rtt_us = x_est >> shift, both counters reset.
@@ -363,7 +363,7 @@ However, their **transient behavior differs fundamentally**:
 
 - **(a) Instant downward convergence**  --  G1 update (TOBIT min) converges to T_prop in a single clean sample, eliminating the multi-RTT lag of running-minimum updates.
 - **(b) Gated upward growth**  --  G2 geometric growth (12.2%/RTT, capped at observation) prevents catastrophic tracking of a single corrupted minimum while providing bounded upward adjustment.
-- **(c) Dual-threshold path-increase detection**  --  G3 dual-threshold (x_est ≥ 1.1 × min_rtt × SCALE -> confirm_cnt+++confirm_slow_cnt++; x_est ≥ 1.05 × min_rtt × SCALE but < 1.1 × min_rtt × SCALE -> confirm_cnt=0+confirm_slow_cnt++; x_est ≤ min_rtt × SCALE -> reset both; confirm_cnt≥6 or confirm_slow_cnt≥7 (both consecutive) -> update min_rtt_us). The G3 lock prevents min_rtt_us from being lowered while counters are non-zero  --  kcc_update still runs, so x_est is never frozen.
+- **(c) Dual-threshold path-increase detection**  --  G3 dual-threshold, evaluated once per completed round on `round_min` (round_min ≥ 1.1 × min_rtt -> confirm_cnt+++confirm_slow_cnt++; round_min ≥ 1.05 × min_rtt but < 1.1 × min_rtt -> confirm_cnt=0+confirm_slow_cnt++; round_min ≤ min_rtt -> reset both; confirm_cnt≥6 or confirm_slow_cnt≥7 (both consecutive) -> update min_rtt_us). The G3 lock prevents min_rtt_us from being lowered while counters are non-zero  --  kcc_update still runs, so x_est is never frozen.
 
 The running minimum is fragile: a single anomalously low sample (negative timestamp error) permanently corrupts the estimate.
 
@@ -473,27 +473,27 @@ The G3 dual-threshold counter is NOT a fallback for a "broken" filter  --  it pr
 
 The G3 detector checks the geodesic estimate against thresholds of the model RTT (mr = min_rtt_us × SCALE), evaluated every RTT after kcc_update has run:
 
-**G3 fast path:** When x_est ≥ 1.1 × mr (≥110% of baseline), confirm_cnt++ and confirm_slow_cnt++.
+**G3 fast path:** When `round_min` ≥ 1.1 × mr (≥110% of baseline), confirm_cnt++ and confirm_slow_cnt++.
 
-**G3 slow path:** When x_est ≥ 1.05 × mr but < 1.1 × mr (105–110% of baseline), confirm_cnt=0 and confirm_slow_cnt++.
+**G3 slow path:** When `round_min` ≥ 1.05 × mr but < 1.1 × mr (105–110% of baseline), confirm_cnt=0 and confirm_slow_cnt++.
 
-**No threshold:** When x_est > mr but < 1.05 × mr, confirm_cnt=0 (confirm_slow_cnt unchanged).
+**No threshold:** When `round_min` > mr but < 1.05 × mr, confirm_cnt=0 and confirm_slow_cnt=0.
 
 **Baseline return:** When x_est ≤ mr, both counters reset to 0.
 
 | Path | Condition | Counter Effect | Action |
 |------|-----------|----------------|--------|
-| G3 fast | x_est ≥ 1.1 × mr | confirm_cnt++, confirm_slow_cnt++ | cnt≥6 -> min_rtt_us = x_est>>shift |
-| G3 slow (5–10%) | x_est ≥ 1.05 × mr, < 1.1 × mr | confirm_cnt=0, confirm_slow_cnt++ | slw≥7 -> min_rtt_us = x_est>>shift |
-| No threshold (<5%) | x_est > mr, < 1.05 × mr | confirm_cnt=0, confirm_slow_cnt=0 |  --  |
-| Baseline | x_est ≤ mr | confirm_cnt=0, confirm_slow_cnt=0 |  --  |
+| G3 fast | round_min ≥ 1.1 × mr | confirm_cnt++, confirm_slow_cnt++ | cnt≥6 -> min_rtt_us = round_min |
+| G3 slow (5–10%) | round_min ≥ 1.05 × mr, < 1.1 × mr | confirm_cnt=0, confirm_slow_cnt++ | slw≥7 -> min_rtt_us = round_min |
+| No threshold (<5%) | round_min > mr, < 1.05 × mr | confirm_cnt=0, confirm_slow_cnt=0 |  --  |
+| Baseline | round_min ≤ mr | confirm_cnt=0, confirm_slow_cnt=0 |  --  |
 
 *Note: The reset behavior matches the actual code in `tcp_kcc.c:kcc_update_min_rtt()`.
 Both counters use CONSECUTIVE counting: confirm_cnt resets on ANY sample below
 the fast threshold (1.1×); confirm_slow_cnt resets on ANY sample below the slow
 threshold (1.05×) or when either G3 path fires (confirm_cnt≥6 or
 confirm_slow_cnt≥7). The slow counter was changed from cumulative to
-consecutive because 20亿-sample simulation proved cumulative counting is
+consecutive because 2e9-sample simulation proved cumulative counting is
 guaranteed to be breached by sustained queue-spike noise (see design doc
 section 4). The README and C code comments are consistent with the
 authoritative code behavior.*
@@ -682,7 +682,7 @@ The stability proofs are built on a three-layer decomposition with NO circular p
 | **A1. Bounded Measurement Noise** | ||η_k|| ≤ η_max, bounded by the geodesic structural noise immunity (G1/G2 asymmetry). | Bus contention, interrupt coalescing. Kernel measurements: σ ∈ [10 us, 1 ms]. |
 | **A2. Finite Buffer** | Queue buffer is finite (switch hardware limit). Overrun -> loss -> congestion signal. | Physical constraint; all CC proofs assume finite buffers. |
 | **A3. DRAIN Under-Pacing** | g_drain = 3/4 = 0.75 (kcc_pacing_gain[1]) is the PROBE_BW cycle DRAIN-phase pacing gain. The STARTUP->DRAIN transition mode uses KCC_DRAIN_GAIN ≈ 0.347. Deficit rate for PROBE_BW DRAIN = (1−g_drain)C = 0.25 C. At 10 Gbps: deficit ≈ 208 kseg/s. | Engineered parameter; matches BBR's PROBE_BW DRAIN phase; STARTUP DRAIN matches kernel BBR's bbr_drain_gain. |
-| **A4. Dwell-Time** | Each PROBE_BW phase lasts at least 1 RTT (is_full_length condition: delta > min_rtt). The DRAIN phase has a safety timeout at 4×min_rtt (hardcoded in kcc_check_drain). | Liberzon (2003) "Switching in Systems and Control" Theorem 3.1: τ_qd > 0 ensures dwell-time switching stability. |
+| **A4. Dwell-Time** | Each PROBE_BW phase lasts at least 1 RTT (is_full_length condition: delta > min_rtt). The probe-up phase has a 2×min_rtt safety timeout and the drain phase a 4×min_rtt timeout, so a phase whose inflight target is unreachable still terminates. | Liberzon (2003) "Switching in Systems and Control" Theorem 3.1: τ_qd > 0 ensures dwell-time switching stability. |
 
 ---
 
@@ -1619,7 +1619,7 @@ The G3 dual-threshold detector provides a secondary safety net: when confirm_cnt
 
 - **G1 instant convergence (ν ≤ 0 → x_est = min(x_est, z)):** One-step reset to observation. On clean samples (≥1 per 8-phase cycle per Q.2) this eliminates accumulated error.
 - **G2 bounded growth (ν > 0 → x_est = min(x_est × 1.122, z)):** Fixed 12.2%/RTT geometric growth, always capped at the observation z. Unlike a Kalman filter whose estimate can drift unboundedly, G2's z-cap provides deterministic boundedness.
-- **G3 dual-threshold (fast: x_est ≥ 1.1×mr_scaled → confirm_cnt+++confirm_slow_cnt++; slow: 1.05× ≤ x_est < 1.1× → confirm_cnt=0, confirm_slow_cnt++):** Fast path reaches 6 consecutive to update min_rtt; slow path reaches 7 consecutive. Both reset on baseline return (x_est ≤ mr_scaled).
+- **G3 dual-threshold, once per completed round on `round_min` (fast: round_min ≥ 1.1×mr → confirm_cnt+++confirm_slow_cnt++; slow: 1.05× ≤ round_min < 1.1× → confirm_cnt=0, confirm_slow_cnt++):** Fast path reaches 6 consecutive rounds to update min_rtt; slow path reaches 7. Both reset on baseline return (round_min ≤ mr).
 
 **Distribution-free nature:** The geodesic estimator requires only bounded noise support, which the G1/G2 structural asymmetry provides  --  downward noise is absorbed instantly, upward noise follows bounded 12.2%/RTT growth capped at the observation. The ISS proof requires only bounded noise support, which this structural asymmetry guarantees.
 
@@ -1659,7 +1659,7 @@ Because `bw_i` and `pacing_gain` are identical in both modes, the **actual sendi
 
 #### Section Fairness.3 model_rtt Impact on Performance (Not Fairness)
 
-The model RTT is always computed as `model_rtt = min(x_est_us, min_rtt_us)`. The min_rtt_us window provides a historical safety ceiling that may lag behind on path increases (stale up to 10 s), but the geodesic estimate x_est provides instant downward tracking. Neither the windowed minimum nor the combined estimate affects fairness  --  they only affect the cwnd ceiling, not the pacing rate or bandwidth estimate.
+The model RTT is the **confirmed** `min_rtt_us`. Unconfirmed estimator samples are deliberately excluded from BDP: G1 is an instantaneous minimum, so a single low outlier would otherwise halve the cwnd target while `min_rtt_us` had not accepted it. `min_rtt_us` is updated by fast-fall (instant for drops below 25%), sticky fall (five consecutive rounds below 75%), the per-round downward check (five consecutive rounds below 95%), and G3 for increases. Neither `min_rtt_us` nor the estimator affects fairness  --  they only affect the cwnd ceiling, not the pacing rate or bandwidth estimate.
 
 ---
 
@@ -1755,13 +1755,13 @@ KCC maintains two independent T_prop estimates:
 
 **The model_rtt selection:**
 
-model_rtt = min(x_est_us, min_rtt_us)  --  uses the geodesic estimate clamped by the windowed minimum. Before the estimator has collected `KCC_MIN_SAMPLES` (5) samples, `model_rtt` falls back to `min_rtt_us` directly. Once active, it responds within ~3 RTTs to BGP reroutes and LEO handovers, avoiding the throughput cliff of stale min_rtt. The directional update (G1/G2) and G2 bounded growth provide multi-layer defences against T_queue/T_noise contamination. KCC uses the Geodesic estimator as a drop-in min_rtt replacement. There is no separate BBR mode.
+model_rtt = min_rtt_us (the confirmed minimum). `min_rtt_us` changes only through confirmed paths: fast-fall (a sample below 25% of min_rtt is applied immediately), sticky fall (five consecutive rounds below 75%), the per-round downward check (five consecutive rounds below 95%), the SRTT guard, and G3 for increases. Unconfirmed single samples never enter the BDP. There is no separate BBR mode.
 
 **Proposition 4 (Conservative BDP Bound  --  FILTER mode).** In FILTER mode, under the three-component model with directional state update, the BDP estimate satisfies:
 
 Single-flow (min_rtt_us converges to T_prop): BDP_KCC ≤ BDP_true. Since x̂ ≤ T_prop + noise_bias under the directional update (all positive innovations rejected), and noise_bias -> 0 with sufficient clean samples (Theorem S.2, exponential contraction): BDP_KCC -> BDP_true as sample count increases.
 
-Multi-flow (N≥8, min_rtt_us may not converge to T_prop due to persistent cross-traffic queuing): BDP_KCC ≤ C·min_rtt_us/MSS. The structural BDP floor (G4: model_rtt = min(x_est, min_rtt_us)) remains correct; BDP may exceed true physical BDP by up to the min_rtt_us overshoot amount. This is a min_rtt_us estimation issue (multi-flow queue-induced floor elevation), not a G4 floor flaw. The BDP bound is always conservative relative to min_rtt_us; it may be non-conservative relative to the unobservable true T_prop in heavily-contended multi-flow scenarios.
+Multi-flow (N≥8, min_rtt_us may not converge to T_prop due to persistent cross-traffic queuing): BDP_KCC ≤ C·min_rtt_us/MSS. The structural BDP floor (G4: model_rtt = min_rtt_us, the confirmed minimum) remains correct; BDP may exceed true physical BDP by up to the min_rtt_us overshoot amount. This is a min_rtt_us estimation issue (multi-flow queue-induced floor elevation), not a G4 floor flaw. The BDP bound is always conservative relative to min_rtt_us; it may be non-conservative relative to the unobservable true T_prop in heavily-contended multi-flow scenarios.
 
 **Proof:** The directional update ensures x̂ ≤ T_prop + δ_noise where δ_noise is the residual noise bias (bounded by σ_noise from Theorem S.2). Therefore:
 
@@ -1920,7 +1920,7 @@ P(7 consecutive exceedances > 5%) ≤ (p₁)^7 where p₁ = P(single exceedance 
 The G2 branch applies a fixed 12.2% geometric growth (`x_est = min(x_est + x_est × 122/1000, z)`) to ALL positive innovations, capped at the observation value z. This provides deterministic bounded upward tracking without any per-sample rejection counter or explicit gated-accept mechanism. The G3 dual-threshold accumulator detects genuine baseline drift: counters increment each RTT (kcc_update runs continuously), reaching 6 (fast) or 7 (slow) to trigger min_rtt_us update.
 
 **Min-RTT window (G3 observation window):**
-KCC replaces BBR's 10s min_rtt window with a 128-round G3 observation window in `kcc_update`. After 128 rounds without a G3 fire (min_rtt_us unchanged), if x_est ≤ 1.10×min_rtt (hasn't crossed into G3 fast-detection territory), x_est is pulled back to 95% of min_rtt, restarting the observation window. This prevents G2 geometric drift (12.2%/RTT) from accumulating false G3 slow-path exceedances over long windows. G3 dual-threshold detection (fast 6-consecutive at 1.10×, slow 7-consecutive at 1.05×) remains the primary path-increase detector. The traditional min_rtt update uses sticky-fall with fast-fall for instantaneous drops; an SRTT guard and geodesic takeover (`x_est` pulling `min_rtt_us` down) provide additional safety. No wall-clock expiry.
+KCC replaces BBR's 10s min_rtt window with a 128-round G3 observation window in `kcc_update`. After 128 rounds without a G3 fire (min_rtt_us unchanged), if x_est ≤ 1.10×min_rtt (hasn't crossed into G3 fast-detection territory), x_est is pulled back to 95% of min_rtt, restarting the observation window. This prevents G2 geometric drift (12.2%/RTT) from accumulating false G3 slow-path exceedances over long windows. G3 dual-threshold detection (fast 6-consecutive at 1.10×, slow 7-consecutive at 1.05×) remains the primary path-increase detector. The traditional min_rtt update uses sticky fall (five consecutive rounds) and fast fall (instant for drops below 25%); an SRTT guard and a per-round downward check (five consecutive rounds below 95%) provide additional coverage. No wall-clock expiry.
 
 **kcc_scale (default 1024 = 2^10):**
 Fixed-point scaling for the classical estimator. Chosen as a power-of-two for efficient bit-shift arithmetic. 10 bits provides ~0.1% fractional precision (1/1024 ≈ 0.1%). 1024^2 = 1,048,576  --  providing sufficient precision for fixed-point arithmetic.
@@ -2111,7 +2111,7 @@ KCC provides two INDEPENDENT mechanisms that bound the starvation error:
 
 **(a) Periodic drain within PROBE_BW.** Every PROBE_BW cycle has one 0.75x drain phase (phase 1 of 8) that clears the queue, producing a clean min_rtt sample. This is a single-round drain within the closed-loop PROBE_BW controller.
 
-**(b) G3 dual-threshold detection.** When x_est >= 1.1 x min_rtt x SCALE, confirm_cnt++ and confirm_slow_cnt++; when x_est >= 1.05 x but < 1.1 x min_rtt x SCALE, confirm_cnt=0 and confirm_slow_cnt++ (consecutive fast, consecutive slow). When confirm_cnt>=6 or confirm_slow_cnt>=7 (both consecutive), min_rtt_us = x_est >> shift. The G3 lock prevents min_rtt_us from being lowered while counters are non-zero.
+**(b) G3 dual-threshold detection.** Evaluated once per completed round on `round_min`. When round_min >= 1.1 x min_rtt, confirm_cnt++ and confirm_slow_cnt++; when round_min >= 1.05 x but < 1.1 x min_rtt, confirm_cnt=0 and confirm_slow_cnt++ (consecutive fast, consecutive slow). When confirm_cnt>=6 or confirm_slow_cnt>=7 (both consecutive), min_rtt_us = x_est >> shift. The G3 lock prevents min_rtt_us from being lowered while counters are non-zero.
 
 This bounds the worst-case drift even when NO clean sample ever arrives.
 
@@ -2235,7 +2235,7 @@ Since σ^2_q > σ^2_noise when queue is present, `MSE_dir < MSE_full`. The forma
 
 The MSE of the directional (directionally filtered) estimator is MSE_dir = σ^2_noise (noise variance on clean-sample subset). Since σ^2_q > σ^2_noise for any non-trivial queue, MSE_dir < MSE_full. **Directional update is strictly lower-MSE than full-data estimator when queue is present.**
 
-**G3 dual-threshold counter:** G3 uses two counters (confirm_cnt, confirm_slow_cnt). Fast path (consecutive, resets below 110%): x_est >= 1.1 x min_rtt x SCALE -> confirm_cnt++ and confirm_slow_cnt++; slow path (consecutive): x_est >= 1.05 x but < 1.1 x min_rtt x SCALE -> confirm_cnt=0 and confirm_slow_cnt++. When confirm_cnt>=6 or confirm_slow_cnt>=7 (both consecutive), min_rtt_us = x_est >> shift. While counters are non-zero, the G3 lock prevents min_rtt_us from being lowered by the min_rtt window, SRTT guard, and geodesic pull-down. Counters also clear when x_est returns to <= min_rtt x SCALE.
+**G3 dual-threshold counter:** G3 uses two counters (confirm_cnt, confirm_slow_cnt), advanced once per completed round using that round's minimum RTT (`round_min`). Fast path (consecutive, resets below 110%): round_min >= 1.1 x min_rtt -> confirm_cnt++ and confirm_slow_cnt++; slow path (consecutive): round_min >= 1.05 x but < 1.1 x min_rtt -> confirm_cnt=0 and confirm_slow_cnt++. When confirm_cnt>=6 or confirm_slow_cnt>=7 (both consecutive), min_rtt_us = x_est >> shift. While counters are non-zero, the G3 lock prevents min_rtt_us from being lowered by the min_rtt window, SRTT guard, and geodesic pull-down. Counters also clear when x_est returns to <= min_rtt x SCALE.
 
 **Why reject ALL positive innovations, not just large ones?** A magnitude-only gate (e.g., 3σ) fails because queue-induced innovations are not necessarily large  --  a 1ms queue on a 10ms path creates a 10% positive innovation that passes a 3σ gate (σ≈2ms -> gate at 6ms). Over N events, the cumulative bias is:
 
@@ -2244,6 +2244,10 @@ The MSE of the directional (directionally filtered) estimator is MSE_dir = σ^2_
 With G2 = 12.2%/RTT fixed growth, q=1ms, N=1000: bias = 0.122 × 1000 = 122ms (capped at observation z each step)  --  the sign-based directional gate correctly rejects ALL positive innovations regardless of magnitude, achieving what magnitude-based gating cannot: negligible queue contamination of x_est. The G3 dual-threshold detection detects baseline drift: when x_est ≥ 1.1 × min_rtt × SCALE (fast, consecutive) or x_est ≥ 1.05 × min_rtt × SCALE (slow, consecutive), counters increment each RTT until 6 (fast) or 7 (slow) triggers min_rtt_us update.
 
 **DRAIN exit condition:** kcc_check_drain exits DRAIN when inflight drops to or below BDP (at 1.0x gain), with a 4×min_rtt safety timeout preventing infinite drain on paths where inflight never drops.
+
+**PROBE_BW phase exit:** a 1.0x cruise phase ends after one RTT. The probe-up (1.25x) phase ends when inflight reaches `kcc_inflight(bw, 1.25)` or a loss occurs, and also after 2×min_rtt. The timeout matters because the inflight target includes the TSO headroom (`KCC_TSO_HEADROOM_MULT * tso_segs_goal`), which at a small BDP can exceed what `cwnd_gain * BDP` permits; without the timeout the phase would never end, the queue would stay elevated, and G3 would read that queue as a path increase. The probe-up cwnd bonus is added to the cwnd target only, not to this exit target.
+
+**Drain (0.75x) phase:** ends when inflight falls to the 1.0x target, or after 4×min_rtt.
 
 ---
 
@@ -2383,7 +2387,7 @@ The core measurement pipeline consists of two components:
 
   ν ≤ 0 (clean):  x_est = min(x_est, z)              [G1] TOBIT min, instant convergence
   ν > 0 (noise):  x_est = min(x_est + x_est × 122 / 1000, z), capped at observation z  [G2]
-  Path increase:  G3 dual-threshold detection (x_est ≥ 1.1×min_rtt×SCALE -> confirm_cnt+++confirm_slow_cnt++; x_est ≥ 1.05× < 1.1×min_rtt×SCALE -> confirm_cnt=0+confirm_slow_cnt++; cnt≥6 or slw≥7 (both consecutive) -> update min_rtt_us)
+  Path increase:  G3 dual-threshold detection, once per completed round on round_min (round_min ≥ 1.1×min_rtt -> confirm_cnt+++confirm_slow_cnt++; round_min ≥ 1.05× < 1.1×min_rtt -> confirm_cnt=0+confirm_slow_cnt++; cnt≥6 or slw≥7 (both consecutive) -> update min_rtt_us)
 
 No Kalman filter machinery  --  the geodesic is derived from the three-component behavioral axioms. Propagation delay estimation is treated as a one-sided censoring problem with an exact closed-form solution. The `p_est` variable (bounded [10, 1e6]) is maintained as a convergence proxy for secondary decision gating (ECN backoff) and future planned gain decay; it is NOT used as a Kalman gain in the G1/G2 update rules and carries zero feedback into the ISS estimator subsystem (Lemma N.4).
 
@@ -2391,9 +2395,9 @@ Fixed-point conventions: BW_UNIT = 1 << 24 for bandwidth (segments * 2^24 / us),
 
 ## Model RTT Strategy
 
-The model RTT is always computed as `model_rtt = min(x_est_us, min_rtt_us)` after the estimator has collected at least KCC_MIN_SAMPLES (5) samples; before that it falls back to `min_rtt_us` directly. This dual-bounded approach takes the minimum of the current geodesic estimate and the windowed historical minimum, providing conservative BDP computation that resists T_queue inflation. There is no run-time switch  --  only FILTER mode is implemented.
+The model RTT is the confirmed `min_rtt_us`. Unconfirmed estimator samples are excluded because `x_est` is an instantaneous minimum (G1); `min_rtt_us` is updated by fast-fall, sticky fall, and the per-round downward check.
 
-The geodesic estimate `x_est_us` provides instant downward tracking via G1 while the windowed minimum `min_rtt_us` serves as a safety ceiling  --  BDP never exceeds the lower of the two estimators. This guarantee is structural (BDP = C·min(x_est_us, min_rtt_us)/MSS); in multi-flow scenarios, `min_rtt_us` itself may not converge to true T_prop due to persistent cross-traffic queuing, allowing BDP to overshoot the true physical BDP. This is a `min_rtt_us` estimation issue, not a G4 floor flaw.
+The estimator `x_est_us` tracks downward via G1 but does not enter the BDP; `min_rtt_us` reaches the BDP only through confirmed paths (fast-fall, sticky fall, per-round downward check). This guarantee is structural (BDP = C·min_rtt_us/MSS); in multi-flow scenarios, `min_rtt_us` itself may not converge to true T_prop due to persistent cross-traffic queuing, allowing BDP to overshoot the true physical BDP. This is a `min_rtt_us` estimation issue, not a G4 floor flaw.
 
 ---
 
@@ -2447,15 +2451,15 @@ The primary T_prop estimator is the **geodesic**  --  a minimal-path estimator t
 
 **Geodesic (G1–G3, O(1) per ACK):**
 
- ν = z - x_est
+ ν = z - x_est  (estimator innovation; queue delay is measured against min_rtt)
 
  ν ≤ 0 (clean sample):  x_est = min(x_est, z)              [G1] TOBIT min, instant convergence
  ν > 0 (queue noise):   x_est = min(x_est + x_est × 122 / 1000, z)   [G2] 12.2% geometric growth, capped at observation z
   Path increase:          G3 dual-threshold accumulator (cnt≥6 or slw≥7 -> min_rtt_us update; lock prevents min_rtt lowering during accumulation)
 
-**Estimator takeover**: when `x_est > 0` and `sample_cnt >= KCC_MIN_SAMPLES` (default 5), the geodesic estimate can pull down `min_rtt_us` (only after `KCC_MINRTT_FAST_FALL_CNT` consecutive fast-fall confirmations), not simply replace it. `min_rtt_stamp` is refreshed on pull-down to maintain the windowed minimum.
+**Downward path-change check**: `min_rtt_us` is lowered when the completed round's minimum stays below 0.95 x `min_rtt_us` for `KCC_MINRTT_FAST_FALL_CNT` consecutive rounds. The check runs on the per-round minimum (not on `x_est` and not per ACK), so a single low outlier cannot satisfy it. A drop below 0.75 x `min_rtt_us` is handled by the sticky fall, and a drop below 0.25 x is applied immediately by the fast-fall branch.
 
-**Model RTT strategy**: KCC uses FILTER mode exclusively: `model_rtt = min(x_est_us, min_rtt_us)` -- the geodesic estimate clamped by the windowed minimum for safety. Most parameters are hardcoded compile-time constants; key runtime parameters are exposed via module_param and sysctl (see the Parameter Configuration section).
+**Model RTT strategy**: `model_rtt = min_rtt_us`, the confirmed minimum; the geodesic estimate reaches it only through confirmed reduction paths. Most parameters are hardcoded compile-time constants; key runtime parameters are exposed via module_param and sysctl (see the Parameter Configuration section).
 
 ## KCC Differences from BBRv1
 
@@ -2554,32 +2558,28 @@ On transition to DRAIN, `qdelay_avg` is NOT manually reset — it is an EWMA tha
 
 ### TSO Divisor Adaptation
 
-`kcc_min_tso_segs()` adjusts the rate threshold divisor based on estimator state:
+`kcc_min_tso_segs()` returns 1 or 2 segments based on a pacing-rate threshold:
 
-- classical converged + `jitter_ewma < 1000 us`: divisor halved (8->4), larger TSO bursts
-- `jitter_ewma > 4000 us`: divisor doubled (8->16), smaller TSO bursts to suppress jitter
+```
+div      = KCC_MIN_TSO_RATE_DIV                      (8, low jitter)
+         = KCC_MIN_TSO_RATE_DIV >> 1                 (4, when jitter_ewma > 4000 us)
+threshold = max(1, KCC_MIN_TSO_RATE / div)           (150000 or 300000 B/s)
+segs      = pacing_rate < threshold ? 1 : 2
+```
 
-#### TSO Divisor  --  Physics Derivations
+The direction matters: raising the threshold makes the "1 segment" branch apply to more pacing rates, i.e. shorter bursts. High jitter therefore **halves** the divisor (doubling the threshold), producing smaller minimum bursts.
 
-The internal constants `KCC_TSO_DIV_CEIL` and `KCC_TSO_DIV_DOUBLE_SHIFT` are derived from physical network limits and hardware burst characteristics. The base divisor `KCC_MIN_TSO_RATE_DIV` (default 8) doubles on high-jitter paths via `<< KCC_TSO_DIV_DOUBLE_SHIFT`.
+#### TSO Divisor Constants
 
-| Constant | Value | Derivation |
-|----------|-------|------------|
-| `KCC_MIN_TSO_RATE_DIV` | 8 | Default TSO divisor: kcc_min_tso_segs returns low-seg (1) when pacing < KCC_MIN_TSO_RATE / div. Base divisor before jitter adaptation. |
-| `KCC_TSO_DIV_CEIL` | 32 | Maximum divisor when jitter is high. Selected as the geometric mean of NIC TSO capability range [16, 64]: sqrt(16×64) = 32 (engineering heuristic; any value in [16, 64] would work — 32 provides balanced worst-case self-inflicted burst queue). Guarantees the self-inflicted burst queue ≤ CEIL × MTU / C. At 10 Gbps with CEIL = 32, MTU = 1500 B: T_burst = 32 × 1500 × 8 / 10¹⁰ = 38.4 us  --  drained within 1 RTT (RTT ≥ 1 ms). This prevents pacing-induced standing queues from TSO aggregation: the worst-case queue never exceeds ~38 us, which rounds to 0 in 1-ms-granularity delay measurements. |
-| `KCC_TSO_DIV_DOUBLE_SHIFT` | 1 | Hardware adaptation shift: `div << 1` doubles the divisor, halving TSO burst size on high-jitter paths. When `div >>= 1` would occur on clean paths, instead the estimator-convergence state halves the divisor (clean path -> larger TSO bursts). |
-| `KCC_TSO_DIV_DOUBLE_SHIFT` | 1 | Doubling divisor via `div << 1` halves the effective pacing interval. When jitter_ewma exceeds 4000 us, the NIC interrupt coalescing period (typically 50–128 us) is being exceeded by OS-level jitter. Smaller TSO bursts reduce ACK compression -> lower per-packet jitter variance. The shift-1 design keeps the geometric adaptation step symmetric: halve (>>1) and double (<<1) use the same shift width, ensuring the AdaSearch converges in O(log₂(CEIL − FLOOR)) = O(5) adaptation cycles. |
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `KCC_MIN_TSO_RATE` | 1200000 | Base rate used to derive the segment threshold (bytes/s). |
+| `KCC_MIN_TSO_RATE_DIV` | 8 | Base divisor; threshold = `KCC_MIN_TSO_RATE / div`. |
+| `KCC_TSO_DIV_HALVE_SHIFT` | 1 | High-jitter adaptation: `div >>= 1`, doubling the threshold and shortening bursts. |
+| `KCC_TSO_HIGH_JITTER_THRESH_US` | 4000 | `jitter_ewma` above which the high-jitter adaptation applies. |
+| `KCC_TSO_SEGS_LOW` / `KCC_TSO_SEGS_DEFAULT` | 1 / 2 | Segment counts returned below / at or above the threshold. |
 
-### Formal AdaSearch Bounds
-
-The TSO divisor adaptation implements an offline geometric binary search over the range [FLOOR, CEIL] with exponential step size:
-
- D[n+1] =
-max(FLOOR, D_n >> 1)   if converged and jitter_ewma < 1000 μs
-min(CEIL, D_n << 1)   if jitter_ewma > 4000 μs
-D_n                    otherwise
-
-The search space diameter is log₂(32/2) = 4 steps; with adaptation every ~8 RTTs (one PROBE_BW cycle), full convergence from any initial divisor requires ≤ 4 × 8 = 32 RTTs. The AdaSearch termination condition is the neutral band [1000, 4000] us where the classical estimator's innovation variance is matched to the TSO burst granularity  --  neither undersized (OS-jitter dominated) nor oversized (self-queuing).
+The code has a single high-jitter branch; there is no low-jitter "larger burst" branch (the base divisor 8 is the largest divisor the code applies). An earlier revision of this document described a `div << 1` adaptation with a 32-step ceiling and a symmetric low-jitter step; the code did contain `div << 1` capped at `KCC_TSO_DIV_CEIL`, but that lowered the threshold and therefore *increased* the minimum burst, which is the opposite of the stated goal. Both the direction and the documentation have been corrected.
 
 ## Pacing Rate & Cwnd
 
@@ -2597,7 +2597,9 @@ Rate changes are applied immediately (no smoothing), matching BBR (Cardwell et a
 
 ```
 target = BDP(bw, gain, ext) // base BDP
-target = quantization_budget(target) // TSO headroom + even-round + phase-0 bonus
+target = quantization_budget(target) // TSO headroom + even-round
+if mode == PROBE_BW and cycle_idx == 0:
+    target += KCC_PROBE_CWND_BONUS // probe-up cwnd headroom only
 if min_rtt >= KCC_FAST_ONLY_THRESH_US: // >=7.5ms (BBRv3 pattern, single)
     target += ack_agg_bonus // ACK aggregation compensation (bw*100ms cap)
 
@@ -2664,7 +2666,7 @@ RTT sample (rtt_us)
        │     min_rtt_us from being lowered by window/SRTT/geodesic pull-down)
    │
    ├── Jitter EWMA: from accepted innovation magnitude
-   ├── qdelay EWMA: from (z − x_est) >> SCALE
+   ├── qdelay EWMA: from (z − min_rtt) >> SCALE
 
  └── sample_cnt++
 ```
@@ -2895,7 +2897,7 @@ The following mechanisms intentionally deviate from the linear classical estimat
 | **G1/G2 structural noise immunity** | Asymmetric directional update (G1 instant min, G2 capped 12.2%/RTT growth) instead of symmetric `R` weighting | Real RTT noise is heavy-tailed, not Gaussian; structural asymmetry provides noise immunity without a tuned gate | G1 min and G2 cap-at-observation ensure bounded innovation impact; jitter EWMA is clamped to max(min_rtt_us, KCC_RTT_SAMPLE_MAX_US), keeping all ISS inputs bounded |
 | **Directional update** (sign-gate) | Censored-data estimator; positive innovations discarded | Physical prior: T_prop never increases with congestion. Accepting T_queue as state innovation would violate the behavioral model | Geodesic G2 provides bounded upward growth (capped at observation z_k), G3 provides bounded detection delay (6 samples fast / 7 samples slow) -> bounded uncertainty |
 | **Jitter EWMA** | Replaces the classical measurement noise covariance R with an online scale estimator | R must adapt to path conditions (datacenter μs vs satellite ms); offline R tuning is impossible | Explicitly clamped to max(min_rtt_us, KCC_RTT_SAMPLE_MAX_US) ≤ 500ms; by the three-component model, this is a valid upper bound on T_noise magnitude -> ISS input boundedness satisfied |
-| **G3 dual-threshold counter** | Dual-threshold, both consecutive | x_est vs min_rtt×SCALE: fast (x_est ≥ 1.1 × mr -> confirm_cnt++, confirm_slow_cnt++), slow (x_est ≥ 1.05 × < 1.1 × mr -> confirm_cnt=0, confirm_slow_cnt++). Lock prevents min_rtt lowering while counters non-zero. No covariance state needed | Counters reach 7 (fast) or 7 (slow) -> min_rtt_us update; lock is bounded perturbation to ISS subsystem |
+| **G3 dual-threshold counter** | Dual-threshold, both consecutive, once per round | round_min vs min_rtt: fast (round_min ≥ 1.1 × mr -> confirm_cnt++, confirm_slow_cnt++), slow (x_est ≥ 1.05 × < 1.1 × mr -> confirm_cnt=0, confirm_slow_cnt++). Lock prevents min_rtt lowering while counters non-zero. No covariance state needed | Counters reach 7 (fast) or 7 (slow) -> min_rtt_us update; lock is bounded perturbation to ISS subsystem |
 
 Each of these mechanisms introduces **bounded, measurable perturbations** to the linear estimator recursion. The ISS cascade (Theorems 5–6) explicitly accommodates bounded perturbation inputs  --  the dissipation inequality ΔV ≤ −αV + γ‖w‖^2 holds with the perturbation w comprising cross-traffic, T_noise spikes, and the bounded forcing from these non-linear mechanisms.
 

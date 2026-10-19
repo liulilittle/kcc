@@ -218,10 +218,10 @@
  *       consecutive structure provides false-path-increase rate < 10^{-7}
  *       for all bounded-variance distributions.
  *     Dual-threshold structure provides noise immunity with fixed parameters
- *     (θ=1.10/1.05, N=6/7) selected via 20亿-sample simulation of the
+ *     (θ=1.10/1.05, N=6/7) selected via 2e9-sample simulation of the
  *     real-noise model (1ms baseline + queue spikes up to 20ms): 6/7 is
  *     the combination with zero mis-triggers at the 7.5ms
- *     detection-zone boundary, verified at 20亿 samples (see design doc section 4).
+ *     detection-zone boundary, verified at 2e9 samples (see design doc section 4).
  *     Geodesic-Specific Advantage: The classical version relied on a
  *     noise isolation gate with dynamic threshold
  *     max(RTT>>shift, floor, jitter*2) and variance bound
@@ -993,145 +993,103 @@
  *     To 10*:          N = ln(10)/ln(1.122) ~= 20.0 -> ~20 RTTs.
  *     To 100*:         N = ln(100)/ln(1.122) ~= 40.0 -> ~40 RTTs.
  * ---- G3: Dual-Threshold Path Detection -- Complete Theorem ----
- *   Update Rule (Path Detection):
- *     x_est >= 1.1 * min_rtt * SCALE  =>  confirm_cnt++, confirm_slow_cnt++  (G3a fast)
- *     x_est >= 1.05 * min_rtt * SCALE && x_est < 1.1 * min_rtt * SCALE =>  confirm_cnt = 0, confirm_slow_cnt++ (G3a slow)
- *     x_est <= min_rtt * SCALE        =>  confirm_cnt = confirm_slow_cnt = 0 (G3b reset)
- *     confirm_cnt >= 6                =>  min_rtt = x_est >> shift, reset    (G3c fast)
- *     confirm_slow_cnt >= 7           =>  min_rtt = x_est >> shift, reset    (G3c slow)
+ *   Update Rule (Path Detection, evaluated once per completed round):
+ *     round_min = previous completed round's minimum RTT (delayed-ACK
+ *                 samples excluded)
+ *     round_min >= 1.1 * min_rtt  =>  confirm_cnt++, confirm_slow_cnt++  (G3a fast)
+ *     round_min >= 1.05 * min_rtt =>  confirm_slow_cnt++                 (G3a slow)
+ *     round_min <= min_rtt        =>  confirm_cnt = confirm_slow_cnt = 0 (G3b reset)
+ *     confirm_cnt >= 6            =>  min_rtt = round_min, reset         (G3c fast)
+ *     confirm_slow_cnt >= 7       =>  min_rtt = round_min, reset         (G3c slow)
  *   Theorem G3 (Dual-Threshold Wald SPRT for Path Change).
- *   BOTH counters use consecutive counting (they reset on any sample below
- *   their threshold; see kcc_update_min_rtt).  This is a deliberate change
- *   from the pre-fix design where the slow counter was cumulative:
- *   20亿-sample simulation (real-noise model: 1ms baseline + queue spikes to
- *   20ms) proved cumulative counting is GUARANTEED to be breached by
- *   sustained noise (the mis-trigger source), while consecutive counting
- *   requires unbroken elevation.  The fast counter (θ = 1.1, N = 6) catches
- *   large changes (>10%); the slow counter (θ = 1.05, N = 7) catches small
- *   persistent changes (5-9%).  Counts were raised from 4/5 to 6/7 because
- *   20亿-sample simulation showed 6/7 is the combination with zero
- *   mis-triggers at the 7.5ms detection-zone boundary (re-verified at 20亿 samples: 6/7 at 7.5ms = 0 mis-triggers).
+ *   BOTH counters use consecutive counting (they reset on any round below
+ *   their threshold; see kcc_update_min_rtt).  The slow counter was
+ *   cumulative in an earlier revision; with a cumulative counter a sustained
+ *   elevation eventually crosses the threshold regardless of how noisy the
+ *   individual rounds are, so consecutive counting is used for both.
+ *   The fast counter (θ = 1.1, N = 6) catches large changes (>10%); the slow
+ *   counter (θ = 1.05, N = 7) catches small persistent changes (5-9%).
+ *   The specific counts 6/7 are a design choice (the 3-bit field caps them
+ *   at 7); they were not re-validated against the per-round sampling used
+ *   here and should be treated as tunable.
  *   The dual-threshold design ensures:
  *     - Large changes detected in ~6 RTTs (fast path)
  *     - Small changes detected in ~7 RTTs (slow path)
  *     - Zero false positives from noise at the >=7.5ms zone (sim-verified);
  *       below 5ms G3 is fully disabled; 5-7.5ms runs fast-only (see three-tier lock design)
  *   Hypothesis Test:
- *     H0: T_prop unchanged (path stable)     ->  x_est/min_rtt ~= 1.0
- *     H1: T_prop increased (path changed)    ->  x_est/min_rtt > 1.0
- *   Test statistics (dual-threshold Wald SPRT, consecutive form):
- *     Fast:  S_k = I(x_est > 1.10*min_rtt*SCALE) ∈ {0,1}, C_n = Σ S_k >= 6,
- *            with C reset to 0 on ANY sample below the fast threshold.
- *     Slow:  T_k = I(x_est > 1.05*min_rtt*SCALE) ∈ {0,1}, D_n = Σ T_k >= 7,
- *            with D reset to 0 on ANY sample below the slow threshold.
- *     Reset: x_est <= min_rtt*SCALE -> C_n <- 0, D_n <- 0 (physical floor reset).
+ *     H0: T_prop unchanged (path stable)     ->  round_min/min_rtt ~= 1.0
+ *     H1: T_prop increased (path changed)    ->  round_min/min_rtt > 1.0
+ *   Test statistics (dual-threshold SPRT, consecutive rounds):
+ *     Fast:  S_k = I(round_min > 1.10*min_rtt) in {0,1}, C_n = sum S_k >= 6,
+ *            with C reset to 0 on ANY round below the fast threshold.
+ *     Slow:  T_k = I(round_min > 1.05*min_rtt) in {0,1}, D_n = sum T_k >= 7,
+ *            with D reset to 0 on ANY round below the slow threshold.
+ *     Reset: round_min <= min_rtt -> C_n <- 0, D_n <- 0 (physical floor reset).
  *   Threshold θ = 1.1 Derivation (Simultaneous Inequalities):
  *     Noise Floor Constraint (Lower Bound):
  *       σ_noise ~= T_prop / 100.  With 3σ rule: T_prop + 3σ = 1.03*T_prop.
  *       Need γ > 1.03 to ensure noise alone (within 3σ) never triggers.
  *     Growth Detection Constraint (Upper Bound):
- *       After one G2 step: x_est = 1.122*T_prop (or capped at z_k).
- *       Need γ < 1.122 for detection in a single growth step.
- *       If γ >= 1.122, detection requires >= 2 growth steps (2 RTTs delay).
+ *       After a path increase to h*T_prop, round_min ~= h*T_prop.
+ *       Need γ < h for detection on the first affected round.
+ *       For h in (1.03, 1.122) the slow counter (γ = 1.05) is the one
+ *       that can fire; the fast counter (γ = 1.10) requires h >= 1.10.
  *     Solution space: 1.03 < γ < 1.122.
  *     Select γ = 1.10 = 11/10 (exact integer ratio):
  *       - Above noise floor by 6.8% margin.
  *       - Below growth rate by 1.8% margin.
  *       - Integer comparison: 10*x_est > 11*min_rtt*SCALE (no division).
- *   Statistical Power -- P_detect(k) for Various Path-Increase Factors:
- *     After path increase h = T_new / T_old (> 1):
- *       For h >= 1.122: z_k >= 1.122*T_old -> x_est >= 1.122*T_old > 1.1*T_old
- *         -> confirm_cnt++ on first sample -> 6 RTTs to update min_rtt.
- *       For 1.05 <= h < 1.122: z_k ~= h*T_old < 1.122*T_old -> x_est capped
- *         at z_k ~= h*T_old.  Need k steps where h*(1.122)^{k-1} > 1.1.
- *         k > log(1.1/h)/log(1.122) + 1 ~= 2 (for h = 1.05).
- *       Empirical:
- *         h=1.05:  P_detect ~= 100% after <= 10 RTTs.
- *         h=1.10:  P_detect > 97% after 6 RTTs (fast confirm count).
- *         h=1.25:  P_detect > 95% after ~6 RTTs (confirm-bound).
- *         h=2.0:   P_detect > 99% after ~6 RTTs (confirm-bound).
- * ---- G4: BDP Safety Floor -- Complete Theorem with Dual-Bounded Analysis ----
- *   BDP = C * min(x_est >> shift, min_rtt_us) / MSS                 (G4)
- *   Theorem G4 (BDP Safety Floor -- Dual-Mode with Dual-Bounded Guarantees).
- *   The BDP estimate B̂ = min(x_est >> shift, min_rtt_us) is DUAL-BOUNDED:
- *   (i) above by the all-time minimum RTT (min_rtt_us), and (ii) below
- *   by the current geodesic estimate x_est/SCALE.  The min operation in G4
- *   is not a "max of two estimates" -- it is a SAFETY FLOOR that guarantees
- *   BDP never exceeds the lesser of the two state variables.  This provides
- *   STRUCTURAL protection against BDP inflation from BOTH directions:
- *     -- Upward protection: x_est inflated by queue -> BDP = min_rtt_us
- *       (the pre-congestion floor, zero inflation).
- *     -- Downward protection: min_rtt_us stale from old larger path ->
- *       BDP = x_est (the current geodesic estimate, instant downward tracking).
- *   Formal Error Bound (Dual-Sided):
- *     For all k >= 0, the BDP estimation error ε_k = BDP_k - T_prop satisfies:
- *       ε_k <= max(0, min_rtt_k - T_prop)    (upper bound: min_rtt limits)
- *       ε_k >= -3σ                             (lower bound: noise floor)
- *     The upper bound is ZERO whenever min_rtt_k = T_prop (after G1
- *     or G1 absorption).  The lower bound is the conservative underestimation
- *     from downward noise (Lemma S1, extremal statistics of running minimum).
- *   G4 BDP = min(x_est >> shift, min_rtt_us) -- active after KCC_MIN_SAMPLES samples.
- *     Conservative -- the lesser of geodesic estimate and windowed minimum.
- *     Queue-proof by construction (G1 instant min).  Instantaneous downward tracking
- *     via G1 (x_est < min_rtt -> BDP = x_est).  After path increase:
- *     x_est > min_rtt -> BDP = min_rtt (safe, conservative) until G3 confirms.
- *     Formal guarantee: At any instant, BDP = min(x_est, min_rtt)
- *     which satisfies the joint constraints:
- *       BDP <= min_rtt     (safe: BDP never exceeds physical minimum RTT)
- *       BDP <= x_est       (responsive: tracks latest T_prop estimate)
- *       BDP > T_prop - 3σ (non-zero: won't starve the connection)
- *     These three guarantees make this the DEFAULT: it is safe
- *     (never inflates BDP from queue), responsive (tracks genuine path
- *     decreases immediately), and live (always non-zero, never deadlocks).
- *     This mode is the ENGINEERING EMBODIMENT of Axiom A4 (T_prop
- *     is the physical lower bound).  By taking min(x_est, min_rtt), the
- *     BDP output is the CONSERVATIVE signal -- if there is doubt about
- *     which is the true T_prop, choose the smaller.  This is GLOBALLY
- *     SAFE: underutilization can never cause congestion collapse.
- *   Safety Properties (Analytic):
- *     (a) x_est drifts upward (congestion) -> BDP = min_rtt_us (zero inflation).
- *         Proof: x_est grows via G2 but BDP takes min -> stuck at min_rtt.
- *         Implication: Congestion does not cause BDP inflation.
- *     (b) min_rtt_us stale (old large path) -> x_est < min_rtt -> BDP = x_est.
- *         Proof: After path decrease, G1 converges x_est to new T_prop,
- *         which is below the old min_rtt.  min() returns x_est.
- *         Implication: INSTANT path-decrease detection -- no confirmation delay.
- *     (c) Both x_est and min_rtt inflated (worst case) -> BDP bounded above
- *         by whichever is smaller.  Proof: min operation is monotonic.
- *         Implication: DUAL-REDUNDANT safety -- two independent floors
- *         protect BDP from scenarios that would defeat a single-floor design.
+ *   Detection latency (deterministic, per-round sampling):
+ *     After a step to h = T_new / T_old (> 1), every completed round has
+ *     round_min ~= h*T_old, so:
+ *       h >= 1.10: fast counter reaches 6 -> min_rtt updated after 6 rounds.
+ *       1.05 <= h < 1.10: slow counter reaches 7 -> updated after 7 rounds.
+ *       h < 1.05: below detection sensitivity; min_rtt is unchanged.
+ *     These are round counts, not ACK counts: one round contributes exactly
+ *     one sample regardless of the ACK rate.
+ * ---- G4: BDP Baseline -- Confirmed min_rtt ----
+ *   BDP = C * min_rtt_us / MSS                                       (G4)
  *
- *   Dual-Bounded Analysis: Why TWO Floors are Necessary.
- *     A single floor (e.g., only min_rtt_us) would have failure modes:
- *       -- Path decrease: old min_rtt (from large previous path) exceeds
- *         new T_prop, BDP = stale large value -> overcommitment.
- *         G1 solves this: x_est (updated instantly by G1) becomes BDP.
- *       -- Cold start: min_rtt initialized to first sample which may have
- *         queue, BDP = inflated value -> congestion spiral.
- *         G1 solves this: G1 absorbs downward innovations immediately.
- *     A single floor (e.g., only x_est) would have failure modes:
- *       -- Persistent queue: x_est tracks inflation via G2, BDP inflates.
- *         G1 solves this: min_rtt (pinned to pre-congestion floor)
- *         becomes BDP.
- *       -- G2 geometric growth on upward noise: x_est grows unboundedly
- *         (capped at z_k, but z_k includes queue).  G1 solves this:
- *         min_rtt stays low, BDP = min_rtt.
- *     The dual-floor architecture provides COMPLEMENTARY protection:
- *       x_est protects against path decreases and stale min_rtt.
- *       min_rtt protects against queue inflation and G2 drift.
- *       Neither floor alone is sufficient; together they cover all scenarios.
- *   Empirical Verification.
- *     All congestion scenarios: negligible BDP inflation:
- *       -- DC: 1400us T_prop + 400us queue -> BDP = 1400us (100% floor).
- *       -- WAN: 50000us T_prop + 5000us queue -> BDP = 50000us (100% floor).
- *       -- LH: 300000us T_prop + 20000us queue -> BDP = 300000us (100% floor).
- *     Path decrease: 100% instant G1 correction across all T_prop values.
- *     Path increase: G3-confirmed detection within
- *       6--10 RTTs, during which BDP = min_rtt (safe conservative bound).
- *     Overestimate recovery from large overestimate (e.g., 5.5× blowup after
- *     sustained queue) via G1 clean-sample mechanism: single clean sample
- *     instantly resets x_est to T_prop.
-  * ---- Fairness -- Symmetry ----
+ *   min_rtt_us is the connection's confirmed minimum RTT.  It changes only
+ *   through paths that require evidence:
+ *     - direct minimum : rtt <= min_rtt              -> min_rtt = rtt
+ *     - fast fall      : rtt < min_rtt / 4           -> min_rtt = rtt (first sample)
+ *     - sticky fall    : 0.25 <= rtt/min_rtt < 0.75  -> accepted after
+ *                        KCC_MINRTT_FAST_FALL_CNT consecutive ROUNDS
+ *                        (no pre-reduction: the baseline moves only once
+ *                        the consecutive-round threshold is reached)
+ *     - SRTT guard     : srtt/8 < 0.9 * min_rtt      -> min_rtt = srtt/8
+ *     - downward check : round minimum < 0.95 * min_rtt for
+ *                        KCC_MINRTT_FAST_FALL_CNT consecutive rounds
+ *     - G3             : round minimum >= 1.05x / 1.10x min_rtt for
+ *                        KCC_G3_SLOW_CNT / KCC_G3_FAST_CNT consecutive rounds
+ *
+ *   The geodesic estimate x_est does not enter the BDP directly.  G1 is an
+ *   instantaneous minimum, so a single low-RTT outlier would otherwise halve
+ *   the window before any confirmation had accepted it.  Downward
+ *   convergence remains fast: a sample below min_rtt/4 is applied on the
+ *   first occurrence, and the per-round downward check accepts a sustained
+ *   lower level
+ *   after five samples.
+ *
+ *   Safety properties:
+ *     (a) Queue growth does not inflate BDP.  min_rtt rises only when G3
+ *         confirms a path increase over consecutive round minima; queue
+ *         alone is rejected because the probe-up transient is confined to
+ *         one round and resets the counter.
+ *     (b) Path decrease is applied immediately for a drop below min_rtt/4,
+ *         and after confirmation for smaller drops.
+ *     (c) Path increase is applied by G3 after 6 (fast) or 7 (slow)
+ *         consecutive rounds, which bounds the underestimation window.
+ *
+ *   Residual limitation: min_rtt is a running minimum, so a queue that never
+ *   drains keeps the baseline above T_prop.  This is the scalar-observable
+ *   limitation documented in Section Proof K, not a property of this
+ *   formula.  G3 raises the baseline on genuine increases, and the
+ *   probe-up / drain cycle provides the clean samples that let it fall.
+ *
+ * ---- Fairness -- Symmetry ----
  *   For N identical flows sharing same T_prop, |BDP_i - BDP_j| <= 3σ
  *   (prob >= 0.997).  Fairness improves as O(σ/√N) via CLT.
  * ---- Fixed-Point Precision ----
@@ -1191,7 +1149,7 @@
  *   NON-INCREASING except under G3-confirmed path increases:
  *     min_rtt_{k+1} <= min_rtt_k    for all k where G3 does not fire
  *     min_rtt_{k+1} = x_est/SCALE  on G3 firing (dual-threshold SPRT)
- *   G1 converges x_est downward (min(x_est, z_k)); the geodesic takeover
+ *   G1 converges x_est downward (min(x_est, z_k)); the per-round downward
  *   mechanism translates this into min_rtt reduction via noise-gated
  *   accumulation; G2 grows x_est but never increases min_rtt directly;
  *   G3 increases min_rtt only after
@@ -1219,24 +1177,24 @@
  *   After initialization, min_rtt is updated by three mechanisms:
  *     Downward (G3 lock inactive):
  *       (a) Traditional min_rtt: rtt <= min_rtt_us -> sticky fall
- *           (75% threshold, 5-count accumulator), fast fall
+ *           (75% threshold, 5 consecutive ROUNDS), fast fall
  *           (rtt < min_rtt/4, instant), or direct accept (rtt <= min_rtt
  *           but above sticky threshold).  See kcc_update_min_rtt below.
- *       (b) Geodesic takeover: x_est < min_rtt * 0.95 (noise-gated),
- *           accumulated over KCC_MINRTT_FAST_FALL_CNT confirmations.
- *           This is the mechanism that translates G1's fast downward
- *           convergence of x_est into min_rtt reduction.
+ *       (b) Per-round downward check: round minimum < min_rtt * 0.95
+ *           for KCC_MINRTT_FAST_FALL_CNT consecutive rounds.  This
+ *           covers 5-25% decreases, which are too small for sticky
+ *           fall and too large to be accepted without confirmation.
  *       (c) SRTT guard: srtt < min_rtt * 0.9 -> override with smoothed RTT
  *           (catches ACK-aggregation-inflated direct samples).
  *     Upward: G3 dual-threshold SPRT -- fast: 6 above 1.10*, slow: 7 above
  *     1.05* -> min_rtt <- x_est/SCALE.  Traditional min_rtt and geodesic
- *     takeover updates are monotonic non-increasing; G3 updates require
+ *     downward-check updates are monotonic non-increasing; G3 updates require
  *     statistical evidence at significance α <= 10^{-8}.  Therefore:
  *     T_prop <= min_rtt_k <= min_rtt_0  (for all k where G3 does not fire)
  *     T_prop <= min_rtt_k <= z_max      (for all k, including after G3)
  *   Proof Step 3 -- BDP Composition Bound.
  *   The BDP output (G4):
- *     BDP_k = min(x_est_k >> KCC_SCALE_SHIFT, min_rtt_k)
+ *     BDP_k = C * min_rtt_k / MSS
  *   Since both arguments are bounded above:
  *     x_est_k/KCC_SCALE <= z_max (from Step 1)
  *     min_rtt_k <= max(min_rtt_0, z_max) (from Step 2)
@@ -1404,7 +1362,7 @@
  *   growth cap at z_k bounds upward drift without requiring a covariance
  *   matrix.  The geodesic achieves O(1) convergence where the classical
  *   approach requires O(log(1/ε)) steps, and the cap-at-z_k — combined with
- *   G4's BDP = min(x_est, min_rtt) — ensures the control output remains
+ *   G4's BDP = C * min_rtt / MSS — ensures the control output remains
  *   safe even if the internal estimate experiences temporary inflation.
  *   Verification.
  *   Step-change simulation: consistent detection.  Post-drain convergence
@@ -2029,7 +1987,7 @@
  * ---- CONSTANT HISTORY: KCC_G3_FAST_CNT was 4 / KCC_G3_SLOW_CNT was 5 ----
  *   (see below: the Neyman-Pearson/Wald derivation below was written for the
  *   ORIGINAL N=4/N=5 design.  CURRENT values are FAST_CNT=6, SLOW_CNT=7
- *   (both consecutive), selected by 20亿-sample simulation of the real-noise
+ *   (both consecutive), selected by 2e9-sample simulation of the real-noise
  *   model (1ms baseline + queue spikes up to 20ms) — see design doc section
  *   4. The derivation below is retained as the theoretical basis for the
  *   dual-threshold SPRT structure; its exact N values are superseded by the
@@ -2039,13 +1997,14 @@
  *   Slow path (θ=1.05): small persistent changes 5--9%.
  *   Neyman-Pearson Lemma Derivation (Neyman & Pearson 1933, Wald 1947):
  *     Hypothesis Test:
- *       H0: T_prop is unchanged (path stable, x_est/min_rtt ~= 1.0).
- *       H1: T_prop has increased (path changed, x_est/min_rtt > θ).
+ *       H0: T_prop is unchanged (path stable, round_min/min_rtt ~= 1.0).
+ *       H1: T_prop has increased (path changed, round_min/min_rtt > θ).
  *     Test Statistic:
- *       S_k = I(x_est_k > θ*min_rtt_k*SCALE) ∈ {0, 1}  where θ = 1.1.
+ *       S_k = I(round_min_k > θ*min_rtt_k) ∈ {0, 1}  where θ = 1.1.
+ *       (round_min_k is the k-th completed round's minimum RTT.)
  *       Cumulative sum: C_n = Σ_{i=1}^n S_i.
  *       Stopping rule: Stop and reject H0 when C_n >= N.
- *       Reset: C_n <- 0 when x_est < min_rtt*SCALE (physical floor crossing
+ *       Reset: C_n <- 0 when round_min < min_rtt (physical floor crossing
  *       proves H0 true -- path has NOT increased).
  *       NOTE: the current implementation counts CONSECUTIVE exceedances
  *       (counter resets on ANY sample below threshold), which is stricter
@@ -2115,7 +2074,7 @@
  *     Confirm=4 was the Wald-SPRT-optimal stopping boundary for the original
  *     design, achieving α < 10^{-8} and β ~= 0 for h >= 1.122.  The CURRENT
  *     value KCC_G3_FAST_CNT=6 is more conservative (stricter than the
- *     optimal), selected by 20亿-sample simulation because the real-noise
+ *     optimal), selected by 2e9-sample simulation because the real-noise
  *     model (queue spikes up to 20x baseline on ultra-low-RTT links) is
  *     heavier-tailed than the Pareto(α=2) bound assumed here.
  *   Alternative Approaches Analyzed:
@@ -2134,7 +2093,7 @@
  *        Consecutive: S_k = 1 AND S_{k+1} = 1 AND ... in a row.
  *          Less powerful for slow drift (5% increase over many RTTs) —
  *          intermediate downward noise resets the counter.  THIS tradeoff
- *          was accepted deliberately: 20亿-sample simulation of the
+ *          was accepted deliberately: 2e9-sample simulation of the
  *          real-noise model (1ms baseline + queue spikes up to 20ms)
  *          proved cumulative counting is GUARANTEED to be breached by
  *          sustained queue-spike noise (the mis-trigger source that
@@ -2149,7 +2108,7 @@
  *   α <= 10^{-8} under Pareto noise bound, slow N=5 (θ=1.05) achieves
  *   α ≈ 1.02×10^{-7} (Pareto) or α ~ 2×10^{-33} (Gaussian).  Current
  *   implementation uses N=6/N=7 (both consecutive), strictly stricter
- *   than these bounds; selected by 20亿-sample simulation rather than
+ *   than these bounds; selected by 2e9-sample simulation rather than
  *   derived from the Pareto bound (the real-noise model is heavier-tailed
  *   than Pareto(α=2)).
  *   Verification.
@@ -2182,7 +2141,7 @@
  *     1. Noise constraint (lower bound):
  *        3σ = 3% of T_prop -> T_prop + 3σ = 1.03*T_prop.
  *        γ must exceed 1.03 to prevent noise-driven false triggers.
- *        P(x_est > 1.03*T_prop | H0) = P(Z > 3) ~= 0.0014 (Gaussian).
+ *        P(round_min > 1.03*T_prop | H0) = P(Z > 3) ~= 0.0014 (Gaussian).
  *        After N=6 (current FAST_CNT): (0.0014)^6 ~= 7.5×10^{-18} -- safe.
  *        Conservative noise estimate (σ = 5% T_prop, maximum realistic):
  *        3σ = 0.15*T_prop -> lower bound γ > 1.15 for 3σ margin.
@@ -2190,14 +2149,15 @@
  *        providing margin for typical noise (σ=1%) while accepting
  *        slightly elevated FP risk at extreme noise levels (σ=5%).
  *     2. Growth constraint (upper bound):
- *        r = 0.122 -> after one G2 step: x_est ~= 1.122*T_prop.
- *        γ must be < 1.122 so single growth step triggers detector.
- *        If γ >= 1.122: detection delayed by >= 2 RTTs.
+ *        After a step to h*T_prop, round_min ~= h*T_prop.
+ *        γ must be < h for the first affected round to count.
+ *        γ = 1.10 detects h >= 1.10 on the fast path; 1.05 <= h < 1.10
+ *        is handled by the slow path at γ = 1.05.
  *     Solution space: γ ∈ [1.03, 1.122].
  *     Optimal selection: γ = 1.10 = 11/10.
  *       - Noise margin: (1.10 - 1.03)/1.03 ~= 6.8% above 3σ floor.
  *       - Growth margin: (1.122 - 1.10)/1.122 ~= 1.8% below G2 cap.
- *       - Integer ratio: 11/10 exact -> 10*x_est >= 11*min_rtt*SCALE
+ *       - Integer ratio: 11/10 exact -> 10*round_min >= 11*min_rtt
  *         (integer comparison, no division, no floating-point).
  *   Formal Condition for θ:
  *     θ must satisfy two simultaneous constraints:
@@ -2272,7 +2232,7 @@
  *   sample_cnt < KCC_MIN_SAMPLES (5 samples), ECN backoff and LT-BW processing bypassed to avoid reacting to
  *   unverified congestion signals or uncharacterized bandwidth estimates.
  *   Worst x_est drift: |x_est - T_prop| <= 0.78*T_prop (5 G2 steps, no cap).
- *   BDP = min(x_est, min_rtt_us) ≈ T_prop during cold start (safe).
+ *   BDP = C * min_rtt_us / MSS ≈ T_prop during cold start (safe).
  *   Expected error: ~0.33*T_prop (E[G2 steps] ≈ 2.5 with 50% downward).
  *   Classical: cold-start covariance convergence would require 10--20 samples.
  *   Geodesic: 1--5 samples.  ~5* faster initialization.
@@ -2312,13 +2272,11 @@
  * ---- B4: Path Increase (T_prop = T_old + Δ, Δ > 0) ----
  *   Scenario: BGP reroute, link failure switching to longer backup path,
  *   submarine cable cut -> traffic rerouted trans-oceanic.
- *   Guarantee: All z_k >= T_new > T_old after reroute.  G2 fires every
- *   sample.  x_est grows at 12.2%/RTT.  After x_est > 1.1*T_old -> confirm_cnt++;
- *   after x_est > 1.05*T_old -> confirm_slow_cnt++.  Fast: 6-count (consecutive) ->
- *   min_rtt <- x_est >> shift.  Slow: 7-count (consecutive) -> min_rtt <- x_est >> shift.
- *   Detection latency: L >= 6 RTTs (minimum), L = max(6, log(T_new/T_old)/log(1.122)).
- *   P_detect(h=1.05): ~=100% <=10 RTTs.  P_detect(h=1.25): >95% <=3 RTTs.
- *   P_detect(h=2.0): >99% <=2 RTTs.
+ *   Guarantee: after reroute every completed round has round_min ~= T_new.
+ *   If T_new >= 1.10*T_old the fast counter reaches 6; if 1.05 <= T_new/T_old < 1.10
+ *   the slow counter reaches 7.  Either way min_rtt <- round_min.
+ *   Detection latency is deterministic: 6 rounds (h >= 1.10) or 7 rounds
+ *   (1.05 <= h < 1.10).  It does not depend on the ACK rate or on G2 growth.
  *   Geodesic: G2 + G3 dual-threshold for detection.
  *   Geodesic: G3 dual-threshold Wald SPRT, Neyman-Pearson optimal.
  *   Proof: G3 (Wald SPRT theorem), G2 (geometric growth rate).
@@ -2330,13 +2288,14 @@
  *   established (bypassing transit AS).
  *   Guarantee: First sample on new shorter path: z_k ~= T_new < T_old ~= x_est.
  *   ν_k < 0 -> G1 fires instantly -> x_est = z_k ~= T_new in <= 1 RTT.
- *   G4: BDP = min(x_est, min_rtt).  If x_est < min_rtt (G1 converged),
- *   BDP = x_est = T_new (instant, via G1 one-step convergence; G4 takes
- *   min(x_est, min_rtt), and x_est < min_rtt after G1 fires).
- *   min_rtt itself catches up either via fast-fall (1 RTT, T_new < T_old/4)
- *   or via geodesic takeover (up to 5 RTTs, noise-gated at 95% of current
- *   min_rtt).  But BDP correctness does not wait for min_rtt — it follows
- *   x_est through G4 immediately.
+ *   G4: BDP = C * min_rtt / MSS.  min_rtt follows the decrease through
+ *   fast-fall (a sample below min_rtt/4 is applied on its first
+ *   occurrence), sticky fall (five consecutive ROUNDS below 0.75x), or the
+ *   per-round downward check (five consecutive ROUNDS below 0.95x).  BDP
+ *   therefore converges within one sample for a drop larger than 4x and
+ *   within five rounds otherwise.
+ *   It deliberately does not track x_est instantaneously: that shortcut
+ *   also let a single low outlier halve the window.
  *   Classical: would require multiple downward updates due to K = P/(P+R) < 1 smoothing.
  *   Geodesic: G1 instant (one-step convergence).  G4 decouples BDP safety from x_est tracking.
  *   Empirical: 100% detection in 1 RTT (all T_prop/decrement combinations).
@@ -2428,10 +2387,12 @@
  *   under addition.  Identifiability preserved (total Q monotonic with each Q_i).
  * ---- B21: Extreme RTT Increase (10* T_prop Change) ----
  *   Scenario: Direct path -> submarine trans-Pacific+Europe detour (10*).
- *   Guarantee: x_est grows (1.122)^N -> 10 at N ~= 20.3 RTTs.
- *   G3 detects at 1.1* at ~1 RTT (first growth step).  After 6 confirm
- *   events: min_rtt updated to 1.40*.  Continued growth -> full 10* convergence
- *   at ~21 RTTs.  Intermediate BDP: min(x_est, min_rtt), conservatively.
+ *   Guarantee: the first completed round after the change has a minimum
+ *   RTT of ~10x T_prop, which already satisfies the 1.10x fast threshold.
+ *   G3 updates min_rtt after 6 consecutive such rounds, so BDP follows
+ *   within ~6 RTTs.  The estimator x_est grows at 12.2% per round and is
+ *   not used for the decision.  Until G3 confirms, BDP stays at the old
+ *   (conservative) baseline.
  * ---- B22--B23: Bandwidth 10* Drop/Increase ----
  *   Scenario: Link capacity changes by order of magnitude (upgrade, failure).
  *   T_prop is unchanged (∂T_prop/∂C = 0, Axiom A1), so geodesic state
@@ -2493,9 +2454,10 @@
  *   unchanged.  Redirect-induced path change -> B4/B5.
  * ---- B36: Competition with BBRv1 ----
  *   Scenario: KCC and BBRv1 flows share bottleneck.  Both use BBR FSM.
- *   Guarantee: G4 BDP = min(x_est, min_rtt) <= min_rtt.  BBRv1
- *   uses 10s-window min_rtt.  KCC advantage: instantaneous downward
- *   tracking after path decrease.  Fairness: O(σ/√N) -> negligible gap.
+ *   Guarantee: G4 BDP = C * min_rtt / MSS (confirmed minimum).  BBRv1
+ *   uses a 10s-window min_rtt.  KCC difference: min_rtt is updated by the
+ *   confirmed fast-fall/sticky/downward-check/G3 paths instead of a 10s window
+ *   refresh.  Fairness: O(σ/√N) -> negligible gap.
  * ---- B37: Competition with CUBIC/Reno ----
  *   Scenario: CUBIC/Reno fill bottleneck buffers with standing queue.
  *   Guarantee: Persistent Q from CUBIC.  G2 fires every sample, x_est drifts
@@ -2713,11 +2675,12 @@
  * the FULL classical covariance matrix (P matrix, gain computation K = P/(P+R),
  * predict/update cycles for the PRIMARY estimator), all of which are eliminated.
  * The lightweight scalar p_est convergence proxy retained in ext->p_est is NOT
- * a covariance matrix -- it is a scalar counter-like confidence gauge used for
- * secondary decisions (ECN backoff gating,
- * extension).  The geodesic estimator itself (G1/G2/G3 branches) requires no
- * covariance state.  P_EST proxy dynamics: decay near min_rtt, growth above
- * fast threshold (see kcc_update, near p_est decay/growth block).
+ * a covariance matrix -- it is a scalar confidence gauge.  It is currently
+ * maintained and exported through /proc/kcc/status for diagnostics but does
+ * not drive any control decision; the ECN gate uses sample_cnt, not p_est.
+ * The geodesic estimator itself (G1/G2/G3 branches) requires no covariance
+ * state.  P_EST proxy dynamics: decay near min_rtt, growth above the fast
+ * threshold (see kcc_update, near the p_est decay/growth block).
  * The geodesic G1--G2 core within kcc_update() is approximately 5 lines of
  * executable C code (the if/else branch at G1/G2, excluding the surrounding
  * infrastructure). The complete kcc_update()
@@ -2770,7 +2733,7 @@
  *     Maintains: x_est (T_prop estimate * 1024),
  *     jitter_ewma (noise EWMA), qdelay_avg (average queue delay).
  *   kcc_get_model_rtt(k) -- BDP output (G4).
- *     BDP = min(x_est >> shift, min_rtt_us) -- geodesic bounded.
+ *     BDP = C * min_rtt_us / MSS -- confirmed minimum only.
  *     Provides instantaneous downward tracking after path decrease
  *     (G1 convergence -> x_est < min_rtt -> BDP = x_est).
  *   kcc_main() -- KCC 2.0 three-state finite state machine.
@@ -2941,11 +2904,12 @@ static inline u32 kcc_tcp_snd_cwnd(const struct tcp_sock* tp) { return READ_ONCE
 #define KCC_G3_FAST_TH_DEN 10
 #define KCC_G3_SLOW_TH_NUM 21   /* [T_prop] G3 slow threshold numerator: x_est >= mr * SCALE * NUM/DEN (21/20 = 1.05) */
 #define KCC_G3_SLOW_TH_DEN 20
-/* 5% noise gate (95/100): gates geodesic takeover when x_est is below 95% of min_rtt.
+/* 5% noise gate (95/100): gates the per-round downward check, which accepts a
+ * lower baseline only when a completed round's minimum is below 95% of min_rtt.
  * Sub-RTT-scale noise (kernel jitter, NIC coalescing) is empirically <= 5% of T_prop on
- * modern OS + networks, so 95% threshold prevents false G1 takeover without suppressing
+ * modern OS + networks, so the 95% threshold prevents a false downward update without
  * genuine convergence. Derivation: worst-case empirical jitter/T_prop ratio ~3%; 5% provides
- * 1.67x safety margin while preserving takeover responsiveness (<1% overshoot prevented).
+ * 1.67x safety margin while preserving responsiveness (<1% overshoot prevented).
  */
 #define KCC_PD_NOISE_GATE_NUM 95
 #define KCC_PD_NOISE_GATE_DEN 100
@@ -2956,7 +2920,7 @@ static inline u32 kcc_tcp_snd_cwnd(const struct tcp_sock* tp) { return READ_ONCE
 #define KCC_EWMA_NEW_WEIGHT       1   /* [T_noise] implicit EWMA new-sample weight; follows kernel BBR convention */
 #define KCC_BITFIELD_3BIT_MAX      ((1 << 3) - 1)
 #define KCC_GAIN_MAX              ((1 << 10) - 1)
-#define KCC_LT_RTT_CNT_MAX        ((1 << 12) - 1)
+#define KCC_LT_RTT_CNT_MAX        ((1 << 8) - 1)   /* [T_noise] matches the 8-bit lt_rtt_cnt bitfield */
  /* p_est >= KCC_P_EST_FLOOR (10): any converged check against lower values is unreachable */
 #define KCC_KF_CWND_SEGS_MAX       20000
 #define KCC_KF_OVERFLOW_GUARD   (1ULL << 31)
@@ -2964,19 +2928,18 @@ static inline u32 kcc_tcp_snd_cwnd(const struct tcp_sock* tp) { return READ_ONCE
 #define KCC_KF_VAR_SHIFT        (2 * KCC_KF_INNOV_SHIFT)
 #define KCC_SRTT_SHIFT              3
 #define KCC_RTT_MIN_FLOOR_US        1
-#define KCC_GAIN_FLOOR              1
-#define KCC_TSO_DIV_CEIL             (1 << 5)
-#define KCC_TSO_DIV_DOUBLE_SHIFT    1
+#define KCC_GAIN_FLOOR              1                   /* [T_queue] minimum cwnd_gain (1/256); reached only by extreme backoff configs */
+#define KCC_TSO_DIV_HALVE_SHIFT      1           /* [T_noise] high-jitter: halve divisor => double threshold => shorter bursts */
 #define KCC_STATUS_BW_DISPLAY_SHIFT  12     /* [K] shift for seg/s display; prevents u64 overflow */
 #define KCC_CWND_ABSOLUTE_MIN        1
-#define KCC_G3_FAST_CNT             6       /* [T_prop] G3 fast consecutive count (was 4; 20亿-sim: fast=6 + slow=7 safe at 7.5ms+, fast-only(6) safe at 5ms+) */
+#define KCC_G3_FAST_CNT             6       /* [T_prop] G3 fast consecutive count (was 4; 2e9-sim: fast=6 + slow=7 safe at 7.5ms+, fast-only(6) safe at 5ms+) */
 #define KCC_G3_SLOW_CNT             7       /* [T_prop] G3 slow CONSECUTIVE count (was 5 cumulative; 3-bit max 7) */
 /* [T_prop] Three-tier min_rtt design (see docs/superpowers/specs/2026-08-01-kcc-minrtt-lock-design.md).
  * Physical: TCP path unique + <5ms is fiber (no step possible) + queue only raises RTT.
- * Sim: real-noise model (1ms base + queue spikes to 20ms), 20亿 samples/tier:
+ * Sim: real-noise model (1ms base + queue spikes to 20ms), 2e9 samples/tier:
  *   <5ms: no detection can be safe (4ms fast-only still 2 mis-triggers)
  *   5-7.5ms: fast-only(6) safe (0 mis-triggers), slow is the mis-trigger source
- *   >=7.5ms: fast(6)+slow(7) both safe (7.5ms: 0 mis-triggers at 20亿) */
+ *   >=7.5ms: fast(6)+slow(7) both safe (7.5ms: 0 mis-triggers at 2e9) */
 #define KCC_LOCK_THRESH_US          5000    /* [T_prop] <5ms: lock min_rtt extreme, G3 fully disabled */
 #define KCC_FAST_ONLY_THRESH_US     7500    /* [T_prop] <7.5ms: fast-only; >=7.5ms: fast+slow */
 /*
@@ -3033,10 +2996,9 @@ static const u32 kcc_pacing_gain[] = {
 #define KCC_EWMA_JITTER_DEN         8
 #define KCC_EWMA_QDELAY_NUM         7
 #define KCC_EWMA_QDELAY_DEN         8
-#define KCC_MIN_SAMPLES             5       /* [K] minimum estimator samples before takeover */
+#define KCC_MIN_SAMPLES             5       /* [K] minimum estimator samples before the estimator is trusted */
 #define KCC_ACK_EPOCH_MAX              0x100000
 #define KCC_AGG_WINDOW_ROTATION_RTTS   5
-#define KCC_BDP_MIN_RTT_US             1
 #define KCC_BW_RT_CYCLE_LEN            10
 #define KCC_ECN_EWMA_FLOOR             4
 #define KCC_ECN_EWMA_RETAINED          3
@@ -3074,13 +3036,20 @@ static const u32 kcc_pacing_gain[] = {
 #define KCC_MIN_TSO_RATE_DIV           8
 #define KCC_MINRTT_FAST_FALL_CNT       5
 #define KCC_MINRTT_FAST_FALL_DIV       4
+#define KCC_MINRTT_FAST_FALL_FAST_CNT  2   /* [T_prop] consecutive rounds for a >4x drop */
 #define KCC_MINRTT_SRTT_GUARD_DEN      100 /* [T_prop] SRTT guard ratio denominator */
 #define KCC_MINRTT_SRTT_GUARD_NUM      90
-/* Sticky threshold 75/100 = 75%: KCC_MINRTT_FAST_FALL_CNT (5) consecutive samples
- * below 75% of current min_rtt required before accepting new minimum. Derivation: ACK
- * compression and kernel scheduler jitter produce transient dips ≤20% below true T_prop;
- * 75% threshold blocks these while allowing genuine T_prop decreases to be confirmed
- * statistically (5-sample Neyman-Pearson fixed-count test, α ≤ 10⁻⁸ per Section 3).
+/* srtt is a 1/8 EWMA: after a genuine path increase its error decays as
+ * (7/8)^N, so it needs ~17 rounds to come within 10% of the new baseline.
+ * 24 rounds leaves a 4% margin and prevents the guard from undoing a
+ * G3-confirmed increase. */
+#define KCC_SRTT_SUPPRESS_RNDS         24
+/* Sticky threshold 75/100 = 75%: KCC_MINRTT_FAST_FALL_CNT (5) consecutive ROUNDS
+ * with a minimum below 75% of current min_rtt are required before accepting a new
+ * baseline.  ACK compression and scheduler jitter produce transient dips of roughly
+ * 20% below the true T_prop; the 75% threshold rejects those while still accepting a
+ * genuine decrease after a fixed-count confirmation.  Counting per round (not per
+ * ACK) makes the confirmation independent of the ACK rate.
  */
 #define KCC_MINRTT_STICKY_DEN          100 /* [T_prop] sticky ratio denominator */
 #define KCC_MINRTT_STICKY_NUM          75
@@ -3115,12 +3084,13 @@ static int kcc_ecn_backoff_den = 100;
 struct kcc_ext {
     /*
      * Geodesic T_prop estimate (us * scale).
-     * Updated by the geodesic estimator: downward min(x_est,z),
-     * upward +12.2% geometric growth capped at z.
-     * BDP = min(x_est, min_rtt_us). Guarantee holds by construction:
-     * BDP <= C*min_rtt_us/MSS always. In single-flow, min_rtt_us->T_prop
-     * so BDP<=true physical BDP. Multi-flow may see min_rtt_us > T_prop
-     * due to cross-traffic queuing; this is a min_rtt estimation issue.
+     * Updated by the geodesic estimator: downward min(x_est, z) on every
+     * sample; upward +12.2% once per round, capped at z.
+     * BDP = C * min_rtt_us / MSS.  x_est reaches min_rtt_us only through
+     * the confirmed downward check / fast-fall paths, so BDP <= C*min_rtt_us/MSS
+     * always holds. In single flow min_rtt_us -> T_prop, so BDP <= true
+     * physical BDP. Multi-flow may see min_rtt_us > T_prop due to
+     * cross-traffic queuing; that is a min_rtt estimation issue.
     */
     /* [T_prop] geodesic T_prop estimate (us * KCC_SCALE); u64 prevents G3 threshold overflow when min_rtt*KCC_SCALE*1.1 > U32_MAX */
     u64 x_est;
@@ -3147,7 +3117,7 @@ struct kcc_ext {
     /*
      * Number of accepted estimator updates. Used for:
      * - Cold-start correction (sample_cnt == 1)
-     * - Estimator takeover hysteresis
+     * - Downward path-change hysteresis
      * - Convergence gating
     */
     u32 sample_cnt;         /* accepted estimator updates */
@@ -3167,13 +3137,14 @@ struct kcc_ext {
      * ECN (Explicit Congestion Notification) state.
      * When enabled (kcc_ecn_enable != 0), CE-marked segments are tracked
      * via an EWMA of the ECN-mark ratio. If ecn_ewma > 0 and
-     * qdelay_avg exceeds the congestion threshold, cwnd_gain and
-     * pacing_gain are reduced proportionally by kcc_ecn_backoff.
+     * qdelay_avg exceeds the congestion threshold, cwnd_gain is reduced
+     * by the fixed fraction kcc_ecn_backoff_num/den (default 20%),
+     * scaled down by 1.0/pacing_gain during probe phases.
      * Scaled to BBR_UNIT (256 = 100%).
      * Kernel BBR: ECN handling is limited to reducing cwnd on each
-     * CE-marked ACK (like a loss). KCC's approach is proactive:
-     * it backs off proportionally to the ECN mark ratio, enabling
-     * smoother rate reduction before loss occurs.
+     * CE-marked ACK (like a loss). KCC's approach is proactive: it applies
+     * a bounded cwnd_gain reduction when CE marks coincide with a queue,
+     * reacting before loss occurs.
     */
     /* [T_queue] EWMA of ECN-CE mark ratio (0..256 BBR_UNIT); drives proactive gain backoff */
     u32 ecn_ewma;
@@ -3182,14 +3153,26 @@ struct kcc_ext {
 
     /* [T_noise] tcp_mstamp at epoch start; epoch >~5 RTTs triggers window switch */
     u64 ack_epoch_mstamp;
-    /* [T_noise] dual-window sliding max (seg/ACK); max of both windows = effective */
-    u32 extra_acked[2];
+     /* [T_noise] dual-window sliding max (seg/ACK); max of both windows = effective */
+     u32 extra_acked[2];
     /* [T_noise] bytes ACKed in current epoch; used for extra_acked = max_acked - delivered */
     u32 ack_epoch_acked;
     /* [T_noise] RTTs elapsed in current window (0..31); switches at ~5 RTTs */
     u32 extra_acked_win_rtts;
     /* [T_noise] active window index (0 or 1); toggles on window switch */
     u32 extra_acked_win_idx;
+
+    /* [T_prop] independent consecutive-ROUND counter for the downward check.
+     * It must NOT share min_rtt_fast_fall_cnt with the traditional
+     * sticky/fast-fall path: that path resets the shared counter on every
+     * ACK, so this branch could never reach its threshold. */
+    u8 x_est_fall_cnt;
+
+    /* [T_prop] rounds during which the SRTT guard is suppressed after G3
+     * raised min_rtt.  srtt is a 1/8 EWMA, so after a genuine path increase
+     * it stays below the new baseline for ~17 rounds; without suppression
+     * the guard would immediately undo the confirmed increase. */
+    u8 srtt_suppress_cnt;
 
      /* [K] list node in module-global kcc_conn_list for /proc/kcc/status */
      struct list_head kcc_node;
@@ -3238,13 +3221,14 @@ struct kcc {
         u32 idle_restart : 1;                     /* [T_queue] 1=flow was app-limited; restart logic */
         u32 packet_conservation : 1;              /* [K] 1=in recovery; cwnd=flightsize */
         u32 lt_is_sampling : 1;                   /* [T_noise] 1=collecting LT BW samples; policer-detection mode */
-        u32 lt_rtt_cnt : 12;                      /* [T_noise] RTT counter for LT-BW sampling (0..4095) */
+        u32 lt_rtt_cnt : 8;                       /* [T_noise] RTT counter for LT-BW sampling (0..255; KCC_LT_BW_MAX_RTTS=48) */
         u32 min_rtt_fast_fall_cnt : 3;            /* [T_prop] 3-bit counter for fast min_rtt drops (sticky); max 7 */
         u32 cycle_idx : 3;                        /* [T_queue] current index in pacing_gain cycle (0..7) */
         u32 full_bw_reached : 1;                  /* [T_prop] reached full BW in STARTUP? */
         u32 full_bw_cnt : 2;                      /* [T_prop] rounds without large BW gains (0..3) */
-        u32 locked : 1;                           /* [T_prop] 1=min_rtt locked at extreme (<5ms observed): G3 step detection disabled forever (physical: no step possible, queue spikes only raise RTT) */
-        u32 __pad : 1;                            /* spare */
+        u32 locked : 1;                           /* [T_prop] 1=min_rtt locked at extreme (<5ms observed): G3 step detection disabled until sustained >=7.5ms evidence */
+        u32 locked_high_cnt : 3;                  /* [T_prop] consecutive rounds >=7.5ms while locked; releases the lock at 7 */
+        u32 __pad : 2;                            /* spare */
     };
 
     struct {
@@ -3255,6 +3239,7 @@ struct kcc {
         u32 initialized : 1;                      /* connection init guard */
         u32 confirm_cnt : 3;                      /* [T_prop] G3 fast confirm counter (max 7, threshold 6) */
         u32 confirm_slow_cnt : 3;                 /* [T_prop] G3 slow confirm counter (max 7, threshold 7) */
+        u32 srtt_guard_cnt : 3;                   /* [T_prop] consecutive rounds the SRTT guard has been eligible */
     };
 
     /* standalone u32 fields */
@@ -3357,7 +3342,7 @@ module_param_cb(kcc_ecn_backoff_num, &kcc_param_ops, &kcc_ecn_backoff_num, 0644)
 module_param_cb(kcc_ecn_backoff_den, &kcc_param_ops, &kcc_ecn_backoff_den, 0644);
 
 MODULE_PARM_DESC(kcc_kf_enable, "Global KCC Forwarding (KF) master switch (0=disabled, 1=enabled)");
-MODULE_PARM_DESC(kcc_kf_mode, "KCC Forwarding (KF) mode: 0=peak-tracking, 1=instant");
+MODULE_PARM_DESC(kcc_kf_mode, "KCC Forwarding (KF) mode: 0=instant (default), 1=peak-tracking");
 MODULE_PARM_DESC(kcc_kf_discount_num, "KCC Forwarding (KF) discount numerator (50=50% fair-share)");
 MODULE_PARM_DESC(kcc_kf_discount_den, "KCC Forwarding (KF) discount denominator (100)");
 MODULE_PARM_DESC(kcc_probe_bw_up_limit, "Probe-up exit gated by app send state (0=off, 1=on)");
@@ -3448,7 +3433,9 @@ static inline struct kcc_ext* kcc_ext_get(const struct sock* sk)
     return ((struct kcc*)inet_csk_ca(sk))->ext;
 }
 
-/* [T_prop] min queue-detect level (propagation-based floor) */
+/* [T_prop] min queue-detect level (propagation-based floor).
+ * Diagnostic/reference threshold: the queue-pressure gates in this build
+ * use kcc_cong_thresh() below, so this helper has no control-path caller. */
 static inline u32 kcc_clean_thresh(const struct sock* sk)
 {
     const struct kcc* kcc = (const struct kcc*)inet_csk_ca(sk);
@@ -3561,8 +3548,15 @@ static u64 kcc_rate_bytes_per_sec(struct sock* sk, u64 rate, int gain)
     unsigned int mss = tcp_sk(sk)->mss_cache;
     rate *= mss;
     rate = mul_u64_u32_shr(rate, gain, BBR_SCALE);
-    rate *= USEC_PER_SEC * 99 / 100; /* 1% conservative haircut: prevents over-pacing from floating inaccuracy */
-    return rate >> BW_SCALE;
+    /* 1% conservative haircut, applied as a subtraction.  The equivalent
+     * multiplication by 990000 overflows u64 once rate exceeds
+     * U64_MAX/990000 ~= 1.86e13 (reachable with jumbo MSS at multi-terabit
+     * pacing rates); subtracting rate/100 cannot overflow. */
+    rate -= div_u64(rate, 100);
+    /* rate is still scaled by BW_UNIT per microsecond; convert to
+     * bytes per second.  mul_u64_u32_shr keeps the product exact in
+     * 128 bits, so the conversion cannot overflow. */
+    return mul_u64_u32_shr(rate, USEC_PER_SEC, BW_SCALE);
 }
 
 /* Convert a KCC bw and gain factor to a pacing rate in bytes per second. */
@@ -3609,12 +3603,22 @@ static void kcc_set_pacing_rate(struct sock* sk, u32 bw, int gain)
 
     u64 rate = kcc_bw_to_pacing_rate(sk, bw, gain);
     if (kcc_kf_enable && kcc->mode == KCC_MODE_STARTUP && smp_load_acquire(&kcc_kf_active.counter)) {
-        u64 kf_bw = (u64)smp_load_acquire(&kcc_kf_x.counter);
+        /* Clamp to u32 before the discount multiply: the global
+         * estimate is in BW_UNIT and the discount ratio can be up to
+         * 10000/1, so an unclamped product could overflow u64 for
+         * values the pacing-rate path cannot represent anyway.
+         */
+        u64 kf_bw = min_t(u64, (u64)smp_load_acquire(&kcc_kf_x.counter),
+            U32_MAX);
         if (kf_bw > 0) {
             u64 init_bw;
             u64 kf_rate;
             init_bw = kf_bw * max_t(u32, kcc_kf_discount_num, 0) /
                 max_t(u32, kcc_kf_discount_den, 1);
+            /* Gain-compensated, as in the original implementation: the
+             * effective floor is the discounted fair share divided by
+             * KCC_HIGH_GAIN (0.5 / 2.887 ~= 17.3%).  The arithmetic below is
+             * the authoritative behaviour; it must not follow comment text. */
             init_bw = (init_bw << BBR_SCALE) / KCC_HIGH_GAIN;
             kf_rate = kcc_bw_to_pacing_rate(sk, (u32)init_bw, BBR_UNIT);
             if (rate < kf_rate) {
@@ -3635,16 +3639,13 @@ static void kcc_set_pacing_rate(struct sock* sk, u32 bw, int gain)
 /*
  * kcc_min_tso_segs - Minimum TSO segments for the current pacing rate.
  * @sk: TCP socket.
- * Returns 1 for low pacing rates (< KCC_MIN_TSO_RATE / divisor), 2 otherwise.
- * The divisor is adaptive: doubled (16) when jitter is high (smaller bursts
- * for jittery paths).  Default base divisor is 8.
+ * Returns 1 when pacing_rate < KCC_MIN_TSO_RATE / divisor, else 2.
+ * The divisor adapts downward (8 -> 4) when jitter_ewma exceeds
+ * KCC_TSO_HIGH_JITTER_THRESH_US.  Halving the divisor doubles the rate
+ * threshold, so the "1 segment" branch covers more pacing rates and the
+ * minimum burst gets shorter.  Default base divisor is 8.
  * Kernel BBR compares pacing_rate directly to a fixed rate threshold (no
  * divisor: TSO=1 below ~1.2 MB/s, else 2), with no path awareness.
- * KCC scales the threshold via an adaptive divisor (8 or 16 based on
- * jitter): higher jitter halves the threshold for shorter bursts,
- * trading throughput for RTT stability.
- * On jittery paths, doubling the divisor forces smaller bursts, preventing
- * micro-bursts from amplifying RTT variance.
  * Marked KCC_KFUNC for BPF struct_ops attachment.
  */
 KCC_KFUNC u32 kcc_min_tso_segs(struct sock* sk)
@@ -3655,7 +3656,12 @@ KCC_KFUNC u32 kcc_min_tso_segs(struct sock* sk)
     struct kcc_ext* ext = kcc_ext_get(sk);
     if (ext) {
         if (ext->jitter_ewma > KCC_TSO_HIGH_JITTER_THRESH_US) {
-            div = min_t(u32, KCC_TSO_DIV_CEIL, div << KCC_TSO_DIV_DOUBLE_SHIFT);
+            /* High jitter must produce SHORTER bursts.  Raising the divisor
+             * lowers tso_rate_thresh, which makes the ">= threshold -> 2
+             * segments" branch fire MORE often -- i.e. larger minimum
+             * bursts, the opposite of the intent.  Halve the divisor
+             * instead (doubling the threshold). */
+            div = max_t(u32, 1, div >> KCC_TSO_DIV_HALVE_SHIFT);
         }
     }
 
@@ -3739,31 +3745,52 @@ KCC_KFUNC void kcc_cwnd_event(struct sock* sk, enum tcp_ca_event event)
         }
 
         if (kcc->mode == KCC_MODE_PROBE_BW) {
+            /* cycle_mstamp is a delivery timestamp.  After an idle period
+             * it is far in the past, so the first ACK would satisfy
+             * is_full_length immediately and end the phase early.  Restart
+             * the phase clock from the current delivery timestamp.
+             */
+            kcc->cycle_mstamp = tp->delivered_mstamp;
             kcc_set_pacing_rate(sk, kcc_bw(sk), BBR_UNIT);
         }
     }
 }
 
 /*
- * [G4] kcc_get_model_rtt -- BDP safety floor:  min(x_est >> KCC_SCALE_SHIFT, min_rtt)
- * The model RTT used for BDP calculation is the minimum of two estimates:
- *   x_est    : geodesic tracking (fast, reactive, may drift under queue)
- *   min_rtt  : all-time windowed minimum (slow, conservative, never inflates)
- * This guarantees BDP <= C*T_prop/MSS at all times, preventing the loss
- * cascades caused by queue-inflated RTT estimates.
- * Returns min(x_est >> KCC_SCALE_SHIFT, min_rtt) -- geodesic bounded.
- * Cold-start guard:  returns min_rtt when x_est is not yet converged
- * (sample_cnt < KCC_MIN_SAMPLES).
+ * [G4] kcc_get_model_rtt -- BDP RTT baseline.
+ * The model RTT used for BDP is the confirmed min_rtt_us.
+ *   min_rtt_us : windowed minimum, updated only through confirmed paths
+ *                (fast-fall, sticky fall, SRTT guard, G3, downward check)
+ * This keeps BDP <= C*min_rtt_us/MSS, preventing queue-inflated RTT
+ * estimates from inflating the window.  The estimator does not enter this
+ * value directly; it can only lower min_rtt_us after confirmation.
  */
 static u32 kcc_get_model_rtt(const struct sock* sk,
     const struct kcc_ext* ext)
 {
     const struct kcc* kcc = (const struct kcc*)inet_csk_ca(sk);
-    if (unlikely(!ext || !ext->x_est || ext->sample_cnt < KCC_MIN_SAMPLES)) {
-        return kcc->min_rtt_us;
-    }
+    (void)ext;
 
-    return min_t(u32, (u32)(ext->x_est >> KCC_SCALE_SHIFT), kcc->min_rtt_us);
+    /* BDP uses the CONFIRMED min_rtt only.
+     *
+     * The previous min(x_est >> shift, min_rtt_us) took the minimum with
+     * an unconfirmed quantity: G1 sets x_est = min(x_est, z) instantly,
+     * while min_rtt_us requires confirmation before moving (fast-fall below
+     * min_rtt/4 is immediate; smaller drops need five consecutive samples
+     * or the sticky reduction).  A single low-RTT outlier therefore cut the
+     * cwnd target before min_rtt had accepted it.  min_rtt already tracks
+     * genuine decreases, so the x_est shortcut added outlier exposure
+     * without adding convergence speed.
+     *
+     * The drain phase is what lets min_rtt fall again after a transient
+     * queue, so the drain target must never be derived from a baseline that
+     * a transient queue could have raised.  That is why the probe-up phase
+     * has a bounded timeout (see kcc_is_next_cycle_phase): without it a
+     * probe-up whose inflight target is unreachable would keep the queue
+     * high indefinitely, G3 would read it as a path increase, and the raised
+     * baseline would in turn raise the target that caused the elevation.
+     */
+    return max_t(u32, kcc->min_rtt_us, KCC_RTT_MIN_FLOOR_US);
 }
 
 /* Calculate bdp based on model RTT and bandwidth, with geodesic guard.
@@ -3774,8 +3801,10 @@ static u32 kcc_get_model_rtt(const struct sock* sk,
  * builds a smaller queue, it becomes more vulnerable to noise in RTT
  * measurements (e.g., delayed ACKs or other ACK compression effects).
  *
- * model_rtt = min(x_est >> shift, min_rtt_us) prevents queue-inflated
- * RTT from inflating BDP (the G4 geodesic safety floor).
+ * model_rtt = min_rtt_us (the confirmed minimum).  Unconfirmed estimator
+ * samples are excluded: G1 is an instantaneous minimum, so allowing x_est
+ * into the BDP would let a single low outlier halve the cwnd target before
+ * min_rtt_us had accepted it.
  */
 static u32 kcc_bdp(struct sock* sk, u32 bw, int gain,
     struct kcc_ext* ext)
@@ -3783,24 +3812,11 @@ static u32 kcc_bdp(struct sock* sk, u32 bw, int gain,
     u32 model_rtt;
     u64 w;
     u64 bdp64;
-    model_rtt = kcc_get_model_rtt(sk, ext);
-
-    /* If we've never had a valid RTT sample, cap cwnd at the initial
-     * default. This should only happen when the connection is not using TCP
-     * timestamps and has retransmitted all of the SYN/SYNACK/data packets
-     * ACKed so far.
+    /* kcc_get_model_rtt() already floors at KCC_RTT_MIN_FLOOR_US, so the
+     * former "== ~0U" and "< KCC_BDP_MIN_RTT_US" fallbacks were unreachable
+     * and have been removed.
      */
-    if (unlikely(model_rtt == ~0U))
-        return TCP_INIT_CWND;  /* be safe: cap at default initial cwnd */
-
-    /* Guard against zero model_rtt before geodesic convergence. */
-    {
-        u32 bdp_floor = KCC_BDP_MIN_RTT_US;
-        if (unlikely(!(ext && ext->x_est &&
-            ext->sample_cnt >= KCC_MIN_SAMPLES) &&
-            model_rtt < bdp_floor))
-            model_rtt = bdp_floor;
-    }
+    model_rtt = kcc_get_model_rtt(sk, ext);
 
     w = (u64)bw * model_rtt;
 
@@ -3824,24 +3840,22 @@ static u32 kcc_inflight(struct sock* sk, u32 bw, int gain,
 /* To achieve full performance in high-speed paths, we budget enough cwnd to
  * fit full-sized skbs in-flight on both end hosts to fully utilize the path:
  *   - one skb in sending host Qdisc,
- *   - one skb in sending host TSO/GSO engine
+ *   - one skb in sending host TSO/GSO engine,
  *   - one skb being received by receiver host LRO/GRO/delayed-ACK engine
  * Don't worry, at low rates (KCC_MIN_TSO_RATE) this won't bloat cwnd because
  * in such cases tso_segs_goal is 1. The minimum cwnd is 4 packets,
  * which allows 2 outstanding 2-packet sequences, to try to keep pipe
  * full even with ACK-every-other-packet delayed ACKs.
- * The probe_cwnd_bonus (+2 during cycle_idx == 0, probe-up phase) ensures
- * gain cycling gets inflight above BDP even for small BDPs.
+ *
+ * This function deliberately contains only the TSO headroom.  The probe-up
+ * cwnd bonus is added in kcc_set_cwnd(): this helper also produces the
+ * inflight target that kcc_is_next_cycle_phase() tests for probe-up exit,
+ * and adding the bonus there raised the bar the phase had to clear.
  */
 static u32 kcc_quantization_budget(struct sock* sk, u32 cwnd)
 {
-    struct kcc* kcc = (struct kcc*)inet_csk_ca(sk);
     cwnd += KCC_TSO_HEADROOM_MULT * kcc_tso_segs_goal(sk);
     cwnd = (cwnd + 1) & ~1U;
-
-    if (kcc->mode == KCC_MODE_PROBE_BW && kcc->cycle_idx == 0) {
-        cwnd += KCC_PROBE_CWND_BONUS;
-    }
 
     return cwnd;
 }
@@ -3937,6 +3951,11 @@ static void kcc_ecn_backoff(struct sock* sk, struct kcc_ext* ext)
         return;
     }
 
+    /* Fixed backoff fraction, matching the stability analysis (README
+     * Lemma N.6): at most 20% by default.  During probe phases
+     * (pacing_gain > 1.0) the reduction is scaled down by 1.0/pacing_gain
+     * so that probing is not over-penalised.
+     */
     if (kcc->pacing_gain > BBR_UNIT) {
         u32 ecn_scale = (1U << (BBR_SCALE + BBR_SCALE)) / kcc->pacing_gain;
         ecn_backoff = (u32)((u64)ecn_backoff * ecn_scale >> BBR_SCALE);
@@ -4038,12 +4057,33 @@ static void kcc_set_cwnd(struct sock* sk, const struct rate_sample* rs, u32 acke
          * structural error (double compensation -> cwnd inflated to
          * bw*100ms cap = 100x BDP on 1ms links) and has been removed.
          */
-        if (kcc->min_rtt_us >= KCC_FAST_ONLY_THRESH_US) {
-            target += kcc_ack_aggregation_cwnd(sk, ext, bw);
+        /* Gate on the LOWER of min_rtt and the estimator.  min_rtt can be
+         * raised by G3 or by delayed-ACK samples, which would wrongly
+         * enable aggregation on a sub-7.5ms path -- the very case this
+         * gate exists to protect.
+         */
+        {
+            u32 path_rtt = kcc->min_rtt_us;
+            if (ext && ext->x_est) {
+                path_rtt = min_t(u32, path_rtt,
+                    (u32)(ext->x_est >> KCC_SCALE_SHIFT));
+            }
+            if (path_rtt >= KCC_FAST_ONLY_THRESH_US) {
+                target += kcc_ack_aggregation_cwnd(sk, ext, bw);
+            }
         }
     }
 
     target = kcc_quantization_budget(sk, target);
+
+    /* Probe-up gets a small cwnd bonus so that gain cycling can push
+     * inflight above BDP even at a small BDP.  This is cwnd headroom only:
+     * the probe-up exit target (kcc_inflight) does not include it.
+     */
+    if (kcc->mode == KCC_MODE_PROBE_BW && kcc->cycle_idx == 0) {
+        target += KCC_PROBE_CWND_BONUS;
+    }
+
     if (kcc->full_bw_reached) {
         cwnd = min(cwnd + acked, target);
     }
@@ -4103,12 +4143,13 @@ static void kcc_reset_lt_bw_sampling(struct sock* sk)
 
 /* Token-bucket traffic policers are common (see "An Internet-Wide Analysis of
  * Traffic Policing", SIGCOMM 2016). KCC detects token-bucket policers and
- * explicitly models their policed rate, to reduce unnecessary losses. We
- * estimate that we're policed if we see 2 consecutive sampling intervals with
- * consistent throughput and high packet loss. If we think we're being policed,
- * set lt_bw to the "long-term" average delivery rate from those 2 intervals.
- * KCC adds extra safety resets: abort LT if qdelay_avg exceeds congestion
- * threshold or SRTT exceeds min_rtt + 5ms (suggests standing queue).
+ * explicitly models their policed rate, to reduce unnecessary losses.  A
+ * policer is inferred when consecutive sampling intervals show a consistent
+ * delivery rate together with a high loss ratio; the estimate is smoothed by
+ * an EMA and, once two intervals agree, lt_bw becomes the pacing ceiling.
+ * KCC adds extra safety resets: abort LT sampling if qdelay_avg exceeds the
+ * congestion threshold or SRTT exceeds min_rtt + 5ms, since both indicate a
+ * standing queue rather than a policer.
  */
 static void kcc_lt_bw_interval_done(struct sock* sk, u64 bw)
 {
@@ -4119,36 +4160,32 @@ static void kcc_lt_bw_interval_done(struct sock* sk, u64 bw)
         diff = (bw > kcc->lt_bw) ? bw - kcc->lt_bw : kcc->lt_bw - bw;
         if ((diff * BBR_UNIT <= KCC_LT_BW_RATIO * kcc->lt_bw) ||
             kcc_rate_bytes_per_sec(sk, diff, BBR_UNIT) <= KCC_LT_BW_DIFF) {
-                {
-                    u32 en = KCC_LT_BW_EMA_NUM;
-                    u32 ed = KCC_LT_BW_EMA_DEN;
-                    kcc->lt_bw = (u32)min_t(u64,
-                        (bw * en + (u64)kcc->lt_bw * (ed - en)) / ed, U32_MAX);
-                }
+            struct kcc_ext* ext = kcc_ext_get(sk);
+            struct tcp_sock* tp = tcp_sk(sk);
+            u32 en = KCC_LT_BW_EMA_NUM;
+            u32 ed = KCC_LT_BW_EMA_DEN;
 
-                {
-                    struct kcc_ext* ext = kcc_ext_get(sk);
-                    u32 qthresh = kcc_cong_thresh(sk);
-                    u32 ithresh = KCC_LT_BW_ITHRESH;
-
-                    struct tcp_sock* tp = tcp_sk(sk);
-                    u32 srtt_us = tp->srtt_us >> KCC_SRTT_SHIFT;
-                    if (ext && ext->qdelay_avg > qthresh) {
-                        kcc_reset_lt_bw_sampling(sk);
-                        return;
-                    }
-
-                    if (srtt_us > kcc->min_rtt_us + ithresh) {
-                        kcc_reset_lt_bw_sampling(sk);
-                        return;
-                    }
-                }
-
-                kcc->lt_bw = max_t(u32, kcc->lt_bw, 1U);
-                kcc->lt_use_bw = 1;
-                kcc->pacing_gain = BBR_UNIT;
-                kcc->lt_rtt_cnt = 0;
+            /* Reject the estimate if the path shows a standing queue: a
+             * policed rate is a rate limit, not congestion, and qdelay or an
+             * inflated SRTT means the samples came from a queueing regime.
+             */
+            if (ext && ext->qdelay_avg > kcc_cong_thresh(sk)) {
+                kcc_reset_lt_bw_sampling(sk);
                 return;
+            }
+
+            if ((tp->srtt_us >> KCC_SRTT_SHIFT) > kcc->min_rtt_us + KCC_LT_BW_ITHRESH) {
+                kcc_reset_lt_bw_sampling(sk);
+                return;
+            }
+
+            kcc->lt_bw = (u32)min_t(u64,
+                (bw * en + (u64)kcc->lt_bw * (ed - en)) / ed, U32_MAX);
+            kcc->lt_bw = max_t(u32, kcc->lt_bw, 1U);
+            kcc->lt_use_bw = 1;
+            kcc->pacing_gain = BBR_UNIT;
+            kcc->lt_rtt_cnt = 0;
+            return;
         }
     }
 
@@ -4236,16 +4273,37 @@ static void kcc_lt_bw_sampling(struct sock* sk, const struct rate_sample* rs)
         }
     }
 
+    /* End the sampling interval only on an ACK that carries a loss, so we
+     * estimate the policer rate at the moment its tokens were exhausted.
+     * A cumulative loss ratio alone does not identify that instant and
+     * would under-estimate the policed rate.  (Upstream BBR: same rule.)
+     */
+    if (rs->losses <= 0) {
+        return;
+    }
+
     lost = tp->lost - kcc->lt_last_lost;
     delivered = tp->delivered - kcc->lt_last_delivered;
     if (!delivered || ((u64)lost << BBR_SCALE) < ((u64)KCC_LT_LOSS_THRESH * delivered)) {
         return;
     }
 
-    t_us = (u64)(div_u64(tp->delivered_mstamp, USEC_PER_MSEC) -
-        (u64)kcc->lt_last_stamp) * USEC_PER_MSEC;
-    if (t_us < USEC_PER_MSEC) {
-        return;
+    /* lt_last_stamp is a u32 millisecond timestamp.  Subtracting it from a
+     * u64 millisecond value makes the difference blow up after the u32
+     * wraps (49.7 days), yielding t_us ~= 4.29e12 and bw ~= 0, which then
+     * sets lt_use_bw=1 with lt_bw=0 and collapses pacing/cwnd.  Subtract
+     * in u32 (modular, as upstream BBR does) and reject non-positive
+     * intervals via the signed test.
+     */
+    {
+        u32 t_ms = (u32)div_u64(tp->delivered_mstamp, USEC_PER_MSEC) -
+            kcc->lt_last_stamp;
+
+        if ((s32)t_ms < 1) {
+            return;
+        }
+
+        t_us = (u64)t_ms * USEC_PER_MSEC;
     }
 
     bw = (u64)delivered << BW_SCALE;
@@ -4283,27 +4341,28 @@ static void kcc_update_bw(struct sock* sk, const struct rate_sample* rs)
     kcc_lt_bw_sampling(sk, rs);
     bw = div_u64((u64)rs->delivered << BW_SCALE, rs->interval_us);
 
-    /* Update max BW tracking with raw (pre-floor) value first.
-     * KF floor below is for pacing rate only (via kcc_bw → kcc_set_pacing_rate);
-     * must NOT pollute minmax_running_max or full_bw detection threshold. */
+    /* Update max BW tracking with the raw (pre-floor) value.  The KF
+     * fair-share floor is applied only to the pacing rate (via kcc_bw ->
+     * kcc_set_pacing_rate) and must NOT pollute minmax_running_max or the
+     * full_bw detection threshold.
+     *
+     * Clamp before the u32 conversion: bw is in BW_UNIT (1<<24 per usec),
+     * so u32 saturates at 256 segments/us.  A plain cast would wrap a
+     * multi-terabit estimate to a small value and corrupt max_bw.
+     */
     {
         u64 prev_max = (u64)kcc_max_bw(sk);
         if (!rs->is_app_limited || bw >= prev_max) {
-            minmax_running_max(&kcc->bw, KCC_BW_RT_CYCLE_LEN, kcc->rtt_cnt, (u32)bw);
+            minmax_running_max(&kcc->bw, KCC_BW_RT_CYCLE_LEN, kcc->rtt_cnt,
+                (u32)min_t(u64, bw, U32_MAX));
         }
     }
 
-    if (kcc_kf_enable && kcc->mode == KCC_MODE_STARTUP && smp_load_acquire(&kcc_kf_active.counter)) {
-        u64 kf_bw = (u64)smp_load_acquire(&kcc_kf_x.counter);
-        if (kf_bw > 0) {
-            u64 floor_bw = kf_bw * max_t(u32, kcc_kf_discount_num, 0) /
-                max_t(u32, kcc_kf_discount_den, 1);
-            floor_bw = (floor_bw << BBR_SCALE) / KCC_HIGH_GAIN;
-            if (bw < floor_bw) {
-                bw = floor_bw;
-            }
-        }
-    }
+    /* NOTE: the KF fair-share floor is applied in kcc_set_pacing_rate(),
+     * which is the only consumer of the pacing rate.  An earlier block here
+     * computed the same floor into the local `bw` variable and returned,
+     * which had no effect (kcc_bw() re-reads minmax/lt_bw) -- dead code
+     * that made the floor look implemented twice. */
 }
 
 /* [K] Geodesic -- propagation delay estimator.
@@ -4312,11 +4371,13 @@ static void kcc_update_bw(struct sock* sk, const struct rate_sample* rs)
  * growth for upward adjustment and instant minimum-tracking for downward.
  * Algorithm (see file header for complete derivations):
  *   ν <= 0:  x_est = min(x_est, z)          [G1] TOBIT censored min
- *   ν > 0:  x_est = min(x_est + x_est*122/1000, z)  [G2] 12.2% geometric growth, capped at z
- *   G3 path-increase detection is in kcc_update_min_rtt (post-G1/G2).
- *   BDP:   min(x_est >> KCC_SCALE_SHIFT, min_rtt)  [G4] safety floor
- *   Queue: excluded by min + floor              no cumulative contamination
- *   Noise: asymmetric response                  downward instant, upward gated
+ *   ν > 0:  x_est = min(x_est + x_est*122/1000, z)  [G2] 12.2% growth
+ *            applied ONCE PER ROUND (round_start), capped at z
+ *   G3 path-increase detection is in kcc_update_min_rtt, evaluated once per
+ *   round against the completed round's minimum RTT.
+ *   BDP:   confirmed min_rtt                       [G4] safety floor
+ *   Queue: excluded by min + confirmation         no cumulative contamination
+ *   Noise: asymmetric response                    downward instant, upward gated
  * Verified:  detection across path-increase step sizes,
  *             negligible BDP inflation under congestion,
  *             overestimate recovery,
@@ -4378,13 +4439,25 @@ static void kcc_update(struct sock* sk, u32 rtt_us,
          * The z cap prevents estimate inflation beyond observed RTT --
          * queue acts as a natural bound on upward growth.
          */
-        else {
+        else if (kcc->round_start) {
+            /* G2 runs once per round, matching the documented
+             * "12.2% per RTT" semantics.  Running it per ACK made the
+             * step 12.2% of x_est per ACK, so min(x_est * 1.122, z)
+             * evaluated to z unless RTT rose by more than 12.2% between
+             * two adjacent ACKs.  Gradual queue build does not do that: a
+             * probe-up phase raises RTT by ~25% spread over a whole round,
+             * i.e. 25%/N per ACK for N ACKs per RTT.  x_est therefore
+             * degenerated into a pass-through of the latest RTT rather
+             * than a T_prop estimate, and qdelay = z - x_est became zero
+             * for any gradually building queue, disabling the ECN and
+             * LT-BW queue gates.
+             */
             u64 growth = ext->x_est * KCC_G2_GROWTH_NUM / KCC_G2_GROWTH_DEN;
             ext->x_est = min_t(u64, ext->x_est + growth, z);
         }
 
         /* Observation window: If min_rtt_us hasn't been updated (by G3,
-        * traditional min_rtt, SRTT guard, or geodesic takeover) for
+        * traditional min_rtt, SRTT guard, or the downward check) for
         * 128 rounds, the G3 slow-path (consecutive 7-count at 1.05×) may
         * be accumulating false exceedances from G2 slow drift.  128 rounds
         * exceeds the maximum G3 detection latency for a gradual physical
@@ -4411,7 +4484,13 @@ static void kcc_update(struct sock* sk, u32 rtt_us,
         if (kcc->rtt_cnt - ext->mr_update_rtt_cnt >= KCC_STALENESS_RNDS) {
             u64 mr_scaled = (u64)kcc->min_rtt_us << KCC_SCALE_SHIFT;
             if (ext->x_est <= mr_scaled * KCC_G3_FAST_TH_NUM / KCC_G3_FAST_TH_DEN) {
-                ext->x_est = mr_scaled * KCC_PD_NOISE_GATE_NUM / KCC_PD_NOISE_GATE_DEN;
+                /* Downward-only correction (the comment below always said
+                 * so; the assignment could also raise x_est).  Floor the
+                 * target at one microsecond: 95% of a 1us min_rtt would
+                 * otherwise put x_est below its physical lower bound. */
+                ext->x_est = max_t(u64, (u64)KCC_SCALE,
+                    min_t(u64, ext->x_est,
+                        mr_scaled * KCC_PD_NOISE_GATE_NUM / KCC_PD_NOISE_GATE_DEN));
                 ext->mr_update_rtt_cnt = kcc->rtt_cnt;
             }
         }
@@ -4427,7 +4506,13 @@ static void kcc_update(struct sock* sk, u32 rtt_us,
         ext->jitter_ewma = min_t(u32, ext->jitter_ewma,
             max_t(u32, kcc->min_rtt_us, KCC_RTT_SAMPLE_MAX_US));
         {
-            u64 t_prop_scaled = (u64)ext->x_est;
+            /* Queue delay is measured against the stable propagation
+             * baseline (min_rtt), not against x_est.  Using the
+             * just-updated x_est made qdelay identically zero for any
+             * RTT increase smaller than one G2 step, which silently
+             * disabled the ECN backoff and LT-BW queue gates.
+             */
+            u64 t_prop_scaled = (u64)kcc->min_rtt_us << KCC_SCALE_SHIFT;
             u32 qdelay_instant = (z > t_prop_scaled) ?
                 (u32)((z - t_prop_scaled) >> KCC_SCALE_SHIFT) : 0;
             if (ext->sample_cnt == 1) {
@@ -4470,21 +4555,25 @@ static void kcc_update(struct sock* sk, u32 rtt_us,
  * @rs:  rate sample from this ACK.
  * @ext: extended state (for geodesic estimator update).
  * Processing sequence:
- *   1. Validate RTT sample: reject invalid (rs->rtt_us == 0).
+ *   1. Validate RTT sample: reject non-positive (rs->rtt_us <= 0).
  *   2. Run geodesic estimator (kcc_update) on the RTT sample.
- *   3. [G3] Path-increase detection: dual-threshold counter accumulation.
- *      Fast (10%*4) or slow (5%*5) updates min_rtt_us when triggered.
- *      G3 evaluates against fresh x_est (post-G1/G2 update).
- *      min_rtt_us is structurally floored at KCC_RTT_MIN_FLOOR_US (1μs)
- *      at all update paths; a zero min_rtt cannot reach G3.
- *   4. [G3] Lock: if counters are non-zero, freeze all min_rtt_us
- *      manipulation to protect threshold baselines -- return early.
+ *   3. [G3] Path-increase detection: dual-threshold counter accumulation,
+ *      evaluated ONCE PER ROUND (on round_start) against the completed
+ *      round's minimum RTT (prev_round_rtt_min), which excludes delayed
+ *      ACKs.  Fast (6 consecutive rounds >= 1.10x) or slow (7 consecutive
+ *      rounds >= 1.05x) updates min_rtt_us when triggered.
+ *      Counting per ACK against x_est made one PROBE_BW probe-up phase
+ *      (about one round, ~25% queue) fire G3 every cycle.
+ *   4. [G3] Lock: while locked (<5ms observed), G3 is disabled; the lock
+ *      is released after 7 consecutive rounds >= 7.5ms so a genuine path
+ *      change cannot pin min_rtt forever.
  *   5. Traditional min_rtt update:
- *      - Sticky fall: gradual reduction using sticky_num/sticky_den ratio.
  *      - Fast fall: immediate reduction when rtt < min_rtt / 4.
+ *      - Sticky fall: five consecutive ROUNDS below 0.75 * min_rtt.
+ *      - Direct: rtt <= min_rtt but above the sticky threshold.
  *   6. SRTT guard: override min_rtt if SRTT < min_rtt * guard_ratio.
- *   7. Geodesic takeover: when x_est is valid, update min_rtt_us from
- *      geodesic estimate.
+ *   7. Per-round downward check: five consecutive ROUNDS whose minimum
+ *      is below 0.95 * min_rtt.
  *   NOTE: KCC replaces BBR's 10-second min_rtt window expiry with the
  *   128-round G3 observation window in kcc_update and G3
  *   multi-event path-increase detection. No window-based expiry is needed.
@@ -4494,7 +4583,6 @@ static void kcc_update_min_rtt(struct sock* sk, const struct rate_sample* rs, st
     struct tcp_sock* tp = tcp_sk(sk);
     struct kcc* kcc = (struct kcc*)inet_csk_ca(sk);
 
-    bool min_fall_cnt_incr_this_ack = false;
     u32 now;
     u32 rtt_clamped;
     u32 mr_snapshot = kcc->min_rtt_us;
@@ -4503,7 +4591,15 @@ static void kcc_update_min_rtt(struct sock* sk, const struct rate_sample* rs, st
         return;
     }
 
-    if (rs->rtt_us < 0) {
+    /* Reject non-positive samples.  rs->rtt_us is produced by
+     * tcp_stamp_us_delta(), which clamps at 0 (include/net/tcp.h), so 0 is
+     * not a measurement; the kernel itself substitutes one jiffy in
+     * tcp_update_rtt_min().  Feeding 0 here would clamp to 1us, which
+     * collapses x_est and min_rtt, sets locked (0 < 5ms), and leaves the
+     * connection with a 1us BDP until either the lock-release path sees
+     * seven consecutive rounds at >= 7.5ms or the connection ends.
+     */
+    if (rs->rtt_us <= 0) {
         return;
     }
 
@@ -4512,133 +4608,219 @@ static void kcc_update_min_rtt(struct sock* sk, const struct rate_sample* rs, st
 
     kcc_update(sk, rtt_clamped, ext);
 
-    /* [T_prop] min_rtt LOCK trigger (one-shot, never reset):
-     * Any sample < KCC_LOCK_THRESH_US (5ms) proves this TCP connection's
-     * physical path can reach <5ms => it is a fiber path where a real RTT
-     * step is physically impossible (TCP path unique, fiber fixed, queue
-     * spikes only raise RTT). Once locked, G3 step detection is disabled
-     * forever and min_rtt stays at its extreme (only downward updates).
-     * 20亿-sample sim: at <5ms every detection config mis-triggers on queue
-     * spikes (up to 20ms), so locking is the only safe behavior.
+    /* Cold start: when the connection had no RTT sample at init, min_rtt_us
+     * holds KCC_DEFAULT_RTT_US (1ms) as a placeholder.  Adopt the first
+     * real measurement instead, otherwise a 20ms path would run with a 1ms
+     * baseline until G3 confirms the true value six rounds later (BDP and
+     * cwnd clamped to the minimum for that whole window).
+     *
+     * Only replace the placeholder: if kcc_init() obtained a real value
+     * from tcp_min_rtt() it must be kept, even though has_seen_rtt is
+     * still clear (it tracks srtt_us, not the min_rtt filter).
      */
-    if (unlikely(rtt_clamped < KCC_LOCK_THRESH_US)) {
+    if (unlikely(ext->sample_cnt == 1 && !kcc->has_seen_rtt &&
+        kcc->min_rtt_us == KCC_DEFAULT_RTT_US)) {
+        kcc->min_rtt_us = rtt_clamped;
+    }
+
+    /* [T_prop] min_rtt LOCK trigger:
+     * A sub-5ms sample is evidence that this path is a short, fixed fibre
+     * path, where a genuine propagation step is unlikely and queue spikes
+     * dominate.  While locked, G3 is disabled; the lock is released after
+     * KCC_BITFIELD_3BIT_MAX consecutive rounds observed at
+     * >= KCC_FAST_ONLY_THRESH_US (see the G3 block below), so it is not
+     * permanent.
+     *
+     * Require the CONFIRMED min_rtt to be in the short-path regime as well.
+     * A single sub-5ms outlier on a 20ms path is a measurement artefact
+     * (tcp_stamp_us_delta can return a very small value for a burst of
+     * same-microsecond ACKs); letting it lock G3 would disable path-increase
+     * detection for the next seven rounds on a path that never was short.
+     */
+    if (unlikely(rtt_clamped < KCC_LOCK_THRESH_US &&
+        kcc->min_rtt_us <= KCC_LOCK_THRESH_US)) {
         kcc->locked = 1;
     }
 
-    /* G3 dual-threshold path-increase detection (Wald SPRT).
-     * Fast path (10% above baseline, KCC_G3_FAST_CNT=6 consecutive events):
-     *   x_est >= 1.10 * min_rtt -> confirm_cnt++
-     * Slow path (5% above baseline, KCC_G3_SLOW_CNT=7 CONSECUTIVE events):
-     *   x_est >= 1.05 * min_rtt but < 1.10 * min_rtt -> confirm_slow_cnt++
-     *   (converted from cumulative to consecutive: cumulative counting is
-     *    guaranteed to be breached by sustained noise — the mis-trigger
-     *    source — while consecutive requires unbroken elevation)
-     * Both counters reset on ANY sample below their threshold.
-     * When locked (<5ms observed), G3 is fully disabled.
-     * When 5ms <= min_rtt < 7.5ms (possible step zone), slow is disabled
-     * (fast-only is proven safe; slow is the mis-trigger source).
-     * When min_rtt >= 7.5ms, fast+slow both proven safe (20亿-sim).
+    /* G3 dual-threshold path-increase detection (Wald SPRT, per-round form).
+     *
+     * The decision statistic is the COMPLETED round's minimum RTT
+     * (prev_round_rtt_min), not x_est.  Two reasons:
+     *   1. x_est is updated per ACK and, because the G2 step is much larger
+     *      than a single ACK's RTT change, it converges to the latest sample;
+     *      it therefore carries the queue as well as T_prop.
+     *   2. A PROBE_BW probe-up phase raises RTT by ~25% for about one round.
+     *      Counting per ACK made six consecutive exceedances fit inside a
+     *      fraction of that phase (6/(ACKs per RTT) rounds), so at the ACK
+     *      densities of bulk flows (tens to hundreds per RTT) G3 fired on
+     *      KCC's own probe queue on every probe-up cycle.  Each such update
+     *      raised min_rtt, which in turn raised the probe-up exit target
+     *      (kcc_inflight() is derived from model_rtt) and the drain target,
+     *      so the queue was not drained by the next phase.
+     * Counting once per completed round and requiring unbroken elevation
+     * across consecutive rounds makes a one-round probe-up transient
+     * contribute at most one count before the next clean round resets it,
+     * while a real path change accumulates evidence at one sample per RTT.
+     *
+     * Fast: round_min >= 1.10 * min_rtt for KCC_G3_FAST_CNT rounds.
+     * Slow: round_min >= 1.05 * min_rtt for KCC_G3_SLOW_CNT rounds.
+     * Locked (<5ms ever observed): G3 disabled, but the lock is released
+     * after KCC_BITFIELD_3BIT_MAX consecutive rounds at >= 7.5ms, so a
+     * genuine path change cannot keep min_rtt pinned forever.
      */
-    if (likely(!kcc->locked && kcc->min_rtt_us >= KCC_FAST_ONLY_THRESH_US)) {
-        if (ext->x_est >= (u64)kcc->min_rtt_us * KCC_SCALE * KCC_G3_FAST_TH_NUM / KCC_G3_FAST_TH_DEN) {
-            if (kcc->confirm_cnt < KCC_BITFIELD_3BIT_MAX) {
-                kcc->confirm_cnt++;
-            }
-        }
-        else {
+    if (kcc->round_start) {
+        u32 round_min = kcc->prev_round_rtt_min;
+        u64 stat;
+
+        if (round_min == 0 || round_min == U32_MAX) {
+            /* No usable sample in the previous round (all samples were
+             * delayed-ACK or invalid).  That round cannot serve as evidence,
+             * so the consecutive chain is broken and both counters must
+             * restart -- otherwise stale counts from an earlier run would
+             * accumulate across an observation gap.
+             */
             kcc->confirm_cnt = 0;
+            kcc->confirm_slow_cnt = 0;
+            goto g3_done;
         }
 
-        if (ext->x_est >= (u64)kcc->min_rtt_us * KCC_SCALE * KCC_G3_SLOW_TH_NUM / KCC_G3_SLOW_TH_DEN) {
-            if (kcc->confirm_slow_cnt < KCC_BITFIELD_3BIT_MAX) {
-                kcc->confirm_slow_cnt++;
+        if (kcc->locked) {
+            if (round_min >= KCC_FAST_ONLY_THRESH_US) {
+                if (kcc->locked_high_cnt < KCC_BITFIELD_3BIT_MAX) {
+                    kcc->locked_high_cnt++;
+                }
+                if (kcc->locked_high_cnt >= KCC_BITFIELD_3BIT_MAX) {
+                    kcc->locked = 0;
+                    kcc->locked_high_cnt = 0;
+                    /* Seven consecutive rounds >= 7.5ms disprove the
+                     * short-path assumption that justified the lock, so
+                     * adopt the observed baseline immediately instead of
+                     * making G3 wait another six rounds.  Suppress the
+                     * SRTT guard while srtt catches up to the new value. */
+                    kcc->min_rtt_us = round_min;
+                    kcc->min_rtt_stamp = now;
+                    ext->srtt_suppress_cnt = KCC_SRTT_SUPPRESS_RNDS;
+                    kcc->srtt_guard_cnt = 0;
+                }
+            }
+            else {
+                kcc->locked_high_cnt = 0;
+            }
+            kcc->confirm_cnt = 0;
+            kcc->confirm_slow_cnt = 0;
+            goto g3_done;
+        }
+
+        stat = (u64)round_min << KCC_SCALE_SHIFT;
+
+        /* The three-tier zone is selected from the OBSERVED round minimum,
+         * not from min_rtt_us: min_rtt_us is the quantity G3 is trying to
+         * raise, so gating on it would deadlock recovery (a min_rtt stuck
+         * below 5ms could never accept a genuine >=7.5ms path). */
+        if (round_min >= KCC_FAST_ONLY_THRESH_US) {
+            if (stat >= (u64)kcc->min_rtt_us * KCC_SCALE * KCC_G3_FAST_TH_NUM / KCC_G3_FAST_TH_DEN) {
+                if (kcc->confirm_cnt < KCC_BITFIELD_3BIT_MAX) {
+                    kcc->confirm_cnt++;
+                }
+            }
+            else {
+                kcc->confirm_cnt = 0;
+            }
+
+            if (stat >= (u64)kcc->min_rtt_us * KCC_SCALE * KCC_G3_SLOW_TH_NUM / KCC_G3_SLOW_TH_DEN) {
+                if (kcc->confirm_slow_cnt < KCC_BITFIELD_3BIT_MAX) {
+                    kcc->confirm_slow_cnt++;
+                }
+            }
+            else {
+                kcc->confirm_slow_cnt = 0;
             }
         }
-        else {
+        else if (round_min >= KCC_LOCK_THRESH_US) {
+            /* Gray zone (5ms <= round_min < 7.5ms): fast-only. */
+            if (stat >= (u64)kcc->min_rtt_us * KCC_SCALE * KCC_G3_FAST_TH_NUM / KCC_G3_FAST_TH_DEN) {
+                if (kcc->confirm_cnt < KCC_BITFIELD_3BIT_MAX) {
+                    kcc->confirm_cnt++;
+                }
+            }
+            else {
+                kcc->confirm_cnt = 0;
+            }
             kcc->confirm_slow_cnt = 0;
         }
-    }
-    else if (likely(!kcc->locked && kcc->min_rtt_us >= KCC_LOCK_THRESH_US)) {
-        /* Gray zone (5ms <= min_rtt < 7.5ms): fast-only. */
-        if (ext->x_est >= (u64)kcc->min_rtt_us * KCC_SCALE * KCC_G3_FAST_TH_NUM / KCC_G3_FAST_TH_DEN) {
-            if (kcc->confirm_cnt < KCC_BITFIELD_3BIT_MAX) {
-                kcc->confirm_cnt++;
-            }
-        }
         else {
             kcc->confirm_cnt = 0;
+            kcc->confirm_slow_cnt = 0;
         }
-        kcc->confirm_slow_cnt = 0;
-    }
-    else {
-        /* Locked (<5ms observed): G3 fully disabled. */
-        kcc->confirm_cnt = 0;
-        kcc->confirm_slow_cnt = 0;
-    }
 
-    /* Baseline return: x_est at or below min_rtt => reset both counters. */
-    if (ext->x_est <= (u64)kcc->min_rtt_us * KCC_SCALE) {
-        kcc->confirm_cnt = 0;
-        kcc->confirm_slow_cnt = 0;
-    }
+        /* Baseline return: round at or below min_rtt => reset both counters. */
+        if (stat <= (u64)kcc->min_rtt_us * KCC_SCALE) {
+            kcc->confirm_cnt = 0;
+            kcc->confirm_slow_cnt = 0;
+        }
 
-    /* Fast path confirmed: KCC_G3_FAST_CNT consecutive events above 10% threshold.
-     * Update min_rtt_us from x_est, reset counters and convergence proxy.
-     */
-    if (kcc->confirm_cnt >= KCC_G3_FAST_CNT) {
-        kcc->min_rtt_us = (u32)(ext->x_est >> KCC_SCALE_SHIFT);
-        kcc->min_rtt_stamp = now;
-        kcc->confirm_cnt = 0;
-        kcc->confirm_slow_cnt = 0;
-        ext->p_est = KCC_P_EST_INIT;
-        ext->mr_update_rtt_cnt = kcc->rtt_cnt;
+        if (kcc->confirm_cnt >= KCC_G3_FAST_CNT) {
+            kcc->min_rtt_us = round_min;
+            kcc->min_rtt_stamp = now;
+            kcc->confirm_cnt = 0;
+            kcc->confirm_slow_cnt = 0;
+            ext->p_est = KCC_P_EST_INIT;
+            ext->mr_update_rtt_cnt = kcc->rtt_cnt;
+            ext->srtt_suppress_cnt = KCC_SRTT_SUPPRESS_RNDS;
+            kcc->srtt_guard_cnt = 0;
+        }
+        else if (kcc->confirm_slow_cnt >= KCC_G3_SLOW_CNT) {
+            kcc->min_rtt_us = round_min;
+            kcc->min_rtt_stamp = now;
+            kcc->confirm_cnt = 0;
+            kcc->confirm_slow_cnt = 0;
+            ext->p_est = KCC_P_EST_INIT;
+            ext->mr_update_rtt_cnt = kcc->rtt_cnt;
+            ext->srtt_suppress_cnt = KCC_SRTT_SUPPRESS_RNDS;
+            kcc->srtt_guard_cnt = 0;
+        }
     }
-    /* Slow path confirmed: KCC_G3_SLOW_CNT consecutive events above 5% threshold. */
-    else if (kcc->confirm_slow_cnt >= KCC_G3_SLOW_CNT) {
-        kcc->min_rtt_us = (u32)(ext->x_est >> KCC_SCALE_SHIFT);
-        kcc->min_rtt_stamp = now;
-        kcc->confirm_cnt = 0;
-        kcc->confirm_slow_cnt = 0;
-        ext->p_est = KCC_P_EST_INIT;
-        ext->mr_update_rtt_cnt = kcc->rtt_cnt;
-    }
+g3_done:
 
-    /* G3 lock: while counters are non-zero, protect min_rtt_us from
-     * being lowered by the traditional min_rtt window, SRTT guard,
-     * and geodesic pull-down. kcc_update (G1/G2) still runs every RTT
-     * so x_est stays fresh and counters continue accumulating.
-     */
-    if (kcc->confirm_cnt > 0 || kcc->confirm_slow_cnt > 0) {
-        return;
-    }
-
-    /* Traditional min_rtt update (when G3 lock not active):
-     *   - Fast fall: if rtt < min_rtt / 4, instant update.
-     *   - Sticky fall: if rtt < min_rtt * 75/100 (sticky threshold),
-     *     require KCC_MINRTT_FAST_FALL_CNT consecutive qualified samples
-     *     before accepting the new minimum. While accumulating, gradually
-     *     reduce min_rtt by the sticky ratio on each round boundary.
+    /* Traditional min_rtt update:
+     *   - Fast fall: rtt < min_rtt / 4 on KCC_MINRTT_FAST_FALL_FAST_CNT
+     *     consecutive rounds.  A 4x drop cannot be produced by queueing, but
+     *     a single such sample can be a timestamp artefact, so two rounds
+     *     are required (2 RTT of latency, still far faster than the five
+     *     rounds used for smaller drops).
+     *   - Sticky fall: if 0.25 <= rtt/min_rtt < 0.75, require
+     *     KCC_MINRTT_FAST_FALL_CNT consecutive ROUNDS with a qualified
+     *     minimum before accepting the new minimum.
      *   - Direct: otherwise accept the new minimum immediately.
+     *
+     * The baseline is NOT reduced on the first qualified sample.  An earlier
+     * revision applied a 25% reduction at the first round boundary after a
+     * single low sample, so one outlier immediately cut the BDP by 25% even
+     * though the confirmation never completed; the connection then needed
+     * several rounds to grow back.  The reduction now happens only after the
+     * consecutive-round threshold has been reached.
+     *
+     * The counter advances once per round rather than once per ACK: on a
+     * high-ACK-rate connection five consecutive ACKs span a fraction of one
+     * RTT, so per-ACK counting let a single queue transient satisfy a
+     * "five sample" confirmation.
      */
     if (rtt_clamped <= kcc->min_rtt_us) {
         rtt_clamped = max_t(u32, rtt_clamped, KCC_RTT_MIN_FLOOR_US);
         if (rtt_clamped < (u64)kcc->min_rtt_us * KCC_MINRTT_STICKY_NUM / KCC_MINRTT_STICKY_DEN) {
-            if (rtt_clamped < kcc->min_rtt_us / KCC_MINRTT_FAST_FALL_DIV) {
-                kcc->min_rtt_us = rtt_clamped;
-                kcc->min_rtt_fast_fall_cnt = 0;
+            if (kcc->round_start) {
+                kcc->min_rtt_fast_fall_cnt = min_t(u32,
+                    kcc->min_rtt_fast_fall_cnt + 1, KCC_BITFIELD_3BIT_MAX);
             }
-            else {
-                kcc->min_rtt_fast_fall_cnt = min_t(u32, kcc->min_rtt_fast_fall_cnt + 1, KCC_BITFIELD_3BIT_MAX);
-                min_fall_cnt_incr_this_ack = true;
-                if (kcc->min_rtt_fast_fall_cnt >= KCC_MINRTT_FAST_FALL_CNT) {
+            if (rtt_clamped < kcc->min_rtt_us / KCC_MINRTT_FAST_FALL_DIV) {
+                if (kcc->min_rtt_fast_fall_cnt >= KCC_MINRTT_FAST_FALL_FAST_CNT) {
                     kcc->min_rtt_us = rtt_clamped;
                     kcc->min_rtt_fast_fall_cnt = 0;
                 }
-                else if (kcc->round_start) {
-                    kcc->min_rtt_us = max_t(u32, KCC_RTT_MIN_FLOOR_US,
-                        (u64)kcc->min_rtt_us * KCC_MINRTT_STICKY_NUM /
-                        KCC_MINRTT_STICKY_DEN);
-                }
+            }
+            else if (kcc->min_rtt_fast_fall_cnt >= KCC_MINRTT_FAST_FALL_CNT) {
+                kcc->min_rtt_us = rtt_clamped;
+                kcc->min_rtt_fast_fall_cnt = 0;
             }
         }
         else {
@@ -4652,16 +4834,39 @@ static void kcc_update_min_rtt(struct sock* sk, const struct rate_sample* rs, st
         kcc->min_rtt_fast_fall_cnt = 0;
     }
 
-    /* SRTT guard: override min_rtt if SRTT is significantly lower than
-     * the current min_rtt (SRTT < min_rtt * 90/100). This catches cases
-     * where all direct RTT samples are inflated by ACK aggregation or
-     * delayed ACKs but the smoothed RTT has converged to the true value.
+    /* SRTT guard: override min_rtt if SRTT is significantly lower than the
+     * current min_rtt (SRTT < min_rtt * 90/100).  Catches the case where the
+     * direct samples are inflated by ACK aggregation while the smoothed RTT
+     * has converged to the true value.
+     *
+     * Two guards keep this from undoing a confirmed path increase:
+     *   1. It is evaluated once per round and must hold for
+     *      KCC_MINRTT_FAST_FALL_CNT consecutive rounds.
+     *   2. It is suppressed for KCC_SRTT_SUPPRESS_RNDS rounds after G3 (or
+     *      the lock-release path) raised min_rtt, because srtt is a 1/8 EWMA
+     *      and stays below the new baseline for roughly 17 rounds after a
+     *      genuine increase.
      */
-    if (tp->srtt_us && kcc->min_rtt_us) {
+    if (ext->srtt_suppress_cnt) {
+        if (kcc->round_start) {
+            ext->srtt_suppress_cnt--;
+        }
+        kcc->srtt_guard_cnt = 0;
+    }
+    else if (tp->srtt_us && kcc->min_rtt_us) {
         u32 srtt_shifted = max_t(u32, tp->srtt_us >> KCC_SRTT_SHIFT, KCC_RTT_MIN_FLOOR_US);
         if (srtt_shifted < (u64)kcc->min_rtt_us * KCC_MINRTT_SRTT_GUARD_NUM / KCC_MINRTT_SRTT_GUARD_DEN) {
-            kcc->min_rtt_us = srtt_shifted;
-            kcc->min_rtt_stamp = now;
+            if (kcc->round_start && kcc->srtt_guard_cnt < KCC_BITFIELD_3BIT_MAX) {
+                kcc->srtt_guard_cnt++;
+            }
+            if (kcc->srtt_guard_cnt >= KCC_MINRTT_FAST_FALL_CNT) {
+                kcc->min_rtt_us = srtt_shifted;
+                kcc->min_rtt_stamp = now;
+                kcc->srtt_guard_cnt = 0;
+            }
+        }
+        else {
+            kcc->srtt_guard_cnt = 0;
         }
     }
 
@@ -4669,28 +4874,40 @@ static void kcc_update_min_rtt(struct sock* sk, const struct rate_sample* rs, st
         kcc->idle_restart = 0;
     }
 
-    /* Geodesic takeover: when x_est is valid and reliably below min_rtt_us
-     * (within the noise gate), pull min_rtt_us down to x_est. This ensures
-     * the geodesic estimate's faster convergence (G1 instant min) is reflected
-     * in the BDP calculation. Uses the same fast-fall accumulator to prevent
-     * flapping from individual noisy samples.
+    /* Downward path-change detection on the per-round statistic.
+     *
+     * This replaces the earlier "geodesic takeover" that compared min_rtt
+     * against x_est.  x_est is driven by G1, an instantaneous minimum, so a
+     * single low outlier held it below 0.95*min_rtt for the ~12 rounds G2
+     * needs to grow back (12.2% per round), and five samples on a
+     * high-ACK-rate connection span a fraction of one RTT.  Using the
+     * completed round's minimum instead requires five CONSECUTIVE rounds
+     * with a genuinely low minimum, which a one-round outlier cannot
+     * produce.
+     *
+     * Threshold 0.95 complements the traditional sticky fall at 0.75: a
+     * 5-25% decrease is too small for sticky fall but is confirmed here
+     * after five rounds.  A decrease below 0.75 is handled immediately by
+     * the fast-fall branch above.
      */
-    if (ext && ext->x_est && ext->sample_cnt >= KCC_MIN_SAMPLES) {
-        u32 krtt = (u32)(ext->x_est >> KCC_SCALE_SHIFT);
-        if (krtt < kcc->min_rtt_us && krtt < kcc->min_rtt_us * KCC_PD_NOISE_GATE_NUM / KCC_PD_NOISE_GATE_DEN) {
-            if (!min_fall_cnt_incr_this_ack) {
-                kcc->min_rtt_fast_fall_cnt = min_t(u32,
-                    kcc->min_rtt_fast_fall_cnt + 1, KCC_BITFIELD_3BIT_MAX);
-                if (kcc->min_rtt_fast_fall_cnt >= KCC_MINRTT_FAST_FALL_CNT) {
-                    kcc->min_rtt_us = krtt;
-                    kcc->min_rtt_fast_fall_cnt = 0;
-                    kcc->min_rtt_stamp = now;
-                    ext->mr_update_rtt_cnt = kcc->rtt_cnt;
-                }
+    if (kcc->round_start &&
+        kcc->prev_round_rtt_min != 0 &&
+        kcc->prev_round_rtt_min != U32_MAX) {
+        u32 round_min = kcc->prev_round_rtt_min;
+        if (round_min < kcc->min_rtt_us &&
+            round_min < kcc->min_rtt_us * KCC_PD_NOISE_GATE_NUM / KCC_PD_NOISE_GATE_DEN) {
+            if (ext->x_est_fall_cnt < KCC_MINRTT_FAST_FALL_CNT) {
+                ext->x_est_fall_cnt++;
+            }
+            if (ext->x_est_fall_cnt >= KCC_MINRTT_FAST_FALL_CNT) {
+                kcc->min_rtt_us = round_min;
+                ext->x_est_fall_cnt = 0;
+                kcc->min_rtt_stamp = now;
+                ext->mr_update_rtt_cnt = kcc->rtt_cnt;
             }
         }
         else {
-            kcc->min_rtt_fast_fall_cnt = 0;
+            ext->x_est_fall_cnt = 0;
         }
     }
 
@@ -4765,7 +4982,11 @@ static u32 kcc_ack_aggregation_cwnd(struct sock* sk, struct kcc_ext* ext, u32 bw
         u64 product = max_ms != 0 ? bw * max_ms : 0;
 
         max_aggr_cwnd = (u32)min_t(u64, product >> BW_SCALE, U32_MAX);
-        aggr64 = (extra_acked_gain *
+        /* Cast before multiplying: extra_acked_gain (int) times a u32
+         * would otherwise be evaluated in 32-bit unsigned arithmetic and
+         * wrap once gain * extra_acked exceeds U32_MAX (reachable with a
+         * large sndbuf / snd_cwnd_clamp and the maximum gain of 1024). */
+        aggr64 = ((u64)extra_acked_gain *
             max_t(u32, ext->extra_acked[0], ext->extra_acked[1])) >> BBR_SCALE;
         aggr_cwnd = (u32)min_t(u64, aggr64, max_aggr_cwnd);
     }
@@ -4840,12 +5061,23 @@ static bool kcc_is_next_cycle_phase(struct sock* sk, const struct rate_sample* r
      * small (e.g. on a LAN). We do not persist if packets are lost, since
      * a path with small buffers may not hold that much.
      * Optionally (kcc_probe_bw_up_limit), exit early when app-limited.
+     *
+     * The inflight target can be unreachable: it includes the quantization
+     * headroom (KCC_TSO_HEADROOM_MULT * tso_segs_goal) plus the probe bonus,
+     * which at a small BDP is a large fraction of the target while cwnd is
+     * capped at cwnd_gain * BDP.  Without a timeout the phase would then
+     * never end, the queue would stay elevated indefinitely, and G3 would
+     * read that queue as a path increase -- which raises min_rtt, which
+     * raises the very target that was unreachable.  Bound the phase to
+     * 2 * min_rtt, the same way the drain phase is bounded to 4 * min_rtt.
      */
     if (kcc->pacing_gain > BBR_UNIT) {
-        return is_full_length &&
+        return (is_full_length &&
             (rs->losses ||  /* perhaps pacing_gain*BDP won't fit */
                 inflight >= kcc_inflight(sk, bw, kcc->pacing_gain, kcc->ext) ||
-                (kcc_probe_bw_up_limit && (rs->is_app_limited || !tcp_send_head(sk))));
+                (kcc_probe_bw_up_limit && (rs->is_app_limited || !tcp_send_head(sk))))) ||
+            tcp_stamp_us_delta(tp->delivered_mstamp, kcc->cycle_mstamp) >
+                (u64)kcc->min_rtt_us * 2;
     }
 
     /* A pacing_gain < 1.0 tries to drain extra queue we added if bw
@@ -4894,12 +5126,18 @@ static void kcc_check_full_bw_reached(struct sock* sk, const struct rate_sample*
     struct kcc* kcc = (struct kcc*)inet_csk_ca(sk);
     u32 bw_thresh;
     if (kcc_kf_enable && kcc->round_start && kcc->rtt_cnt <= KCC_FULL_BW_CNT && kcc->mode == KCC_MODE_STARTUP && smp_load_acquire(&kcc_kf_active.counter)) {
-        u64 kf_bw = (u64)smp_load_acquire(&kcc_kf_x.counter);
+        /* Same clamp as kcc_set_pacing_rate(): both operands are in
+         * BW_UNIT and only u32 values can be represented downstream.
+         */
+        u64 kf_bw = min_t(u64, (u64)smp_load_acquire(&kcc_kf_x.counter),
+            U32_MAX);
         if (kf_bw > 0) {
             u64 init_floor = kf_bw * max_t(u32, kcc_kf_discount_num, 0) /
                 max_t(u32, kcc_kf_discount_den, 1);
+            /* Gain-compensated, matching the pacing floor: effectively
+             * 17.3% of the fair share (code behaviour). */
             init_floor = (init_floor << BBR_SCALE) / KCC_HIGH_GAIN;
-            if (kcc_max_bw(sk) >= (u32)init_floor) {
+            if ((u64)kcc_max_bw(sk) >= min_t(u64, init_floor, U32_MAX)) {
                 kcc->full_bw = kcc_max_bw(sk);
                 kcc->full_bw_cnt = 0;
                 return;
@@ -5023,7 +5261,11 @@ static void kcc_update_model(struct sock* sk, const struct rate_sample* rs,
     kcc_check_drain(sk, rs);
     kcc_update_min_rtt(sk, rs, ext);
 
-    if (likely(rs->rtt_us >= 0)) {
+    if (likely(rs->rtt_us > 0) && !rs->is_ack_delayed) {
+        /* Delayed-ACK samples inflate RTT by the receiver's ACK timer
+         * (1-40ms) and are not path evidence.  Excluding them here keeps
+         * the per-round G3 statistic (prev_round_rtt_min) clean; BBR
+         * likewise skips suspected delayed ACKs in its min_rtt filter. */
         u32 rtt_us = (u32)rs->rtt_us;
         if (rtt_us < kcc->round_rtt_min) {
             kcc->round_rtt_min = rtt_us;
@@ -5068,27 +5310,26 @@ static u64 kcc_kf_update(u64 z, u32 r_pct, bool check)
 
     R = kcc_kf_compute_R(z, r_pct);
 
+    /* The whole read-modify-write must be one critical section.  The
+     * previous version read P/x under the lock, released it, recomputed,
+     * and re-acquired to store: two connections updating concurrently
+     * could each read the same old state and the later store would
+     * discard the earlier update.  KCC runs this once per round per
+     * connection, so holding the lock across the arithmetic is cheap.
+     */
     spin_lock(&kcc_kf_lock);
     P = atomic64_read(&kcc_kf_P);
     x = atomic64_read(&kcc_kf_x);
-    spin_unlock(&kcc_kf_lock);
+
+    if (unlikely(!atomic_read(&kcc_kf_active))) {
+        atomic64_set(&kcc_kf_x, z);
+        atomic64_set(&kcc_kf_P, max(R, 1ULL));
+        spin_unlock(&kcc_kf_lock);
+        smp_store_release(&kcc_kf_active.counter, 1);
+        return z;
+    }
 
     P += (1ULL << KCC_KF_Q_SHIFT);
-    if (unlikely(!atomic_read(&kcc_kf_active))) {
-        spin_lock(&kcc_kf_lock);
-        if (!atomic_read(&kcc_kf_active)) {
-            atomic64_set(&kcc_kf_x, z);
-            atomic64_set(&kcc_kf_P, max(R, 1ULL));
-            spin_unlock(&kcc_kf_lock);
-            smp_store_release(&kcc_kf_active.counter, 1);
-            return z;
-        }
-
-        P = atomic64_read(&kcc_kf_P);
-        x = atomic64_read(&kcc_kf_x);
-        spin_unlock(&kcc_kf_lock);
-        P += (1ULL << KCC_KF_Q_SHIFT);
-    }
 
     if (check) {
         u64 nu2;
@@ -5105,6 +5346,7 @@ static u64 kcc_kf_update(u64 z, u32 r_pct, bool check)
         S >>= KCC_KF_VAR_SHIFT;
         if (S > 0 &&
             nu2 * KCC_KF_CHI2_DEN > KCC_KF_CHI2_NUM * S) {
+            spin_unlock(&kcc_kf_lock);
             return x;
         }
     }
@@ -5138,18 +5380,20 @@ static u64 kcc_kf_update(u64 z, u32 r_pct, bool check)
     }
 
     if (x > 0) {
-        spin_lock(&kcc_kf_lock);
         smp_store_release(&kcc_kf_x.counter, x);
         smp_store_release(&kcc_kf_P.counter, P);
-        spin_unlock(&kcc_kf_lock);
+    }
 
-        if (kcc_kf_mode) {
-            u64 old_steady;
-            do {
-                old_steady = atomic64_read(&kcc_kf_x_steady);
-            } while (x > old_steady &&
-                atomic64_cmpxchg(&kcc_kf_x_steady, old_steady, x) != old_steady);
-        }
+    spin_unlock(&kcc_kf_lock);
+
+    /* x_steady is an independent atomic high-water mark; the cmpxchg loop
+     * is safe outside the lock and keeps the critical section short. */
+    if (x > 0 && kcc_kf_mode) {
+        u64 old_steady;
+        do {
+            old_steady = atomic64_read(&kcc_kf_x_steady);
+        } while (x > old_steady &&
+            atomic64_cmpxchg(&kcc_kf_x_steady, old_steady, x) != old_steady);
     }
 
     return x;
@@ -5171,7 +5415,10 @@ static u64 kcc_kf_get_init_bw(struct sock* sk)
         return 0;
     }
 
-    fair = (u64)smp_load_acquire(&kcc_kf_x.counter);
+    /* Clamp to u32: the result is returned as u32 bandwidth, and the
+     * discount multiply below would otherwise be able to overflow.
+     */
+    fair = min_t(u64, (u64)smp_load_acquire(&kcc_kf_x.counter), U32_MAX);
     if (fair == 0) {
         return 0;
     }
@@ -5184,6 +5431,9 @@ static u64 kcc_kf_get_init_bw(struct sock* sk)
     }
 
     init_bw = fair * max_t(u32, kcc_kf_discount_num, 0) / max_t(u32, kcc_kf_discount_den, 1);
+    /* Gain-compensated by KCC_PACING_INIT_GAIN, as in the original
+     * implementation: the returned seed is fair * discount / 2.887
+     * (0.5 / 2.887 ~= 17.3%). */
     init_bw = (init_bw << BBR_SCALE) / KCC_PACING_INIT_GAIN;
     if (init_bw < ((u64)kcc_tcp_snd_cwnd(tp) << BW_SCALE) /
         max_t(u32, tp->srtt_us >> KCC_SRTT_SHIFT, KCC_RTT_MIN_FLOOR_US)) {
@@ -5209,7 +5459,11 @@ KCC_KFUNC void kcc_main(struct sock* sk, const struct rate_sample* rs)
 
     if (kcc_kf_enable && kcc->round_start &&
         kcc->mode == KCC_MODE_PROBE_BW && rs->interval_us > 0 &&
-        rs->delivered > 0) {
+        rs->delivered > 0 && !rs->is_app_limited) {
+        /* App-limited samples measure the application's send rate, not
+         * path capacity; feeding them into the cross-connection fair-share
+         * estimate drags the shared value below the real link rate and
+         * makes new connections start too slowly. */
         u64 kbw = ((u64)rs->delivered << BW_SCALE) / (u64)rs->interval_us;
         if (!atomic_read(&kcc_kf_active)) {
             kcc_kf_update(kbw, KCC_KF_STARTUP_R_PCT, false);
@@ -5249,7 +5503,12 @@ KCC_KFUNC void kcc_init(struct sock* sk)
 
     if (kcc->min_rtt_us == 0 || kcc->min_rtt_us == U32_MAX) {
         struct tcp_sock* tp = tcp_sk(sk);
-        kcc->min_rtt_us = tp->srtt_us ? tp->srtt_us >> KCC_SRTT_SHIFT : KCC_DEFAULT_RTT_US;
+        /* Floor the srtt-derived seed: srtt_us is scaled by 8, so a tiny
+         * srtt_us would yield 0 and make BDP collapse to 0 for the whole
+         * connection (kcc_get_model_rtt -> kcc_bdp). */
+        kcc->min_rtt_us = tp->srtt_us ?
+            max_t(u32, tp->srtt_us >> KCC_SRTT_SHIFT, KCC_RTT_MIN_FLOOR_US) :
+            KCC_DEFAULT_RTT_US;
     }
 
     kcc->min_rtt_stamp = tcp_jiffies32;
@@ -5379,6 +5638,15 @@ static size_t kcc_get_info(struct sock* sk, u32 ext_mask, int* attr,
         info->bbr.bbr_min_rtt = kcc->min_rtt_us;
         info->bbr.bbr_pacing_gain = kcc->pacing_gain;
         info->bbr.bbr_cwnd_gain = kcc->cwnd_gain;
+        /* inet_sk_diag_fill() declares "int attr;" uninitialised and uses
+         * it as the netlink attribute type for the payload returned here;
+         * without this assignment the kernel emits the block under a
+         * stack-garbage attribute id (BBR sets it to INET_DIAG_BBRINFO).
+         * The NULL guard keeps the callback safe for any caller that does
+         * not request the attribute id. */
+        if (attr) {
+            *attr = INET_DIAG_BBRINFO;
+        }
         return sizeof(info->bbr);
     }
 
@@ -5738,11 +6006,9 @@ static int __init kcc_register(void)
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0) && LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0)
 #if defined(CONFIG_X86) && defined(CONFIG_DYNAMIC_FTRACE)
-    ret = register_kfunc_btf_id_set(&bpf_tcp_ca_kfunc_list, &tcp_kcc_kfunc_btf_set);
-    if (ret < 0) {
-        pr_warn("KCC: legacy kfunc registration failed (err %d); BPF struct_ops unavailable\n", ret);
-    }
-
+    /* 5.16/5.17 API returns void; the old "ret = ...; if (ret < 0)" was a
+     * compile error on those kernels. */
+    register_kfunc_btf_id_set(&bpf_tcp_ca_kfunc_list, &tcp_kcc_kfunc_btf_set);
 #endif
 #endif
 
